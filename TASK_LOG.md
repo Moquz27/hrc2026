@@ -11,4 +11,8 @@
 - Created runtime asset directories under ~/hrc-runtime for data, checkpoints, outputs, and logs
 - Corrected Linux path plan so HRC_REPO points to ~/hrc2026/repo while ~/hrc-runtime stores only runtime assets
 - Added scripts/smoke_isaac.py as a minimal Isaac Sim headless smoke test that validates env vars, steps an empty stage, and writes LOG_ROOT/isaac_smoke_ok.txt
-- Test result: local preflight and syntax checks only; full Isaac Sim execution must be run on Linux with Isaac Sim installed
+- Cleaned ~/.bashrc so a single HRC environment block is defined before the interactive-shell guard
+- Verified HRC_REPO resolves to ~/hrc2026/repo and runtime assets remain under ~/hrc-runtime
+- Test result: preflight passed and wrote ~/hrc-runtime/logs/isaac_smoke_preflight_ok.txt
+- Test result: Isaac smoke passed with steps=20 and wrote ~/hrc-runtime/logs/isaac_smoke_ok.txt
+- Infrastructure phase complete; next step is to commit this note, then begin the minimal simulation baseline in a separate change
