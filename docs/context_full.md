@@ -44,11 +44,14 @@ May include a local .venv for lightweight testing
 This environment is NOT the production/runtime environment
 
 On Linux
-All workspace must be under:
+Code remains in:
+~/hrc2026/repo
+
+Runtime assets live under:
 ~/hrc-runtime/
 
 Structure:
-~/hrc-runtime/repo            # actual runnable code
+~/hrc2026/repo                # existing runnable code repository
 ~/hrc-runtime/data            # dataset + simulation assets
 ~/hrc-runtime/checkpoints     # model weights
 ~/hrc-runtime/outputs         # metrics, replay, video, results
@@ -102,7 +105,7 @@ All paths must be read from environment variables.
 6. Environment Variables (Linux Only)
 Add to ~/.bashrc:
 export HRC_ROOT=$HOME/hrc-runtime
-export HRC_REPO=$HOME/hrc-runtime/repo
+export HRC_REPO=$HOME/hrc2026/repo
 export DATA_ROOT=$HOME/hrc-runtime/data
 export CKPT_ROOT=$HOME/hrc-runtime/checkpoints
 export OUTPUT_ROOT=$HOME/hrc-runtime/outputs
@@ -189,7 +192,7 @@ SSH from Mac:
 ssh hrc-linux
 
 Go to repo:
-cd ~/hrc-runtime/repo
+cd ~/hrc2026/repo
 git pull
 
 Activate environment:
@@ -282,7 +285,7 @@ Mac:
 ~/hrc-dev/hrc2026
 → coding, Codex, lightweight testing, Git push
 Linux:
-~/hrc-runtime/repo
+~/hrc2026/repo
 ~/hrc-runtime/data
 ~/hrc-runtime/checkpoints
 ~/hrc-runtime/outputs
@@ -298,4 +301,3 @@ TASK_LOG.md
 
 20. Final Workflow Rule
 Edit on Mac → Sync via Git → Run on Linux → Inspect → Iterate
-
