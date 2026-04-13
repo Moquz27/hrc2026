@@ -16,3 +16,8 @@
 - Test result: preflight passed and wrote ~/hrc-runtime/logs/isaac_smoke_preflight_ok.txt
 - Test result: Isaac smoke passed with steps=20 and wrote ~/hrc-runtime/logs/isaac_smoke_ok.txt
 - Infrastructure phase complete; next step is to commit this note, then begin the minimal simulation baseline in a separate change
+- Started minimal simulation baseline phase with scripts/minimal_scene_baseline.py
+- Purpose: launch Isaac Sim, create one static cube scene, step fixed frames, write one log and one metrics JSON outside the repo
+- Constraints: no robot model, dataset, task logic, perception, or learning code
+- Test result: Isaac minimal scene baseline passed with frames=60 and scene_prim=/World/StaticCube
+- Runtime artifacts: LOG_ROOT/minimal_scene_baseline.log and OUTPUT_ROOT/metrics/minimal_scene_baseline.json
