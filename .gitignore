@@ -1,8 +1,16 @@
 .venv/
 __pycache__/
 *.pyc
+.env
+.env.local
 data/
 checkpoints/
 outputs/
 logs/
+*.pt
+*.ckpt
+*.mp4
+*.mov
+*.png
+*.jpg
 .DS_Store
