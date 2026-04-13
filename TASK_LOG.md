@@ -21,3 +21,7 @@
 - Constraints: no robot model, dataset, task logic, perception, or learning code
 - Test result: Isaac minimal scene baseline passed with frames=60 and scene_prim=/World/StaticCube
 - Runtime artifacts: LOG_ROOT/minimal_scene_baseline.log and OUTPUT_ROOT/metrics/minimal_scene_baseline.json
+- Added GUI inspection flags to minimal scene baseline: --gui and --hold-open
+- Fixed minimal scene baseline argument handling so Isaac Kit does not consume script-only flags such as --frames
+- Removed experimental material binding from minimal scene baseline; kept scene to one static cube plus light for reproducibility
+- Test result: restored minimal scene baseline passed on Linux with frames=3 and regenerated LOG_ROOT/minimal_scene_baseline.log plus OUTPUT_ROOT/metrics/minimal_scene_baseline.json

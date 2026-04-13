@@ -72,7 +72,7 @@ def _validate_environment() -> dict[str, Path]:
 
 def _create_static_cube_scene() -> str:
     import omni.usd  # type: ignore
-    from pxr import Gf, UsdGeom  # type: ignore
+    from pxr import Gf, UsdGeom, UsdLux  # type: ignore
 
     usd_context = omni.usd.get_context()
     usd_context.new_stage()
@@ -90,6 +90,9 @@ def _create_static_cube_scene() -> str:
     cube = UsdGeom.Cube.Define(stage, cube_path)
     cube.CreateSizeAttr(1.0)
     cube.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.5))
+
+    light = UsdLux.DistantLight.Define(stage, "/World/Light")
+    light.CreateIntensityAttr(500)
 
     return cube_path
 
@@ -125,10 +128,21 @@ def _write_metric(metrics_root: Path, frames: int, scene_prim: str, log_file: Pa
         "robot_model": None,
         "dataset": None,
         "task_logic": None,
+        "perception": None,
+        "learning": None,
         "log_file": str(log_file),
     }
     metric_file.write_text(json.dumps(metric, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return metric_file
+
+
+def _hold_gui_open(sim_app: Any) -> None:
+    print("Holding Isaac Sim GUI open. Close the window or press Ctrl+C to exit.")
+    try:
+        while sim_app.is_running():
+            sim_app.update()
+    except KeyboardInterrupt:
+        print("Ctrl+C received; closing Isaac Sim.")
 
 
 def main() -> int:
@@ -139,18 +153,32 @@ def main() -> int:
         action="store_true",
         help="Launch Isaac Sim with a visible window instead of headless mode.",
     )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Alias for --no-headless; launch Isaac Sim with a visible window.",
+    )
+    parser.add_argument(
+        "--hold-open",
+        action="store_true",
+        help="After writing artifacts, keep the GUI open until the window closes or Ctrl+C is pressed.",
+    )
     args = parser.parse_args()
 
     if args.frames < 1:
         raise RuntimeError("--frames must be at least 1")
+
+    # Prevent Isaac Kit from consuming this script's CLI arguments.
+    sys.argv = [sys.argv[0]]
 
     paths = _validate_environment()
     print(f"HRC_REPO={paths['HRC_REPO']}")
     print(f"LOG_ROOT={paths['LOG_ROOT']}")
     print(f"METRICS_ROOT={paths['METRICS_ROOT']}")
 
+    show_gui = args.no_headless or args.gui
     SimulationApp = _load_simulation_app()
-    sim_app = SimulationApp({"headless": not args.no_headless})
+    sim_app = SimulationApp({"headless": not show_gui})
 
     try:
         scene_prim = _create_static_cube_scene()
@@ -164,6 +192,9 @@ def main() -> int:
         metric_file = _write_metric(paths["METRICS_ROOT"], args.frames, scene_prim, log_file)
         print(f"Minimal scene baseline OK; wrote {log_file}")
         print(f"Minimal scene baseline metrics OK; wrote {metric_file}")
+
+        if show_gui and args.hold_open:
+            _hold_gui_open(sim_app)
     finally:
         sim_app.close()
 
