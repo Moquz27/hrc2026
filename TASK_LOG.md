@@ -25,3 +25,21 @@
 - Fixed minimal scene baseline argument handling so Isaac Kit does not consume script-only flags such as --frames
 - Removed experimental material binding from minimal scene baseline; kept scene to one static cube plus light for reproducibility
 - Test result: restored minimal scene baseline passed on Linux with frames=3 and regenerated LOG_ROOT/minimal_scene_baseline.log plus OUTPUT_ROOT/metrics/minimal_scene_baseline.json
+
+## 2026-04-14
+- Started Phase 2 robot integration baseline with scripts/load_walker_s2.py
+- Purpose: launch Isaac Sim, load Walker S2 from a configurable USD path outside the repo, inspect articulation and joints, and write LOG_ROOT/walker_s2_load_ok.txt
+- Constraints: no task logic, robot control, object manipulation, perception, dataset use, or learning code
+- Test result: lightweight Python compile passed; Isaac runtime validation still must be run on Linux with the Walker S2 USD asset available
+- Next step: place the Walker S2 model under runtime assets, set WALKER_S2_USD or pass --robot-usd, then run the load inspection script with Isaac Sim's python.sh
+- Added early Git LFS pointer detection to scripts/load_walker_s2.py so placeholder USD files fail before Isaac launch
+- Runtime attempt: s2_v1.usd failed because the file is a Git LFS pointer, not a downloaded USD payload
+- Runtime attempt: SubUSDs/s2_v1_physics.usd failed because the file is also a Git LFS pointer, not a downloaded USD payload
+- Blocker: git-lfs is not installed on the Linux runtime, so the Walker S2 asset repository has not fetched the real USD payloads
+- Phase 2 status remains in progress; next step is to install/enable git-lfs outside the code repo, pull the Walker S2 LFS assets under HRC_ROOT/assets, then rerun the same two candidate load commands
+- After git-lfs install and asset pull, verified s2_v1.usd and SubUSDs/s2_v1_physics.usd are real binary USDC payloads rather than Git LFS pointers
+- Runtime result: scripts/load_walker_s2.py passed with s2_v1.usd using init_steps=120
+- Phase 2 result: robot loaded without crash, articulation root detected at /World/WalkerS2/base_link, joint_count=42, joint names printed, and LOG_ROOT/walker_s2_load_ok.txt written
+- Joint state read warning remains: dynamic_control did not find articulation at /World/WalkerS2 and articulation wrapper fallback failed; this is non-blocking because joint state printing was optional
+- Correct Walker S2 integration entrypoint for this phase: HRC_ROOT/assets/WalkerS2-Model-Challenge/WalkerS2-Model-Challenge/s2_v1.usd
+- Phase 2 status: PASS for robot load and articulation inspection baseline; next step is to commit this baseline before starting any robot control or task logic
