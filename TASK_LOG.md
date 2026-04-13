@@ -5,3 +5,5 @@
 - Created folders: src, scripts, configs, tests, docs
 - Added AGENTS.md, PROJECT_CONTEXT.md, TASK_LOG.md
 - Next step: create smoke test and basic requirements
+- Added tracked placeholders for empty project directories
+- Tightened repository hygiene ignores and simplified direct dependencies
