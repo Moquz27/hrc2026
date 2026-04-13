@@ -7,3 +7,4 @@
 - Next step: create smoke test and basic requirements
 - Added tracked placeholders for empty project directories
 - Tightened repository hygiene ignores and simplified direct dependencies
+- Added docs/context_full.md placeholder and updated agent context rules
