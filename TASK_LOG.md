@@ -46,3 +46,40 @@
 - Added docs/roadmap.md to define Phase 0 through Phase 4 with Phase 3 as the next active integration and validation phase
 - Updated PROJECT_CONTEXT.md so Current Phase points to Phase 3 and Phase 4 remains gated on Phase 3 exit criteria
 - Documentation-only update; no runtime code, training code, or scripts changed
+- Started Phase 3.1 minimal controllability baseline with scripts/control_walker_s2_arms.py
+- Purpose: load Walker S2, acquire the detected articulation root, read DOF observations, send small arm position targets, and log observed motion
+- Constraints: no task logic, object manipulation, perception, dataset use, training, or machine learning
+- Test result: Isaac runtime smoke passed with control_steps=40, articulation_path=/World/WalkerS2/base_link, selected_arm_dof_count=8, and max_abs_delta=0.05010388046503067
+- Runtime artifact: LOG_ROOT/walker_s2_arm_control_smoke.log
+- Added scripts/move_walker_s2_end_effector.py for a minimal right-arm Cartesian target smoke test
+- Purpose: identify the right-arm end-effector body, run simple damped least-squares IK over right-arm DOFs, and log target vs actual position
+- Constraints: no task logic, object manipulation, perception, dataset use, training, or machine learning
+- Test result: Isaac runtime smoke passed with end_effector_path=/World/WalkerS2/R_wrist_roll_link, target_position=[1.2711199712753296, -0.2775531601905823, 0.8609833312034607], actual_position=[1.275246500968933, -0.27807775139808655, 0.8502683043479919], and position_error=0.01149413953980893
+- Runtime artifact: LOG_ROOT/walker_s2_end_effector_target.log
+- Added scripts/grasp_static_object_smoke.py for a minimal fixed-target grasp primitive smoke test
+- Purpose: identify right gripper DOFs, verify open/close motion, move to pre-grasp/grasp/lift poses around one fixed cube target, and log the primitive sequence
+- Assumption: the cube is a static pose target; lift success measures end-effector vertical lift after gripper close, not physical object transport
+- Test result: Isaac runtime smoke passed with target_pose=[1.2711199712753296, -0.2775531601905823, 0.8209833312034607], actual_grasp_pose=[1.2714508771896362, -0.27760079503059387, 0.8601263761520386], actual_end_effector_pose=[1.2779146432876587, -0.2779400646686554, 0.8996994495391846], gripper_dof_names=['R_finger1_joint', 'R_finger2_joint'], gripper_verified=true, lift_delta=0.039573073387145996, and lift_succeeded=true
+- Runtime artifact: LOG_ROOT/walker_s2_static_grasp_smoke.log
+- Debugged visually unsafe Cartesian reaching behavior in scripts/move_walker_s2_end_effector.py and scripts/grasp_static_object_smoke.py
+- Root cause: the previous smoke used position-only wrist-link IK with one-shot targets, no front-workspace clamp, no posture bias, and no early stop/hold, so visually bad equivalent arm postures and small target chasing jitter were possible
+- Added front-workspace target clamping, small IK steps, posture bias, early stop/hold behavior, debug target/end-effector markers, and per-step commanded-vs-observed right-arm joint logging
+- Updated the static grasp smoke sequence to run approach_from_front -> move_down_grasp -> close gripper -> lift_up -> move_down_release -> open gripper
+- End-effector assumption: R_wrist_roll_link remains the selected frame because no palm/hand rigid body was identified by the current body-name filter
+- Test result: lightweight Python compile passed for the Cartesian target and static grasp scripts
+- Runtime result: GUI static grasp sanity run passed with --ik-steps 16, lift_delta=0.0317690372467041, release_pose reached within tolerance, and LOG_ROOT/walker_s2_static_grasp_smoke.log recorded the new IK trace
+- Current GUI result still failed visual motion sanity because the right arm could still appear backward; paused Cartesian grasp proof and switched to direct joint-space arm debugging
+- Added scripts/right_arm_joint_space_sanity.py for a minimal right-arm joint-space visual demo with no Cartesian IK, no task assets, no dataset, and no ML
+- Script logs right-arm DOF indices/names, right-gripper DOF indices/names, commanded targets, observed joint values, and optional one-joint-at-a-time diagnostics
+- Diagnostic result: R_shoulder_roll_joint positive moved the wrist backward in +x-forward convention, R_shoulder_roll_joint negative moved forward, R_elbow_roll_joint positive moved forward, and R_elbow_roll_joint negative moved backward
+- Updated the joint-space demo preset to use R_shoulder_roll_joint=-0.25 for front pose, raise by moving R_shoulder_roll_joint to -0.33, then lower back to -0.25; wrist and shoulder pitch are kept near zero
+- Test result: lightweight Python compile passed for scripts/right_arm_joint_space_sanity.py
+- Runtime result: diagnostic headless run passed and wrote LOG_ROOT/walker_s2_right_arm_joint_space_sanity.log
+- Runtime result: GUI joint-space demo passed and is held open with sequence front_pose -> raise_slightly -> lower_slightly -> gripper_close -> gripper_open
+- Added scripts/front_seeded_manipulation_motion.py for the next minimal front-seeded phased manipulation motion
+- Purpose: start every cycle from the validated right-arm front pose, then run move_to_front_pose -> move_slightly_above_front_target -> move_slightly_downward -> gripper_close -> lift_slightly_upward -> gripper_open using explicit joint-space targets
+- Root cause carried forward: the unsafe visual motion came from right-arm joint sign/posture assumptions and Cartesian IK freedom, so this script avoids general IK and keeps R_shoulder_roll_joint negative plus R_elbow_roll_joint slightly positive for front-facing motion
+- Motion tuning: control_steps reduced to 72 and settle_steps reduced to 12, with only small shoulder/elbow target deltas, to make the motion slightly faster and more visible without introducing large overshoot
+- Runtime result: headless 5-cycle run passed and wrote LOG_ROOT/walker_s2_front_seeded_manipulation_motion.log
+- Stability result: all 5 cycles reported cycle_passed_motion_sanity=true, front_facing_ok=true, overhead_ok=true, backward_deviation=0.0, overhead_deviation=0.0, and phase repeatability drift stayed near 1e-6 meters
+- Runtime result: GUI run passed the same 5-cycle sequence, updated LOG_ROOT/walker_s2_front_seeded_manipulation_motion.log, and is held open for visual inspection
