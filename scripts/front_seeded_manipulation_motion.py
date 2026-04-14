@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Walker S2 front-seeded right-arm phased manipulation motion demo.
+"""Walker S2 front-seeded right-arm phased motion baseline.
 
 Run this on the Linux runtime machine with Isaac Sim's Python environment. This
 script intentionally uses explicit joint-space phases instead of general
-Cartesian IK. It is only a visual motion sanity demo: no task assets, dataset,
-competition logic, or ML.
+Cartesian IK. It is the current strongest manipulation-related motion baseline,
+but it is still only motion sanity: no dynamic object transport, task assets,
+dataset, competition logic, or ML.
 """
 
 from __future__ import annotations

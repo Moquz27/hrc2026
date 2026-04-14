@@ -83,3 +83,68 @@
 - Runtime result: headless 5-cycle run passed and wrote LOG_ROOT/walker_s2_front_seeded_manipulation_motion.log
 - Stability result: all 5 cycles reported cycle_passed_motion_sanity=true, front_facing_ok=true, overhead_ok=true, backward_deviation=0.0, overhead_deviation=0.0, and phase repeatability drift stayed near 1e-6 meters
 - Runtime result: GUI run passed the same 5-cycle sequence, updated LOG_ROOT/walker_s2_front_seeded_manipulation_motion.log, and is held open for visual inspection
+- Performed minimal baseline standardization pass
+- Added docs/baseline_status.md to classify scripts as diagnostic, baseline, or experiment and to state current baseline maturity honestly
+- Updated README.md to point new agents at the current checks, strongest manipulation-related motion script, and unimplemented task gaps
+- Updated PROJECT_CONTEXT.md with the baseline status reference
+- Tightened docstrings for scripts/grasp_static_object_smoke.py and scripts/front_seeded_manipulation_motion.py so they do not imply verified object manipulation
+- No runtime logic was refactored; current working behavior is preserved
+- Test result: lightweight compile passed for scripts/grasp_static_object_smoke.py and scripts/front_seeded_manipulation_motion.py
+- Next step: add a minimal Task 1 dynamic-contact smoke test with object-centric pass/fail based on final workpiece pose
+- Verified official external resources setup
+- Initial resource state: Walker S2 model repo already existed under HRC_ROOT/assets and was verified first; baseline repo, official assets, and official dataset were missing
+- Downloaded missing resources outside the code repo: HRC_ROOT/baseline/GlobalHumanoidRobotChallenge_2026_Baseline, HRC_ROOT/assets/challenge2026_assets, and DATA_ROOT/challenge2026_dataset
+- Added scripts/inspect_official_assets.py for filesystem inventory, size checks, key-file listing, and Git LFS pointer detection
+- Added scripts/load_official_scene_smoke.py for Isaac validation of one official USD scene/object plus Walker S2 in the same stage
+- Filesystem validation result: baseline repo 2.0M, Walker S2 557M, official assets 2.5G, official dataset 1.7G, and no Git LFS pointer files detected
+- Isaac validation result: official table USD loaded with Walker S2; scene_prim_count=11, robot_prim_count=260, articulation_root=/World/WalkerS2/base_link, joint_count=42, and LOG_ROOT/official_scene_smoke.log reports status=official_scene_smoke_ok
+- Known Isaac warnings: Walker S2 emits non-fatal material binding scope warnings, one non-existent collision mesh path warning, and one corrupted normal primvar warning; no missing-resource or broken-payload failure was observed
+- Added docs/official_resources_inventory.md with resource paths, sizes, candidate task asset entrypoints, validation results, and readiness status
+- Current readiness: official resources are present and usable for Phase 3 inspection; baseline repo execution, official task reset/scoring mapping, dataset schema inspection, and full task-scene composition remain unverified
+- Next step: inspect the official baseline repo task configs and SceneBuilder to map asset-root handling, reset flow, action format, and intended scene composition before implementing task logic
+- Added scripts/validate_task1_object_assets.py for object-level Task 1 asset validation with official table visual, simple table-top collider, one Part A, and one Part B; no robot, perception, sorting, or task logic
+- Validation result: root visual assets resources/Task1_PartA.usd and resources/Part_B.usd have reasonable scale but no detected CollisionAPI/RigidBodyAPI, so they did not fall under gravity or rest on the table; treat these as not physics-ready for manipulation
+- Validation result: collected variants resources/Collected_Task1_PartA_red/Task1_PartA.usd and resources/Collected_Part_B_red/Part_B.usd passed physics validation
+- Part A collected result: size approximately 0.044 x 0.0225 x 0.036 m, collision_count=12, rigid_body_count=1, fell_under_gravity=true, rested_on_table=true, stable=true
+- Part B collected result: size approximately 0.0348 x 0.0646 x 0.0464 m, collision_count=34, rigid_body_count=1, fell_under_gravity=true, rested_on_table=true, stable=true
+- Table note: official Collected_table_v2/table_v2.usd exposes collision APIs, but this diagnostic pass/fail uses a simple tabletop collider so object physics is isolated from table-asset assumptions
+- Runtime artifact: LOG_ROOT/task1_object_asset_validation.log
+- Current object readiness: use collected Task 1 Part A/B variants for manipulation experiments; do not use root Task1_PartA.usd or Part_B.usd as physics-ready workpieces without adding/confirming collision and rigid body setup
+- Next step: inspect official baseline SceneBuilder/configs to confirm which workpiece USD variants it uses and how it instantiates physics before writing Task 1 manipulation logic
+- Inspected official baseline Task 1 asset usage in HRC_ROOT/baseline/GlobalHumanoidRobotChallenge_2026_Baseline/Ubtech_sim/source/SceneBuilder.py and Ubtech_sim/config/Part_Sorting.yaml
+- Confirmed Task 1 config uses collected physics-ready asset pools, not root visual USDs: Part A uses Collected_Task1_PartA_ori_color/Task1_PartA.usd or Collected_Task1_PartA_red/Task1_PartA.usd; Part B uses Collected_Part_B_blue/Part_B.usd or Collected_Part_B_ori_color/Part_B.usd
+- Confirmed Task 1 table config uses Collected_table_v2/table_v2.usd and the bin/box config uses Box_blank/box_60_40_23_cut_0.usd with lock_boxes=true
+- Confirmed SceneBuilder.build_parts creates Task 1 objects via rep.create.from_usd, then applies rep.physics.rigid_body(overwrite=True), rep.physics.mass, random rotation, and rep.randomizer.scatter_2d on the hidden scatter plane
+- Confirmed reset flow deletes/recreates Task 1 parts from the same asset pools, applies UsdPhysics.RigidBodyAPI and MassAPI to the root prim, randomizes pose in _create_parts_at_paths, resets boxes, and leaves scatter_after_reset as the post-world.reset pose randomization path
+- Local mismatch found: the baseline repo assets submodule directory is empty/missing resources, so Part_Sorting.yaml resolves to missing files under baseline/assets/resources unless the official assets are mounted/symlinked there or root_path is changed; the verified assets currently live under HRC_ROOT/assets/challenge2026_assets/resources
+- Validation result for configured pools from the verified assets tree: Part A original color, Part A red, Part B blue, and Part B original color all passed object-level physics checks with collision and rigid body present
+- Current Task 1 asset readiness: safe to build manipulation experiments on collected variants from the verified official assets tree, but not safe to run the unmodified baseline checkout until its assets/resources path is fixed
+- Next exact step: add a minimal baseline-scene smoke script that loads Part_Sorting.yaml through the official config loader with an explicit root_path override to HRC_ROOT/assets/challenge2026_assets/resources, builds table/box/parts only, steps physics, and logs actual spawned prim paths plus rigid-body detection
+- Added scripts/validate_task1_scene_builder_scene.py to validate the composed Task 1 runtime scene produced by the official SceneBuilder with root_path overridden in memory to HRC_ROOT/assets/challenge2026_assets/resources
+- Runtime result: SceneBuilder spawned 4 Task 1 parts at /Replicator/Ref_Xform_01 through /Replicator/Ref_Xform_04; by SceneBuilder order the first two are Part A and the last two are Part B
+- Part physics result: all 4 spawned parts had CollisionAPI and RigidBodyAPI, mass approximately 0.2 kg, no rigid-body schema issues, fell under gravity after lift, rested on the table, and had near-zero final jitter
+- Table result: SceneBuilder table at /Replicator/Ref_Xform had collision_count=2 and no rigid-body schema issues; parts rested on the table surface instead of falling through
+- Box/bin result: /Root/Box had collision_count=2 but rigid_body_count=19 with invalid schema issues, including RigidBodyAPI on non-xformable material/shader prims and nested rigid bodies under /Root/Box
+- Current composed Task 1 scene readiness: NOT READY for manipulation because the bin/box physics hierarchy is invalid, even though the SceneBuilder-spawned parts and table are usable
+- Runtime artifact: LOG_ROOT/task1_scene_builder_validation.log
+- Next exact step: inspect Box_blank/box_60_40_23_cut_0.usd and SceneBuilder._lock_box_positions to create a minimal diagnostic-only box collision fix or replacement strategy before any pick/place manipulation logic
+- Added scripts/diagnose_task1_bin_physics.py for focused Task 1 bin diagnostics
+- Standalone box asset result: Box_blank/box_60_40_23_cut_0.usd loaded cleanly enough for inspection, with collision_count=2, rigid_body_count=1 on /World/StandaloneBox/Group, and no rigid-body schema issues detected
+- SceneBuilder box result: build_box + _lock_box_positions changed the composed /Root/Box into an invalid hierarchy with collision_count=2, rigid_body_count=19, RigidBodyAPI on non-xformable material/shader prims, and nested rigid bodies under /Root/Box
+- Root cause classification: code, specifically SceneBuilder._lock_box_positions applying or preserving RigidBodyAPI too broadly under /Root/Box
+- Chosen unblock strategy: diagnostic_replacement_static_bin_collider, using the official box as visual geometry only and adding simple static floor/wall colliders for manipulation validation
+- Validation result: passed after stripping physics from the diagnostic visual box; official Part A fell under gravity, rested on the static bin floor, had jitter_last_30_steps_m near 5.7e-17, and did not explode
+- Runtime artifact: LOG_ROOT/task1_bin_physics_diagnostic.log
+- Remaining unverified: robot placement into the diagnostic bin, official scoring acceptance of diagnostic collider prims, and whether a targeted SceneBuilder._lock_box_positions fix is preferable after baseline ownership is decided
+- Next exact step: build a minimal Task 1 pick-place baseline against the SceneBuilder table/parts plus the diagnostic static bin collider, with object final-pose scoring and no perception
+- Added scripts/inspect_task1_pick_place_gui.py as a GUI-first Task 1 visual inspection script
+- Confirmed the script uses the official Task 1 YAML at Ubtech_sim/config/Part_Sorting.yaml; it does not use task1.yaml
+- Scene construction: loads Part_Sorting.yaml through the official config loader, overrides cfg["root_path"] in memory to HRC_ROOT/assets/challenge2026_assets/resources, builds only SceneBuilder table + Task 1 parts, loads Walker S2, and adds the diagnostic static bin collider instead of SceneBuilder.build_box
+- Visual flow: hold_initial_view -> move_to_front_pose -> move_to_pre_grasp -> pause -> descend -> pause -> close_gripper -> pause -> lift -> pause -> move_to_bin -> pause -> open_gripper -> pause -> settle
+- Debug aids: target part marker, pre-grasp marker, bin center marker, bin bbox corner markers, and final end-effector marker
+- Logging: writes LOG_ROOT/task1_pick_place_gui_inspection.log with selected target prim, target bbox/pose, inferred category if available, bin bounds, robot/articulation info, phase log, gripper observations, and final object pose
+- Important limitation: this is visual inspection only, not a scored baseline and not proof of grasp, transport, or successful sorting
+- Runtime dry check: headless short run completed and wrote status=inspection_complete with selected_target_part_prim=/Replicator/Ref_Xform_01
+- Runtime warnings observed during dry check: Isaac/PhysX still emits Walker S2 joint/property warnings in the composed scene; the script avoids applying the Part_Sorting.yaml robot pose by default because that path produced stronger invalid-transform warnings during testing
+- User GUI check should verify robot/table/bin relative placement, visible target markers, arm phase direction, gripper open/close visibility, absence of collisions/explosions, and whether the destination bin position is plausible for Task 1
+- Next exact step: manually run the GUI inspection with --gui --hold-open and tune only the minimal robot/bin/phase pose parameters needed before attempting object-contact pick/place

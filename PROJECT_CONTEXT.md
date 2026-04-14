@@ -52,3 +52,4 @@ Assumptions:
 
 Reference:
 - Full detailed context is in docs/context_full.md
+- Current baseline maturity and script classification are in docs/baseline_status.md

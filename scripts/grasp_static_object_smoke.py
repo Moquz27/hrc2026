@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Minimal Walker S2 single-object grasp primitive smoke test in Isaac Sim.
+"""Minimal Walker S2 fixed-target grasp-position smoke test in Isaac Sim.
 
 Run this on the Linux runtime machine with Isaac Sim's Python environment. This
-script validates the next deterministic primitive after Cartesian reaching:
+script checks the next deterministic primitive after Cartesian reaching:
 open the right gripper, move above one fixed cube target, descend, close the
-gripper, and lift vertically. It intentionally contains no competition task
-logic, dataset use, perception, or learning code.
+gripper, and lift the wrist vertically. It intentionally contains no competition
+task logic, dataset use, perception, or learning code. It does not verify
+physical object transport.
 """
 
 from __future__ import annotations
