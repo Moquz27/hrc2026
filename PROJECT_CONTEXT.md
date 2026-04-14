@@ -1,5 +1,9 @@
 Project: HRC 2026 Robotics Competition
 
+## Official Resources
+Official external competition resources are tracked in `docs/resources.md`.
+Use that file to distinguish baseline code, simulation assets, dataset resources, and the Walker S2 robot model source.
+
 ## Current Phase
 
 - Current major phase: Phase 3 - Competition Stack Integration & Validation
