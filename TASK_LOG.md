@@ -43,3 +43,6 @@
 - Joint state read warning remains: dynamic_control did not find articulation at /World/WalkerS2 and articulation wrapper fallback failed; this is non-blocking because joint state printing was optional
 - Correct Walker S2 integration entrypoint for this phase: HRC_ROOT/assets/WalkerS2-Model-Challenge/WalkerS2-Model-Challenge/s2_v1.usd
 - Phase 2 status: PASS for robot load and articulation inspection baseline; next step is to commit this baseline before starting any robot control or task logic
+- Added docs/roadmap.md to define Phase 0 through Phase 4 with Phase 3 as the next active integration and validation phase
+- Updated PROJECT_CONTEXT.md so Current Phase points to Phase 3 and Phase 4 remains gated on Phase 3 exit criteria
+- Documentation-only update; no runtime code, training code, or scripts changed

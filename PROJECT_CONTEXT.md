@@ -1,5 +1,14 @@
 Project: HRC 2026 Robotics Competition
 
+## Current Phase
+
+- Current major phase: Phase 3 - Competition Stack Integration & Validation
+- Current status: next active phase after Phase 2 passed
+- Phase 3 focus: make the full competition stack runnable and debuggable before algorithm optimization
+- Phase 4 starts only after all Phase 3 exit criteria pass
+
+Phase 0, Phase 1, and Phase 2 are complete. Phase 3 is integration and validation, not serious optimization. Phase 4 is reserved for algorithm and ML optimization after the stack is stable.
+
 Architecture:
 - Mac: development machine (coding, planning, lightweight testing)
 - Linux: runtime machine (simulation, evaluation, dataset, logs)
@@ -28,9 +37,9 @@ Development Strategy:
 - Avoid large refactors without benchmark evidence
 
 Current Focus:
-- Phase: Infrastructure + baseline setup
-- Goal: build minimal pipeline for Task 1
-- No learning-based methods yet (IL/ACT later)
+- Phase: Competition stack integration and validation
+- Goal: make official resources, scenes, baseline, dataset access, and robot motion debuggable
+- No serious algorithm or ML optimization until Phase 3 passes
 
 Assumptions:
 - Dataset not fully available yet
