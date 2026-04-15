@@ -220,3 +220,9 @@
 - Depth comparison: pregrasp_error was unchanged at approximately 0.304866 m for all offsets; grasp_depth segment error worsened slightly from approximately 0.2062 m at offset 0.0 to 0.2086 m at -0.005 and 0.2111 m at -0.010, so grasp depth is not yet the main lever for this target
 - Runtime artifacts: LOG_ROOT/task1_smooth_autoseed_multi_object_baseline_20260415T012103Z_depth_sweep_seed1_target2_offset_0p000.log, LOG_ROOT/task1_smooth_autoseed_multi_object_baseline_20260415T012642Z_depth_sweep_seed1_target2_offset_m0p005.log, and LOG_ROOT/task1_smooth_autoseed_multi_object_baseline_20260415T013205Z_depth_sweep_seed1_target2_offset_m0p010.log
 - Next tuning recommendation: do not deepen grasp further for this target; next single knob family should be approach/soft waypoint reachability before contact-dwell, because the failure occurs before a valid grasp/lift comparison can be made
+
+## 2026-04-15
+- Added pregrasp geometry diagnostics to scripts/task1_smooth_autoseed_multi_object_baseline.py without changing the motion executor or tuning grasp depth, dwell, carry, place, or release behavior
+- New diagnostic print/payload fields record object center, bbox top z, pregrasp target, robot base position, forward/lateral offsets, horizontal reach, vertical reach, table clearance, and full base-to-pregrasp distance
+- Lightweight test result: python3 -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Runtime limitation: no Isaac runtime was run on Mac; seed=1 target-index=2 numeric geometry still needs a Linux diagnostic run or the referenced LOG_ROOT artifacts

@@ -168,6 +168,39 @@ def _distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b))
 
 
+def _pregrasp_geometry_summary(
+    *,
+    target_index: int,
+    target_path: str,
+    object_center: np.ndarray,
+    bbox_top_z: float,
+    pre_grasp_position: np.ndarray,
+    robot_base_position: list[float],
+    table_top_z: float,
+) -> dict[str, Any]:
+    robot_base = np.array(robot_base_position, dtype=float)
+    delta = pre_grasp_position - robot_base
+    return {
+        "target_index": target_index,
+        "target_path": target_path,
+        "reference_frame": "world",
+        "object_center": object_center.tolist(),
+        "bbox_top_z": float(bbox_top_z),
+        "pre_grasp_target": pre_grasp_position.tolist(),
+        "robot_base_position": robot_base.tolist(),
+        "forward_offset_x": float(delta[0]),
+        "lateral_offset_y": float(delta[1]),
+        "horizontal_reach_distance": float(np.linalg.norm(delta[:2])),
+        "vertical_reach_requirement": float(delta[2]),
+        "table_clearance": float(pre_grasp_position[2] - table_top_z),
+        "full_base_to_pregrasp_distance": float(np.linalg.norm(delta)),
+    }
+
+
+def _print_pregrasp_geometry(summary: dict[str, Any]) -> None:
+    print(f"pregrasp_geometry={json.dumps(summary, sort_keys=True)}")
+
+
 def _parse_bounds(raw_values: list[float], name: str) -> tuple[float, float]:
     if len(raw_values) != 2:
         raise RuntimeError(f"{name} requires exactly two values")
@@ -1185,6 +1218,7 @@ def _attempt_pick_place_target(
     front_workspace_y: tuple[float, float],
     front_workspace_z: tuple[float, float],
     table_top_z: float,
+    robot_base_position: list[float],
     bin_bbox: dict[str, list[float]],
     bin_collider: dict[str, Any],
     marker_paths: list[str],
@@ -1275,6 +1309,16 @@ def _attempt_pick_place_target(
         front_workspace_z,
         table_top_z,
     )
+    pre_grasp_geometry = _pregrasp_geometry_summary(
+        target_index=target_index,
+        target_path=target_path,
+        object_center=initial_center,
+        bbox_top_z=float(initial_state["bbox"]["max"][2]),
+        pre_grasp_position=np.array(pre_grasp_pose["position"], dtype=float),
+        robot_base_position=robot_base_position,
+        table_top_z=table_top_z,
+    )
+    _print_pregrasp_geometry(pre_grasp_geometry)
     marker_paths.extend(
         [
             _debug_marker(stage, f"/World/DebugTask1Target_{target_index}", initial_state["bbox"]["center"], 0.025, (1.0, 0.2, 0.1)),
@@ -1290,6 +1334,7 @@ def _attempt_pick_place_target(
             "category_inference_method": category_inference_method,
             "initial_pose": initial_state,
             "pre_grasp_pose": pre_grasp_pose,
+            "pre_grasp_geometry": pre_grasp_geometry,
             "descend_pose": descend_pose,
             "bin_drop_pose": bin_drop_pose,
             "target_workspace_checks": target_workspace_checks,
@@ -1923,6 +1968,16 @@ def main() -> int:
             front_workspace_z,
             table_top_z,
         )
+        pre_grasp_geometry = _pregrasp_geometry_summary(
+            target_index=attempt_indices[0],
+            target_path=target_path,
+            object_center=initial_center,
+            bbox_top_z=float(initial_state["bbox"]["max"][2]),
+            pre_grasp_position=np.array(pre_grasp_pose["position"], dtype=float),
+            robot_base_position=configured_robot_position,
+            table_top_z=table_top_z,
+        )
+        _print_pregrasp_geometry(pre_grasp_geometry)
         marker_paths = [
             _debug_marker(stage, "/World/DebugTask1Target", initial_state["bbox"]["center"], 0.025, (1.0, 0.2, 0.1)),
             _debug_marker(stage, "/World/DebugTask1PreGraspFront", pre_grasp_pose["position"], 0.025, (0.2, 0.6, 1.0)),
@@ -1989,6 +2044,7 @@ def main() -> int:
         }
         payload["task_space_targets"] = {
             "pre_grasp": pre_grasp_pose,
+            "pre_grasp_geometry": pre_grasp_geometry,
             "descend": descend_pose,
             "bin_drop": bin_drop_pose,
             "continuous_cycle": "per-object plan logged inside multi_object.attempts[].continuous_motion_plan",
@@ -2144,6 +2200,7 @@ def main() -> int:
                 front_workspace_y=front_workspace_y,
                 front_workspace_z=front_workspace_z,
                 table_top_z=table_top_z,
+                robot_base_position=configured_robot_position,
                 bin_bbox=bin_bbox,
                 bin_collider=bin_collider,
                 marker_paths=marker_paths,
