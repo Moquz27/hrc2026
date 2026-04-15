@@ -3,8 +3,8 @@
 
 This is a copied variant of the validated one-object baseline. It preserves the
 official scene path, validated grasp/contact geometry, and gripper effort hold,
-then adds smoother phase transitions, runtime auto-seeding, and an in-scene
-one-arm loop over spawned Task 1 objects.
+then adds runtime auto-seeding, an in-scene one-arm loop over spawned Task 1
+objects, and a queued continuous waypoint cycle with short contact-only dwell.
 
 It does not run perception, A/B classification, or Thinker/model integration.
 """
@@ -18,6 +18,7 @@ import math
 import random
 import sys
 import traceback
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,7 @@ OFFICIAL_GRIPPER_OPEN_WIDTH = -0.0215
 OFFICIAL_GRIPPER_CLOSE_WIDTH = 0.01
 DEFAULT_GRIPPER_HOLD_EFFORT = 100.0
 DEFAULT_DESCEND_CLEARANCE = 0.015
+DEFAULT_GRASP_DEPTH_TUNING_OFFSET = -0.005
 DEFAULT_PRE_GRASP_CLEARANCE = 0.10
 DEFAULT_SAFE_DROP_HEIGHT = 0.10
 DEFAULT_STABLE_JITTER = 0.01
@@ -97,6 +99,13 @@ DEFAULT_FRONT_WORKSPACE_Y = (-0.75, 0.45)
 DEFAULT_FRONT_WORKSPACE_Z = (0.55, 1.20)
 DEFAULT_MIN_EE_TABLE_CLEARANCE = 0.025
 DEFAULT_IK_MAX_STEP = 0.03
+DEFAULT_CONTINUOUS_SOFT_TOLERANCE = 0.18
+DEFAULT_CONTINUOUS_BLEND_RADIUS = 0.05
+DEFAULT_CONTINUOUS_CONTACT_DWELL_STEPS = 8
+DEFAULT_CARRY_STABILIZATION_STEPS = 0
+DEFAULT_PLACE_DEPTH_OFFSET = 0.0
+DEFAULT_RELEASE_TIMING_DWELL_STEPS = 0
+DEFAULT_MICRO_STOP_SPEED_THRESHOLD = 0.0005
 OFFICIAL_ROBOT_PRIM_PATH = "/Root/Ref_Xform/Ref"
 OFFICIAL_ROBOT_NAME = "walkerS2"
 
@@ -124,6 +133,23 @@ class RunFailure(RuntimeError):
     def __init__(self, reason: str, message: str):
         super().__init__(message)
         self.reason = reason
+
+
+@dataclass
+class MotionSegment:
+    name: str
+    phase_tag: str
+    target_position: np.ndarray
+    waypoint_type: str
+    speed_profile: str
+    max_ik_steps: int
+    stop_tolerance: float
+    hold_steps: int
+    blend_radius: float
+    event_marker: str | None = None
+    contact_window: bool = False
+    gripper_effort: float | None = None
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 def _as_path(raw_path: str | None, default_path: Path) -> Path:
@@ -386,6 +412,444 @@ def _run_updates(sim_app: Any, steps: int, counter: dict[str, int]) -> None:
     for _ in range(steps):
         sim_app.update()
         counter["step"] += 1
+
+
+def _active_tuning_knob(args: argparse.Namespace) -> str:
+    if abs(float(args.grasp_depth_offset)) > 1e-9:
+        return "grasp_depth"
+    if args.carry_stabilization_steps > 0:
+        return "carry_stabilization"
+    if abs(float(args.place_depth_offset)) > 1e-9:
+        return "place_depth"
+    if args.release_timing_dwell_steps > 0:
+        return "release_timing"
+    if args.continuous_contact_dwell_steps != DEFAULT_CONTINUOUS_CONTACT_DWELL_STEPS:
+        return "contact_dwell"
+    if args.continuous_soft_tolerance != DEFAULT_CONTINUOUS_SOFT_TOLERANCE:
+        return "soft_tolerance"
+    return "baseline_defaults"
+
+
+def _tuning_knob_summary(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "active_knob_family": _active_tuning_knob(args),
+        "policy": "one_knob_family_per_controlled_sweep",
+        "targeted_failure_pattern": "miss_grasp_or_close_but_no_lift",
+        "grasp_depth": {
+            "descend_clearance": args.descend_clearance,
+            "grasp_depth_offset": args.grasp_depth_offset,
+            "effective_clearance": args.descend_clearance + args.grasp_depth_offset,
+        },
+        "contact_dwell": {
+            "continuous_contact_dwell_steps": args.continuous_contact_dwell_steps,
+        },
+        "carry_stabilization": {
+            "carry_stabilization_steps": args.carry_stabilization_steps,
+        },
+        "place_depth": {
+            "safe_drop_height": args.safe_drop_height,
+            "place_depth_offset": args.place_depth_offset,
+        },
+        "release_timing": {
+            "release_timing_dwell_steps": args.release_timing_dwell_steps,
+        },
+        "soft_tolerance": {
+            "continuous_soft_tolerance": args.continuous_soft_tolerance,
+        },
+    }
+
+
+def _build_continuous_cycle_plan(
+    *,
+    pre_grasp_target: np.ndarray,
+    grasp_depth_target: np.ndarray,
+    lift_clearance_target: np.ndarray,
+    prebin_target: np.ndarray,
+    place_depth_target: np.ndarray,
+    retreat_target: np.ndarray,
+    args: argparse.Namespace,
+) -> list[MotionSegment]:
+    soft_hold_steps = 0 if args.smooth_motion else args.ik_hold_steps
+    contact_hold_steps = args.continuous_contact_dwell_steps if args.smooth_motion else args.ik_hold_steps
+    soft_tolerance = args.continuous_soft_tolerance if args.smooth_motion else args.ik_stop_tolerance
+    return [
+        MotionSegment(
+            name="continuous_pregrasp",
+            phase_tag="approach",
+            target_position=pre_grasp_target,
+            waypoint_type="soft",
+            speed_profile="transit_blended",
+            max_ik_steps=args.ik_steps,
+            stop_tolerance=soft_tolerance,
+            hold_steps=soft_hold_steps,
+            blend_radius=args.continuous_blend_radius,
+            details={"legacy_phase": "move_to_pre_grasp_front"},
+        ),
+        MotionSegment(
+            name="continuous_grasp_depth",
+            phase_tag="grasp_window",
+            target_position=grasp_depth_target,
+            waypoint_type="hard",
+            speed_profile="slow_contact_approach",
+            max_ik_steps=args.ik_steps,
+            stop_tolerance=args.ik_stop_tolerance,
+            hold_steps=contact_hold_steps,
+            blend_radius=0.0,
+            event_marker="close_gripper",
+            contact_window=True,
+            details={"legacy_phase": "descend_front"},
+        ),
+        MotionSegment(
+            name="continuous_lift_clearance",
+            phase_tag="lift",
+            target_position=lift_clearance_target,
+            waypoint_type="hard",
+            speed_profile="slow_grasp_validation_lift",
+            max_ik_steps=args.ik_steps,
+            stop_tolerance=args.ik_stop_tolerance,
+            hold_steps=contact_hold_steps,
+            blend_radius=0.0,
+            contact_window=True,
+            gripper_effort=args.gripper_hold_effort,
+            details={"legacy_phase": "grasp_validation_and_lift_front"},
+        ),
+        MotionSegment(
+            name="continuous_prebin",
+            phase_tag="carry",
+            target_position=prebin_target,
+            waypoint_type="soft",
+            speed_profile="transit_blended_with_grip_effort",
+            max_ik_steps=args.ik_steps,
+            stop_tolerance=soft_tolerance,
+            hold_steps=soft_hold_steps,
+            blend_radius=args.continuous_blend_radius,
+            gripper_effort=args.gripper_hold_effort,
+            details={"legacy_phase": "move_to_bin_front"},
+        ),
+        MotionSegment(
+            name="continuous_place_depth",
+            phase_tag="place_window",
+            target_position=place_depth_target,
+            waypoint_type="hard",
+            speed_profile="slow_place_release",
+            max_ik_steps=args.ik_steps,
+            stop_tolerance=args.ik_stop_tolerance,
+            hold_steps=contact_hold_steps,
+            blend_radius=0.0,
+            event_marker="open_gripper",
+            contact_window=True,
+            gripper_effort=args.gripper_hold_effort,
+            details={"legacy_phase": "release"},
+        ),
+        MotionSegment(
+            name="continuous_retreat",
+            phase_tag="retreat",
+            target_position=retreat_target,
+            waypoint_type="soft",
+            speed_profile="transit_blended_after_release",
+            max_ik_steps=args.ik_steps,
+            stop_tolerance=soft_tolerance,
+            hold_steps=soft_hold_steps,
+            blend_radius=args.continuous_blend_radius,
+            details={"legacy_phase": "retreat"},
+        ),
+    ]
+
+
+def _trigger_motion_event(
+    *,
+    event_marker: str,
+    dc: Any,
+    gripper_dofs: list[tuple[int, Any, str]],
+    sim_app: Any,
+    args: argparse.Namespace,
+    counter: dict[str, int],
+) -> tuple[dict[str, Any], float | None]:
+    if event_marker == "close_gripper":
+        if args.skip_gripper_close:
+            effort_result = _run_updates_with_optional_gripper_effort(
+                sim_app,
+                args.continuous_contact_dwell_steps,
+                counter,
+                dc,
+                gripper_dofs,
+                args.gripper_hold_effort,
+            )
+            return {
+                "event_marker": event_marker,
+                "skipped": True,
+                "dwell_steps": args.continuous_contact_dwell_steps,
+                "gripper_effort": effort_result,
+            }, args.gripper_hold_effort
+        close_targets = [OFFICIAL_GRIPPER_CLOSE_WIDTH] * len(gripper_dofs)
+        _send_position_targets(dc, gripper_dofs, close_targets)
+        effort_result = _run_updates_with_optional_gripper_effort(
+            sim_app,
+            args.continuous_contact_dwell_steps,
+            counter,
+            dc,
+            gripper_dofs,
+            args.gripper_hold_effort,
+        )
+        return {
+            "event_marker": event_marker,
+            "skipped": False,
+            "dwell_steps": args.continuous_contact_dwell_steps,
+            "commanded_targets": _named_positions(gripper_dofs, close_targets),
+            "gripper_effort": effort_result,
+        }, args.gripper_hold_effort
+
+    if event_marker == "open_gripper":
+        if args.skip_release:
+            effort_result = _run_updates_with_optional_gripper_effort(
+                sim_app,
+                args.continuous_contact_dwell_steps,
+                counter,
+                dc,
+                gripper_dofs,
+                0.0,
+            )
+            return {
+                "event_marker": event_marker,
+                "skipped": True,
+                "dwell_steps": args.continuous_contact_dwell_steps,
+                "gripper_effort": effort_result,
+            }, 0.0
+        open_targets = [OFFICIAL_GRIPPER_OPEN_WIDTH] * len(gripper_dofs)
+        _send_position_targets(dc, gripper_dofs, open_targets)
+        effort_result = _run_updates_with_optional_gripper_effort(
+            sim_app,
+            args.continuous_contact_dwell_steps,
+            counter,
+            dc,
+            gripper_dofs,
+            0.0,
+        )
+        return {
+            "event_marker": event_marker,
+            "skipped": False,
+            "dwell_steps": args.continuous_contact_dwell_steps,
+            "commanded_targets": _named_positions(gripper_dofs, open_targets),
+            "gripper_effort": effort_result,
+        }, None
+
+    raise RuntimeError(f"Unknown motion event marker: {event_marker}")
+
+
+def _micro_stop_estimate(
+    *,
+    start_position: np.ndarray,
+    trace: list[dict[str, Any]],
+    frame_span_per_trace_sample: int,
+    threshold: float,
+    contact_window: bool,
+) -> dict[str, Any]:
+    if contact_window:
+        return {"micro_stop_frames": 0, "micro_stop_samples": 0}
+    previous = start_position
+    micro_stop_frames = 0
+    micro_stop_samples = 0
+    for sample in trace:
+        actual = np.array(sample["actual"], dtype=float)
+        speed = _distance(previous, actual) / float(max(frame_span_per_trace_sample, 1))
+        if speed <= threshold:
+            micro_stop_samples += 1
+            micro_stop_frames += frame_span_per_trace_sample
+        previous = actual
+    return {
+        "micro_stop_frames": micro_stop_frames,
+        "micro_stop_samples": micro_stop_samples,
+    }
+
+
+def _execute_continuous_motion_cycle(
+    *,
+    target_index: int,
+    target_path: str,
+    stage: Any,
+    dc: Any,
+    articulation: Any,
+    arm_dofs: list[tuple[int, Any, str]],
+    gripper_dofs: list[tuple[int, Any, str]],
+    end_effector_body: Any,
+    sim_app: Any,
+    args: argparse.Namespace,
+    counter: dict[str, int],
+    phase_log: list[dict[str, Any]],
+    segments: list[MotionSegment],
+) -> dict[str, Any]:
+    cycle_start_step = counter["step"]
+    frame_span_per_trace_sample = (len(arm_dofs) + 1) * args.ik_settle_steps
+    metrics: dict[str, Any] = {
+        "target_index": target_index,
+        "cycle_start_step": cycle_start_step,
+        "segment_count": len(segments),
+        "micro_stop_frames": 0,
+        "micro_stop_samples": 0,
+        "micro_stop_speed_threshold_m_per_frame": args.micro_stop_speed_threshold,
+        "phase_tags": ["approach", "grasp_window", "post_close_verify", "lift", "carry", "place_window", "retreat"],
+        "tuning_knobs": _tuning_knob_summary(args),
+        "close_event_fired": False,
+        "open_event_fired": False,
+        "snapshots": {},
+        "segment_summaries": [],
+    }
+    active_effort: float | None = None
+
+    for segment in segments:
+        start_step = counter["step"]
+        start_ee = _body_pose_position(dc, end_effector_body)
+        if active_effort is not None:
+            effort_before = _apply_gripper_effort(dc, gripper_dofs, active_effort)
+            if not effort_before["supported"]:
+                raise RuntimeError(f"Gripper effort command failed before {segment.name}: {effort_before}")
+        else:
+            effort_before = None
+        if segment.gripper_effort is not None:
+            effort_before = _apply_gripper_effort(dc, gripper_dofs, segment.gripper_effort)
+            if not effort_before["supported"]:
+                raise RuntimeError(f"Gripper effort command failed before {segment.name}: {effort_before}")
+            active_effort = segment.gripper_effort
+
+        trace: list[dict[str, Any]] = []
+        actual_position, position_error = move_end_effector_to_target(
+            dc,
+            articulation,
+            arm_dofs,
+            end_effector_body,
+            segment.target_position,
+            sim_app,
+            segment.max_ik_steps,
+            args.ik_settle_steps,
+            args.ik_position_eps,
+            args.ik_damping,
+            args.ik_max_step,
+            posture_positions=np.array(_current_positions(dc, arm_dofs), dtype=float),
+            posture_gain=args.ik_posture_gain,
+            stop_tolerance=segment.stop_tolerance,
+            hold_steps=segment.hold_steps,
+            phase_label=segment.name,
+            trace=trace,
+        )
+        counter["step"] += len(trace) * frame_span_per_trace_sample + segment.hold_steps
+        if active_effort is not None:
+            effort_after = _apply_gripper_effort(dc, gripper_dofs, active_effort)
+            if not effort_after["supported"]:
+                raise RuntimeError(f"Gripper effort command failed after {segment.name}: {effort_after}")
+        else:
+            effort_after = None
+
+        event_details = None
+        if segment.event_marker is not None:
+            if segment.event_marker == "open_gripper" and args.release_timing_dwell_steps > 0:
+                _run_updates_with_optional_gripper_effort(
+                    sim_app,
+                    args.release_timing_dwell_steps,
+                    counter,
+                    dc,
+                    gripper_dofs,
+                    active_effort,
+                )
+            metrics["snapshots"][f"before_{segment.event_marker}"] = _bbox_state(stage, target_path)
+            event_details, active_effort = _trigger_motion_event(
+                event_marker=segment.event_marker,
+                dc=dc,
+                gripper_dofs=gripper_dofs,
+                sim_app=sim_app,
+                args=args,
+                counter=counter,
+            )
+            if segment.event_marker == "close_gripper":
+                metrics["close_event_fired"] = True
+            if segment.event_marker == "open_gripper":
+                metrics["open_event_fired"] = True
+            metrics["snapshots"][f"after_{segment.event_marker}"] = _bbox_state(stage, target_path)
+
+        snapshot_name = f"after_{segment.name}"
+        metrics["snapshots"][snapshot_name] = _bbox_state(stage, target_path)
+        stop_estimate = _micro_stop_estimate(
+            start_position=start_ee,
+            trace=trace,
+            frame_span_per_trace_sample=frame_span_per_trace_sample,
+            threshold=args.micro_stop_speed_threshold,
+            contact_window=segment.contact_window,
+        )
+        if not segment.contact_window and segment.hold_steps > 0:
+            stop_estimate["micro_stop_frames"] += segment.hold_steps
+        if segment.phase_tag == "carry" and args.carry_stabilization_steps > 0:
+            carry_effort = active_effort if active_effort is not None else segment.gripper_effort
+            carry_stabilization_effort = _run_updates_with_optional_gripper_effort(
+                sim_app,
+                args.carry_stabilization_steps,
+                counter,
+                dc,
+                gripper_dofs,
+                carry_effort,
+            )
+            metrics["snapshots"]["after_carry_stabilization"] = _bbox_state(stage, target_path)
+        else:
+            carry_stabilization_effort = None
+        metrics["micro_stop_frames"] += int(stop_estimate["micro_stop_frames"])
+        metrics["micro_stop_samples"] += int(stop_estimate["micro_stop_samples"])
+
+        condition_met = bool(
+            position_error <= segment.stop_tolerance
+            or (segment.waypoint_type == "soft" and position_error <= args.pre_grasp_ee_tolerance)
+        )
+        segment_summary = {
+            "name": segment.name,
+            "phase_tag": segment.phase_tag,
+            "waypoint_type": segment.waypoint_type,
+            "speed_profile": segment.speed_profile,
+            "blend_radius": segment.blend_radius,
+            "target_position": segment.target_position.tolist(),
+            "actual_position": actual_position.tolist(),
+            "position_error": position_error,
+            "condition_met": condition_met,
+            "contact_window": segment.contact_window,
+            "event_marker": segment.event_marker,
+            "micro_stop_estimate": stop_estimate,
+        }
+        metrics["segment_summaries"].append(segment_summary)
+        details = {
+            "target_index": target_index,
+            "continuous_motion": True,
+            "phase_tag": segment.phase_tag,
+            "waypoint_type": segment.waypoint_type,
+            "speed_profile": segment.speed_profile,
+            "blend_radius": segment.blend_radius,
+            "target_position": segment.target_position.tolist(),
+            "position_error": position_error,
+            "ik_step_count": len(trace),
+            "ik_trace": trace,
+            "stop_tolerance": segment.stop_tolerance,
+            "hold_steps": segment.hold_steps,
+            "gripper_effort_before_segment": effort_before,
+            "gripper_effort_after_segment": effort_after,
+            "event": event_details,
+            "carry_stabilization_steps": args.carry_stabilization_steps if segment.phase_tag == "carry" else 0,
+            "carry_stabilization_effort": carry_stabilization_effort,
+        }
+        details.update(segment.details)
+        _append_phase(
+            phase_log,
+            phase=segment.name,
+            start_step=start_step,
+            end_step=counter["step"],
+            commanded_targets=_named_positions(arm_dofs, _current_positions(dc, arm_dofs)),
+            ee_position=actual_position,
+            gripper_values=_gripper_values(dc, gripper_dofs),
+            condition_met=condition_met,
+            details=details,
+        )
+        print(
+            f"phase={segment.name} waypoint_type={segment.waypoint_type} "
+            f"position_error={position_error} event={segment.event_marker}"
+        )
+
+    metrics["cycle_end_step"] = counter["step"]
+    metrics["cycle_time_steps"] = counter["step"] - cycle_start_step
+    return metrics
 
 
 def _smooth_pause_steps(args: argparse.Namespace, phase_name: str) -> int:
@@ -656,18 +1120,49 @@ def _fail(reason: str, message: str) -> None:
 
 def _phase_from_failure_reason(reason: str) -> str:
     mapping = {
-        "target_outside_front_workspace": "target_selection",
-        "pre_grasp_unreachable": "move_to_pre_grasp_front",
-        "descend_failed": "descend_front",
-        "gripper_command_failed": "close_gripper",
-        "object_not_lifted": "grasp_validation",
-        "dropped_during_lift": "lift_front",
-        "dropped_during_transport": "move_to_bin_front",
-        "release_failed": "release",
-        "object_outside_bin": "settle",
-        "object_unstable_after_settle": "settle",
+        "target_outside_front_workspace": "approach",
+        "pre_grasp_unreachable": "approach",
+        "descend_failed": "grasp_window",
+        "gripper_command_failed": "grasp_window",
+        "continuous_motion_failed": "approach",
+        "object_not_lifted": "post_close_verify",
+        "dropped_during_lift": "lift",
+        "dropped_during_transport": "carry",
+        "release_failed": "place_window",
+        "object_outside_bin": "place_window",
+        "object_unstable_after_settle": "retreat",
     }
     return mapping.get(reason, "unknown")
+
+
+def _retained_with_gripper(
+    *,
+    object_center: np.ndarray,
+    ee_position: np.ndarray,
+    initial_center: np.ndarray,
+    min_lift_delta: float,
+    distance_tolerance: float,
+) -> bool:
+    return bool(
+        object_center[2] >= initial_center[2] + min_lift_delta
+        and _distance(ee_position, object_center) <= distance_tolerance
+    )
+
+
+def _failure_kind(result: dict[str, Any], reason: str) -> str:
+    if reason in {"pre_grasp_unreachable", "descend_failed"}:
+        return "miss_grasp"
+    if reason == "object_not_lifted":
+        return "close_but_no_lift" if result.get("close_event_fired") else "miss_grasp"
+    if reason in {"dropped_during_lift", "dropped_during_transport"}:
+        return "lift_then_slip_during_carry"
+    if reason == "object_outside_bin":
+        return "release_timing_failure" if result.get("object_retained_at_preplace") else "near_bin_place_failure"
+    if reason == "object_unstable_after_settle":
+        return "near_bin_place_failure"
+    if reason == "release_failed":
+        return "release_timing_failure"
+    return "runtime_or_safety_failure"
 
 
 def _attempt_pick_place_target(
@@ -697,12 +1192,22 @@ def _attempt_pick_place_target(
     result: dict[str, Any] = {
         "attempt_number": attempt_number,
         "target_index": target_index,
+        "selected_object_id": target_path,
         "target_prim": target_path,
         "success": False,
+        "failure_phase": None,
         "failure_reason": None,
         "first_failing_phase": None,
         "object_lifted": False,
         "object_retained_after_lift": False,
+        "close_event_fired": False,
+        "open_event_fired": False,
+        "lift_height_threshold_achieved": False,
+        "object_retained_at_carry_midpoint": None,
+        "object_retained_at_carry_midpoint_source": "not_evaluated",
+        "object_retained_at_prebin": None,
+        "object_retained_at_preplace": None,
+        "release_timing_failure_suspected": False,
         "object_transported": False,
         "final_inside_bin": False,
         "object_stable": False,
@@ -713,6 +1218,7 @@ def _attempt_pick_place_target(
         "pre_grasp_unreachable",
         "descend_failed",
         "gripper_command_failed",
+        "continuous_motion_failed",
         "release_failed",
     }
 
@@ -738,7 +1244,10 @@ def _attempt_pick_place_target(
         "position": [
             initial_state["bbox"]["center"][0],
             initial_state["bbox"]["center"][1],
-            max(initial_state["bbox"]["max"][2] + args.descend_clearance, table_top_z + args.min_ee_table_clearance),
+            max(
+                initial_state["bbox"]["max"][2] + args.descend_clearance + args.grasp_depth_offset,
+                table_top_z + args.min_ee_table_clearance,
+            ),
         ],
         "orientation": "fixed_downward",
         "orientation_search": False,
@@ -796,94 +1305,113 @@ def _attempt_pick_place_target(
             )
 
         pre_grasp_target_np = np.array(pre_grasp_pose["position"], dtype=float)
-        ee_pre, _ = _command_ee_phase(
-            "move_to_pre_grasp_front",
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            gripper_dofs,
-            pre_grasp_target_np,
-            sim_app,
-            args,
-            counter,
-            phase_log,
-            {"target_index": target_index, "explicit_pre_grasp_pose": pre_grasp_pose},
+        grasp_depth_target_np = np.array(descend_pose["position"], dtype=float)
+        lift_target_np = grasp_depth_target_np.copy()
+        lift_target_np[2] = max(
+            grasp_depth_target_np[2] + args.pre_grasp_clearance,
+            initial_center[2] + args.pre_grasp_clearance + args.min_lift_delta,
+            table_top_z + args.min_ee_table_clearance + 0.08,
         )
-        ee_pre = _body_pose_position(dc, end_effector_body)
+        prebin_target_np = np.array(bin_drop_pose["position"], dtype=float)
+        place_depth_target_np = prebin_target_np.copy()
+        place_depth_target_np[2] = max(
+            float(bin_bbox["max"][2]) + min(args.safe_drop_height * 0.35, 0.04) + args.place_depth_offset,
+            table_top_z + args.min_ee_table_clearance,
+        )
+        retreat_target_np = prebin_target_np.copy()
+        place_pose = {
+            "position": place_depth_target_np.tolist(),
+            "orientation": "fixed_downward",
+            "orientation_search": False,
+        }
+        result["place_pose"] = place_pose
+
+        continuous_plan = _build_continuous_cycle_plan(
+            pre_grasp_target=pre_grasp_target_np,
+            grasp_depth_target=grasp_depth_target_np,
+            lift_clearance_target=lift_target_np,
+            prebin_target=prebin_target_np,
+            place_depth_target=place_depth_target_np,
+            retreat_target=retreat_target_np,
+            args=args,
+        )
+        result["continuous_motion_plan"] = [
+            {
+                "name": segment.name,
+                "phase_tag": segment.phase_tag,
+                "waypoint_type": segment.waypoint_type,
+                "speed_profile": segment.speed_profile,
+                "blend_radius": segment.blend_radius,
+                "event_marker": segment.event_marker,
+                "target_position": segment.target_position.tolist(),
+            }
+            for segment in continuous_plan
+        ]
+        try:
+            cycle_metrics = _execute_continuous_motion_cycle(
+                target_index=target_index,
+                target_path=target_path,
+                stage=stage,
+                dc=dc,
+                articulation=articulation,
+                arm_dofs=arm_dofs,
+                gripper_dofs=gripper_dofs,
+                end_effector_body=end_effector_body,
+                sim_app=sim_app,
+                args=args,
+                counter=counter,
+                phase_log=phase_log,
+                segments=continuous_plan,
+            )
+        except RuntimeError as exc:
+            if "Gripper" in str(exc) or "gripper" in str(exc):
+                _fail("gripper_command_failed", str(exc))
+            _fail("continuous_motion_failed", str(exc))
+        result["cycle_time_steps"] = cycle_metrics["cycle_time_steps"]
+        result["micro_stop_frames"] = cycle_metrics["micro_stop_frames"]
+        result["micro_stop_samples"] = cycle_metrics["micro_stop_samples"]
+        result["close_event_fired"] = bool(cycle_metrics.get("close_event_fired"))
+        result["open_event_fired"] = bool(cycle_metrics.get("open_event_fired"))
+        result["continuous_cycle_metrics"] = cycle_metrics
+
+        segment_by_name = {item["name"]: item for item in cycle_metrics["segment_summaries"]}
+        phase_by_name = {entry["phase"]: entry for entry in phase_log if entry.get("details", {}).get("target_index") == target_index}
+        ee_pre = np.array(segment_by_name["continuous_pregrasp"]["actual_position"], dtype=float)
         pre_distance = _distance(ee_pre, pre_grasp_target_np)
         pre_safety = _ee_front_safety_checks(ee_pre, front_workspace_x, front_workspace_y, table_top_z, args.min_ee_table_clearance)
-        phase_log[-1]["details"]["ee_to_pre_grasp_target_distance"] = pre_distance
-        phase_log[-1]["details"]["pre_grasp_front_safety_checks"] = pre_safety
-        phase_log[-1]["condition_met"] = bool(pre_safety["front_safety_ok"] and pre_distance <= args.pre_grasp_ee_tolerance)
+        if "continuous_pregrasp" in phase_by_name:
+            phase_by_name["continuous_pregrasp"]["details"]["ee_to_pre_grasp_target_distance"] = pre_distance
+            phase_by_name["continuous_pregrasp"]["details"]["pre_grasp_front_safety_checks"] = pre_safety
+            phase_by_name["continuous_pregrasp"]["condition_met"] = bool(
+                pre_safety["front_safety_ok"] and pre_distance <= args.pre_grasp_ee_tolerance
+            )
         if not pre_safety["front_safety_ok"]:
             _fail("pre_grasp_unreachable", "Pre-grasp end-effector target left the front tabletop workspace")
         if pre_distance > args.pre_grasp_ee_tolerance:
             _fail("pre_grasp_unreachable", f"Pre-grasp end effector remained {pre_distance:.3f} m from explicit pre-grasp pose")
 
-        descend_target_np = np.array(descend_pose["position"], dtype=float)
-        ee_descend, descend_error = _command_ee_phase(
-            "descend_front",
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            gripper_dofs,
-            descend_target_np,
-            sim_app,
-            args,
-            counter,
-            phase_log,
-            {"target_index": target_index, "ee_before_descend": ee_pre.tolist(), "explicit_descend_pose": descend_pose},
-        )
-        after_descend = _bbox_state(stage, target_path)
+        ee_descend = np.array(segment_by_name["continuous_grasp_depth"]["actual_position"], dtype=float)
+        descend_error = float(segment_by_name["continuous_grasp_depth"]["position_error"])
+        after_descend = cycle_metrics["snapshots"].get("before_close_gripper") or cycle_metrics["snapshots"]["after_continuous_grasp_depth"]
         object_distance_before_close = _distance(ee_descend, _center_from_bbox(after_descend["bbox"]))
         descend_safety = _ee_front_safety_checks(ee_descend, front_workspace_x, front_workspace_y, table_top_z, 0.0)
-        phase_log[-1]["details"]["target_object_distance_before_close"] = object_distance_before_close
-        phase_log[-1]["details"]["ee_to_explicit_descend_target_distance"] = descend_error
-        phase_log[-1]["details"]["descend_front_safety_checks"] = descend_safety
-        phase_log[-1]["condition_met"] = bool(descend_safety["front_safety_ok"] and object_distance_before_close <= args.descend_object_tolerance)
+        if "continuous_grasp_depth" in phase_by_name:
+            phase_by_name["continuous_grasp_depth"]["details"]["target_object_distance_before_close"] = object_distance_before_close
+            phase_by_name["continuous_grasp_depth"]["details"]["ee_to_explicit_descend_target_distance"] = descend_error
+            phase_by_name["continuous_grasp_depth"]["details"]["descend_front_safety_checks"] = descend_safety
+            phase_by_name["continuous_grasp_depth"]["condition_met"] = bool(
+                descend_safety["front_safety_ok"] and object_distance_before_close <= args.descend_object_tolerance
+            )
         if not descend_safety["front_safety_ok"]:
             _fail("descend_failed", "Descend front target left the front workspace or moved under the table")
         if object_distance_before_close > args.descend_object_tolerance:
             _fail("descend_failed", f"End effector remained {object_distance_before_close:.3f} m from target object before close")
 
-        close_ok = _command_gripper_phase(
-            "close_gripper",
-            dc,
-            gripper_dofs,
-            end_effector_body,
-            [OFFICIAL_GRIPPER_CLOSE_WIDTH] * len(gripper_dofs),
-            sim_app,
-            _smooth_pause_steps(args, "close_gripper"),
-            counter,
-            phase_log,
-            skipped=args.skip_gripper_close,
-            effort_value=args.gripper_hold_effort,
-        )
-        if not close_ok:
-            _fail("gripper_command_failed", "Right gripper close command failed")
-
-        validation_before = _bbox_state(stage, target_path)
+        validation_before = cycle_metrics["snapshots"].get("before_close_gripper") or after_descend
         validation_before_center = _center_from_bbox(validation_before["bbox"])
-        validation_target_np = descend_target_np.copy()
-        validation_target_np[2] = max(validation_target_np[2] + args.pre_grasp_clearance, table_top_z + args.min_ee_table_clearance + 0.08)
-        ee_validation, validation_error = _command_ee_phase(
-            "grasp_validation",
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            gripper_dofs,
-            validation_target_np,
-            sim_app,
-            args,
-            counter,
-            phase_log,
-            {"target_index": target_index, "object_pose_before_validation": validation_before},
-            gripper_effort_value=args.gripper_hold_effort,
-        )
-        validation_after = _bbox_state(stage, target_path)
+        ee_validation = np.array(segment_by_name["continuous_lift_clearance"]["actual_position"], dtype=float)
+        validation_error = float(segment_by_name["continuous_lift_clearance"]["position_error"])
+        validation_after = cycle_metrics["snapshots"]["after_continuous_lift_clearance"]
         validation_after_center = _center_from_bbox(validation_after["bbox"])
         validation_delta = validation_after_center - validation_before_center
         ee_to_object_after_validation = _distance(ee_validation, validation_after_center)
@@ -893,43 +1421,37 @@ def _attempt_pick_place_target(
             and ee_to_object_after_validation <= args.descend_object_tolerance
             and validation_safety["front_safety_ok"]
         )
+        lift_height_threshold_achieved = bool(validation_delta[2] >= args.min_lift_delta)
         result["object_lifted"] = object_lifted
-        phase_log[-1]["details"].update(
-            {
-                "object_pose_after_validation": validation_after,
-                "object_delta_during_validation_m": validation_delta.tolist(),
-                "ee_to_object_after_validation": ee_to_object_after_validation,
-                "ee_to_validation_target_distance": validation_error,
-                "grasp_validation_front_safety_checks": validation_safety,
-                "object_lifted": object_lifted,
-                "gripper_effort_active_during_validation": True,
-                "gripper_effort_value": args.gripper_hold_effort,
-            }
-        )
-        phase_log[-1]["condition_met"] = bool(object_lifted)
+        result["lift_height_threshold_achieved"] = lift_height_threshold_achieved
+        if not result["close_event_fired"]:
+            _fail("gripper_command_failed", "Continuous close_gripper event marker did not fire before lift validation")
+        if "continuous_lift_clearance" in phase_by_name:
+            phase_by_name["continuous_lift_clearance"]["details"].update(
+                {
+                    "object_pose_before_validation": validation_before,
+                    "object_pose_after_validation": validation_after,
+                    "object_delta_during_validation_m": validation_delta.tolist(),
+                    "ee_to_object_after_validation": ee_to_object_after_validation,
+                    "ee_to_validation_target_distance": validation_error,
+                    "grasp_validation_front_safety_checks": validation_safety,
+                    "post_close_verify_phase_tag": "post_close_verify",
+                    "lift_phase_tag": "lift",
+                    "object_lifted": object_lifted,
+                    "lift_height_threshold_achieved": lift_height_threshold_achieved,
+                    "gripper_effort_active_during_validation": True,
+                    "gripper_effort_value": args.gripper_hold_effort,
+                }
+            )
+            phase_by_name["continuous_lift_clearance"]["condition_met"] = bool(object_lifted)
         if not object_lifted:
             _fail("object_not_lifted", "Object did not move upward with the gripper during mandatory grasp validation")
 
-        lift_target_np = validation_target_np.copy()
-        lift_target_np[2] = max(lift_target_np[2], initial_center[2] + args.pre_grasp_clearance + args.min_lift_delta)
-        ee_lift, lift_error = _command_ee_phase(
-            "lift_front",
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            gripper_dofs,
-            lift_target_np,
-            sim_app,
-            args,
-            counter,
-            phase_log,
-            {"target_index": target_index},
-            gripper_effort_value=args.gripper_hold_effort,
-        )
-        after_lift = _bbox_state(stage, target_path)
+        ee_lift = ee_validation
+        lift_error = validation_error
+        after_lift = validation_after
         lift_center = _center_from_bbox(after_lift["bbox"])
-        lift_delta = lift_center - validation_after_center
+        lift_delta = lift_center - validation_before_center
         ee_to_object_after_lift = _distance(ee_lift, lift_center)
         lift_safety = _ee_front_safety_checks(ee_lift, front_workspace_x, front_workspace_y, table_top_z, args.min_ee_table_clearance)
         object_retained_after_lift = bool(
@@ -938,18 +1460,19 @@ def _attempt_pick_place_target(
             and lift_safety["front_safety_ok"]
         )
         result["object_retained_after_lift"] = object_retained_after_lift
-        phase_log[-1]["details"].update(
-            {
-                "ee_to_lift_target_distance": lift_error,
-                "lift_front_safety_checks": lift_safety,
-                "object_delta_during_lift_m": lift_delta.tolist(),
-                "ee_to_object_after_lift": ee_to_object_after_lift,
-                "object_retained_after_lift": object_retained_after_lift,
-                "gripper_effort_active_during_lift": True,
-                "gripper_effort_value": args.gripper_hold_effort,
-            }
-        )
-        phase_log[-1]["condition_met"] = bool(object_retained_after_lift)
+        if "continuous_lift_clearance" in phase_by_name:
+            phase_by_name["continuous_lift_clearance"]["details"].update(
+                {
+                    "ee_to_lift_target_distance": lift_error,
+                    "lift_front_safety_checks": lift_safety,
+                    "object_delta_during_lift_m": lift_delta.tolist(),
+                    "ee_to_object_after_lift": ee_to_object_after_lift,
+                    "object_retained_after_lift": object_retained_after_lift,
+                    "gripper_effort_active_during_lift": True,
+                    "gripper_effort_value": args.gripper_hold_effort,
+                }
+            )
+            phase_by_name["continuous_lift_clearance"]["condition_met"] = bool(object_retained_after_lift)
         if not lift_safety["front_safety_ok"]:
             _fail("dropped_during_lift", "Lift front target left the front workspace or moved too close to the table")
         if lift_center[2] < initial_center[2] + args.min_lift_delta:
@@ -957,23 +1480,21 @@ def _attempt_pick_place_target(
         if ee_to_object_after_lift > args.descend_object_tolerance:
             _fail("dropped_during_lift", "Object did not remain near gripper after lift")
 
-        bin_target_np = np.array(bin_drop_pose["position"], dtype=float)
-        ee_bin, bin_error = _command_ee_phase(
-            "move_to_bin_front",
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            gripper_dofs,
-            bin_target_np,
-            sim_app,
-            args,
-            counter,
-            phase_log,
-            {"target_index": target_index, "explicit_bin_drop_pose": bin_drop_pose},
-        )
-        after_transport = _bbox_state(stage, target_path)
+        bin_target_np = prebin_target_np
+        ee_bin = np.array(segment_by_name["continuous_prebin"]["actual_position"], dtype=float)
+        bin_error = float(segment_by_name["continuous_prebin"]["position_error"])
+        after_transport = cycle_metrics["snapshots"]["after_continuous_prebin"]
         transport_center = _center_from_bbox(after_transport["bbox"])
+        prebin_retained = _retained_with_gripper(
+            object_center=transport_center,
+            ee_position=ee_bin,
+            initial_center=initial_center,
+            min_lift_delta=args.min_lift_delta,
+            distance_tolerance=args.descend_object_tolerance,
+        )
+        result["object_retained_at_prebin"] = prebin_retained
+        result["object_retained_at_carry_midpoint"] = bool(object_retained_after_lift and prebin_retained)
+        result["object_retained_at_carry_midpoint_source"] = "inferred_from_lift_and_prebin_retention"
         transport_distance = _distance(transport_center, initial_center)
         distance_to_bin_initial = _distance(initial_center, np.array(bin_bbox["center"], dtype=float))
         distance_to_bin_after = _distance(transport_center, np.array(bin_bbox["center"], dtype=float))
@@ -987,37 +1508,47 @@ def _attempt_pick_place_target(
         )
         result["object_transported"] = object_transported
         result["transport_distance_m"] = transport_distance
-        phase_log[-1]["details"].update(
-            {
-                "ee_to_explicit_bin_drop_target_distance": _distance(ee_bin, bin_target_np),
-                "bin_target_position_error": bin_error,
-                "object_transport_distance_from_initial": transport_distance,
-                "object_distance_to_bin_initial": distance_to_bin_initial,
-                "object_distance_to_bin_after_transport": distance_to_bin_after,
-                "move_to_bin_front_safety_checks": bin_safety,
-                "object_above_bin_wall_or_near_drop_height": above_bin_wall,
-                "object_transported": object_transported,
-            }
-        )
-        phase_log[-1]["condition_met"] = bool(object_transported)
+        if "continuous_prebin" in phase_by_name:
+            phase_by_name["continuous_prebin"]["details"].update(
+                {
+                    "explicit_bin_drop_pose": bin_drop_pose,
+                    "ee_to_explicit_bin_drop_target_distance": _distance(ee_bin, bin_target_np),
+                    "bin_target_position_error": bin_error,
+                    "object_transport_distance_from_initial": transport_distance,
+                    "object_distance_to_bin_initial": distance_to_bin_initial,
+                    "object_distance_to_bin_after_transport": distance_to_bin_after,
+                    "move_to_bin_front_safety_checks": bin_safety,
+                    "object_above_bin_wall_or_near_drop_height": above_bin_wall,
+                    "object_transported": object_transported,
+                    "object_retained_at_carry_midpoint": result["object_retained_at_carry_midpoint"],
+                    "object_retained_at_carry_midpoint_source": result["object_retained_at_carry_midpoint_source"],
+                    "object_retained_at_prebin": prebin_retained,
+                }
+            )
+            phase_by_name["continuous_prebin"]["condition_met"] = bool(object_transported)
         if not object_transported:
             _fail("dropped_during_transport", "Object did not move the required minimum distance toward the destination bin")
 
-        release_ok = _command_gripper_phase(
-            "release",
-            dc,
-            gripper_dofs,
-            end_effector_body,
-            [OFFICIAL_GRIPPER_OPEN_WIDTH] * len(gripper_dofs),
-            sim_app,
-            _smooth_pause_steps(args, "release"),
-            counter,
-            phase_log,
-            skipped=args.skip_release,
-            effort_value=0.0,
+        preplace_state = cycle_metrics["snapshots"].get("before_open_gripper") or cycle_metrics["snapshots"]["after_continuous_place_depth"]
+        preplace_center = _center_from_bbox(preplace_state["bbox"])
+        ee_preplace = np.array(segment_by_name["continuous_place_depth"]["actual_position"], dtype=float)
+        preplace_retained = _retained_with_gripper(
+            object_center=preplace_center,
+            ee_position=ee_preplace,
+            initial_center=initial_center,
+            min_lift_delta=args.min_lift_delta,
+            distance_tolerance=args.descend_object_tolerance,
         )
-        if not release_ok:
-            _fail("release_failed", "Right gripper release command failed")
+        result["object_retained_at_preplace"] = preplace_retained
+        if "continuous_place_depth" in phase_by_name:
+            phase_by_name["continuous_place_depth"]["details"].update(
+                {
+                    "object_pose_before_release": preplace_state,
+                    "ee_to_object_before_release": _distance(ee_preplace, preplace_center),
+                    "object_retained_at_preplace": preplace_retained,
+                    "open_event_fired": result["open_event_fired"],
+                }
+            )
 
         settle_start = counter["step"]
         final_state, final_jitter = _settle_and_measure(stage, target_path, sim_app, args.settle_steps, counter)
@@ -1045,15 +1576,21 @@ def _attempt_pick_place_target(
             },
         )
         if not final_inside_bin:
+            result["release_timing_failure_suspected"] = bool(result["open_event_fired"] and result["object_retained_at_preplace"])
             _fail("object_outside_bin", "Target object final pose is outside the diagnostic bin volume")
         if not object_stable:
             _fail("object_unstable_after_settle", "Target object did not settle stably after release")
 
         result["success"] = True
+        result["failure_phase"] = None
+        result["diagnostic_failure_kind"] = "success"
         return result
     except RunFailure as exc:
+        failure_phase = _phase_from_failure_reason(exc.reason)
         result["failure_reason"] = exc.reason
-        result["first_failing_phase"] = _phase_from_failure_reason(exc.reason)
+        result["failure_phase"] = failure_phase
+        result["first_failing_phase"] = failure_phase
+        result["diagnostic_failure_kind"] = _failure_kind(result, exc.reason)
         result["error"] = str(exc)
         result["hard_stop"] = exc.reason in hard_stop_reasons
         try:
@@ -1092,7 +1629,6 @@ def main() -> int:
     parser.add_argument("--gripper-delta", type=float, default=DEFAULT_GRIPPER_DELTA, help="Deprecated; official fixed gripper widths are used.")
     parser.add_argument("--gripper-hold-effort", type=float, default=DEFAULT_GRIPPER_HOLD_EFFORT)
     parser.add_argument("--pre-grasp-clearance", type=float, default=DEFAULT_PRE_GRASP_CLEARANCE)
-    parser.add_argument("--descend-clearance", type=float, default=DEFAULT_DESCEND_CLEARANCE)
     parser.add_argument("--safe-drop-height", type=float, default=DEFAULT_SAFE_DROP_HEIGHT)
     parser.add_argument("--stable-jitter", type=float, default=DEFAULT_STABLE_JITTER)
     parser.add_argument("--min-lift-delta", type=float, default=DEFAULT_MIN_LIFT_DELTA)
@@ -1116,6 +1652,19 @@ def main() -> int:
     parser.add_argument("--smooth-motion", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--smooth-ik-hold-steps", type=int, default=1)
     parser.add_argument("--smooth-non-contact-pause-steps", type=int, default=1)
+    parser.add_argument("--continuous-soft-tolerance", type=float, default=DEFAULT_CONTINUOUS_SOFT_TOLERANCE)
+    parser.add_argument("--continuous-blend-radius", type=float, default=DEFAULT_CONTINUOUS_BLEND_RADIUS)
+    parser.add_argument("--micro-stop-speed-threshold", type=float, default=DEFAULT_MICRO_STOP_SPEED_THRESHOLD)
+    tuning_group = parser.add_argument_group(
+        "controlled tuning knobs",
+        "Sweep one family at a time: grasp depth, contact dwell, carry stabilization, place depth, release timing, then soft tolerance.",
+    )
+    tuning_group.add_argument("--descend-clearance", type=float, default=DEFAULT_DESCEND_CLEARANCE, help="Base grasp-depth clearance above the object bbox top.")
+    tuning_group.add_argument("--grasp-depth-offset", type=float, default=DEFAULT_GRASP_DEPTH_TUNING_OFFSET, help="Active first-pass grasp-depth sweep knob; negative values insert slightly deeper.")
+    tuning_group.add_argument("--continuous-contact-dwell-steps", type=int, default=DEFAULT_CONTINUOUS_CONTACT_DWELL_STEPS, help="Contact dwell knob for close/lift/place windows; leave unchanged unless close succeeds but lift is inconsistent.")
+    tuning_group.add_argument("--carry-stabilization-steps", type=int, default=DEFAULT_CARRY_STABILIZATION_STEPS, help="Neutral by default; use only if lift succeeds but object_retained_at_prebin fails.")
+    tuning_group.add_argument("--place-depth-offset", type=float, default=DEFAULT_PLACE_DEPTH_OFFSET, help="Neutral by default; use only if pre-place retention is true but final placement fails.")
+    tuning_group.add_argument("--release-timing-dwell-steps", type=int, default=DEFAULT_RELEASE_TIMING_DWELL_STEPS, help="Neutral by default; use only for suspected release timing failures.")
     parser.add_argument("--scene-only", action="store_true", help="Build and log the randomized scene, then exit before robot manipulation.")
     parser.add_argument("--skip-release", action="store_true")
     parser.add_argument("--skip-gripper-close", action="store_true")
@@ -1142,6 +1691,14 @@ def main() -> int:
         raise RuntimeError("--ik-steps, --ik-settle-steps, and --ik-hold-steps must be positive")
     if args.smooth_ik_hold_steps < 1 or args.smooth_non_contact_pause_steps < 0:
         raise RuntimeError("--smooth-ik-hold-steps must be positive and --smooth-non-contact-pause-steps must be non-negative")
+    if args.continuous_soft_tolerance <= 0.0 or args.continuous_blend_radius < 0.0:
+        raise RuntimeError("--continuous-soft-tolerance must be positive and --continuous-blend-radius must be non-negative")
+    if args.continuous_contact_dwell_steps < 0:
+        raise RuntimeError("--continuous-contact-dwell-steps must be non-negative")
+    if args.carry_stabilization_steps < 0 or args.release_timing_dwell_steps < 0:
+        raise RuntimeError("--carry-stabilization-steps and --release-timing-dwell-steps must be non-negative")
+    if args.micro_stop_speed_threshold < 0.0:
+        raise RuntimeError("--micro-stop-speed-threshold must be non-negative")
     if args.ik_position_eps <= 0.0 or args.ik_damping <= 0.0 or args.ik_max_step <= 0.0 or args.ik_stop_tolerance <= 0.0:
         raise RuntimeError("--ik-position-eps, --ik-damping, --ik-max-step, and --ik-stop-tolerance must be positive")
     if args.ik_posture_gain < 0.0:
@@ -1172,6 +1729,7 @@ def main() -> int:
             "seed_provided": seed_was_provided,
             "actual_seed": args.seed,
             "random_scene_active": True,
+            "active_tuning_knobs": _tuning_knob_summary(args),
         },
         "scene": {},
         "target": {},
@@ -1195,9 +1753,16 @@ def main() -> int:
             "official_gripper_open_width": OFFICIAL_GRIPPER_OPEN_WIDTH,
             "official_gripper_close_width": OFFICIAL_GRIPPER_CLOSE_WIDTH,
             "descend_clearance": args.descend_clearance,
+            "grasp_depth_offset": args.grasp_depth_offset,
+            "tuning_knobs": _tuning_knob_summary(args),
             "smooth_motion": bool(args.smooth_motion),
             "smooth_non_contact_pause_steps": args.smooth_non_contact_pause_steps,
             "smooth_ik_hold_steps": args.smooth_ik_hold_steps,
+            "continuous_cycle_policy": "queued_soft_and_hard_waypoints_with_event_markers",
+            "continuous_soft_tolerance": args.continuous_soft_tolerance,
+            "continuous_blend_radius": args.continuous_blend_radius,
+            "continuous_contact_dwell_steps": args.continuous_contact_dwell_steps,
+            "micro_stop_speed_threshold": args.micro_stop_speed_threshold,
         },
         "front_workspace": {
             "x_limits": list(front_workspace_x),
@@ -1209,13 +1774,12 @@ def main() -> int:
         "phase_order": [
             "apply_official_startup_pose",
             "open_gripper_initial",
-            "move_to_pre_grasp_front",
-            "descend_front",
-            "close_gripper",
-            "grasp_validation",
-            "lift_front",
-            "move_to_bin_front",
-            "release",
+            "continuous_pregrasp",
+            "continuous_grasp_depth",
+            "continuous_lift_clearance",
+            "continuous_prebin",
+            "continuous_place_depth",
+            "continuous_retreat",
             "settle",
         ],
         "phase_log": [],
@@ -1238,6 +1802,13 @@ def main() -> int:
     sim_app = None
     timeline = None
     log_paths: list[str] = []
+    tuning_knobs = _tuning_knob_summary(args)
+    print(
+        "active_tuning_knob="
+        f"{tuning_knobs['active_knob_family']} "
+        f"targeted_failure_pattern={tuning_knobs['targeted_failure_pattern']} "
+        f"grasp_effective_clearance={tuning_knobs['grasp_depth']['effective_clearance']}"
+    )
 
     try:
         paths = _validate_environment()
@@ -1361,7 +1932,10 @@ def main() -> int:
             "position": [
                 initial_state["bbox"]["center"][0],
                 initial_state["bbox"]["center"][1],
-                max(initial_state["bbox"]["max"][2] + args.descend_clearance, table_top_z + args.min_ee_table_clearance),
+                max(
+                    initial_state["bbox"]["max"][2] + args.descend_clearance + args.grasp_depth_offset,
+                    table_top_z + args.min_ee_table_clearance,
+                ),
             ],
             "orientation": "fixed_downward",
             "orientation_search": False,
@@ -1417,6 +1991,7 @@ def main() -> int:
             "pre_grasp": pre_grasp_pose,
             "descend": descend_pose,
             "bin_drop": bin_drop_pose,
+            "continuous_cycle": "per-object plan logged inside multi_object.attempts[].continuous_motion_plan",
         }
         payload["multi_object"]["attempt_order"] = attempt_indices
         payload["scene"]["initial_part_poses"] = {
@@ -1589,6 +2164,30 @@ def main() -> int:
         payload["multi_object"]["attempted_count"] = attempted_count
         payload["multi_object"]["success_count"] = success_count
         payload["multi_object"]["failure_count"] = len(failed_results)
+        payload["multi_object"]["continuous_motion_metrics"] = {
+            "total_cycle_time_steps": sum(int(result.get("cycle_time_steps", 0)) for result in attempt_results),
+            "total_micro_stop_frames": sum(int(result.get("micro_stop_frames", 0)) for result in attempt_results),
+            "total_micro_stop_samples": sum(int(result.get("micro_stop_samples", 0)) for result in attempt_results),
+            "per_object": [
+                {
+                    "selected_object_id": result.get("selected_object_id") or result.get("target_prim"),
+                    "target_index": result.get("target_index"),
+                    "success": result.get("success"),
+                    "failure_phase": result.get("failure_phase"),
+                    "failure_reason": result.get("failure_reason"),
+                    "diagnostic_failure_kind": result.get("diagnostic_failure_kind"),
+                    "cycle_time_steps": result.get("cycle_time_steps"),
+                    "micro_stop_frames": result.get("micro_stop_frames"),
+                    "micro_stop_samples": result.get("micro_stop_samples"),
+                    "close_event_fired": result.get("close_event_fired"),
+                    "lift_height_threshold_achieved": result.get("lift_height_threshold_achieved"),
+                    "object_retained_at_carry_midpoint": result.get("object_retained_at_carry_midpoint"),
+                    "object_retained_at_prebin": result.get("object_retained_at_prebin"),
+                    "object_retained_at_preplace": result.get("object_retained_at_preplace"),
+                }
+                for result in attempt_results
+            ],
+        }
         payload["multi_object"].setdefault(
             "stop_condition",
             "all_requested_objects_attempted" if attempted_count == len(attempt_indices) else "stopped_before_all_requested_objects",
@@ -1621,336 +2220,6 @@ def main() -> int:
         if (args.no_headless or args.gui) and args.hold_open:
             _hold_gui_open(sim_app)
         return 0 if payload["final_status"] == "pass" else 1
-
-        open_ok = _command_gripper_phase(
-            "open_gripper_initial",
-            dc,
-            gripper_dofs,
-            end_effector_body,
-            [OFFICIAL_GRIPPER_OPEN_WIDTH] * len(gripper_dofs),
-            sim_app,
-            args.pause_steps,
-            counter,
-            phase_log,
-            effort_value=0.0,
-        )
-        if not open_ok:
-            _fail("gripper_command_failed", "Right gripper open command failed before approach")
-
-        pre_grasp_target_np = np.array(pre_grasp_pose["position"], dtype=float)
-        ee_pre, pre_error = _command_ee_phase(
-            "move_to_pre_grasp_front",
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            gripper_dofs,
-            pre_grasp_target_np,
-            sim_app,
-            args,
-            counter,
-            phase_log,
-            {
-                "explicit_pre_grasp_pose": pre_grasp_pose,
-            },
-        )
-        ee_pre = _body_pose_position(dc, end_effector_body)
-        pre_distance = _distance(ee_pre, pre_grasp_target_np)
-        pre_safety = _ee_front_safety_checks(
-            ee_pre,
-            front_workspace_x,
-            front_workspace_y,
-            table_top_z,
-            args.min_ee_table_clearance,
-        )
-        phase_log[-1]["details"]["ee_to_pre_grasp_target_distance"] = pre_distance
-        phase_log[-1]["details"]["pre_grasp_front_safety_checks"] = pre_safety
-        phase_log[-1]["condition_met"] = bool(pre_safety["front_safety_ok"] and pre_distance <= args.pre_grasp_ee_tolerance)
-        if not pre_safety["front_safety_ok"]:
-            _fail("pre_grasp_unreachable", "Pre-grasp end-effector target left the front tabletop workspace")
-        if pre_distance > args.pre_grasp_ee_tolerance:
-            _fail("pre_grasp_unreachable", f"Pre-grasp end effector remained {pre_distance:.3f} m from explicit pre-grasp pose")
-
-        ee_descend_before = ee_pre
-        descend_target_np = np.array(descend_pose["position"], dtype=float)
-        ee_descend, descend_error = _command_ee_phase(
-            "descend_front",
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            gripper_dofs,
-            descend_target_np,
-            sim_app,
-            args,
-            counter,
-            phase_log,
-            {"ee_before_descend": ee_descend_before.tolist(), "explicit_descend_pose": descend_pose},
-        )
-        after_descend = _bbox_state(stage, target_path)
-        payload["object_trace"]["after_descend"] = after_descend
-        object_distance_before_close = _distance(ee_descend, _center_from_bbox(after_descend["bbox"]))
-        descend_safety = _ee_front_safety_checks(
-            ee_descend,
-            front_workspace_x,
-            front_workspace_y,
-            table_top_z,
-            0.0,
-        )
-        phase_log[-1]["details"]["target_object_distance_before_close"] = object_distance_before_close
-        phase_log[-1]["details"]["ee_to_explicit_descend_target_distance"] = descend_error
-        phase_log[-1]["details"]["descend_front_safety_checks"] = descend_safety
-        phase_log[-1]["condition_met"] = bool(descend_safety["front_safety_ok"] and object_distance_before_close <= args.descend_object_tolerance)
-        if not descend_safety["front_safety_ok"]:
-            _fail("descend_failed", "Descend front target left the front workspace or moved under the table")
-        if object_distance_before_close > args.descend_object_tolerance:
-            _fail("descend_failed", f"End effector remained {object_distance_before_close:.3f} m from target object before close")
-
-        close_ok = _command_gripper_phase(
-            "close_gripper",
-            dc,
-            gripper_dofs,
-            end_effector_body,
-            [OFFICIAL_GRIPPER_CLOSE_WIDTH] * len(gripper_dofs),
-            sim_app,
-            args.pause_steps,
-            counter,
-            phase_log,
-            skipped=args.skip_gripper_close,
-            effort_value=args.gripper_hold_effort,
-        )
-        payload["object_trace"]["after_close"] = _bbox_state(stage, target_path)
-        if not close_ok:
-            _fail("gripper_command_failed", "Right gripper close command failed")
-
-        validation_before = _bbox_state(stage, target_path)
-        validation_before_center = _center_from_bbox(validation_before["bbox"])
-        validation_target_np = descend_target_np.copy()
-        validation_target_np[2] = max(validation_target_np[2] + args.pre_grasp_clearance, table_top_z + args.min_ee_table_clearance + 0.08)
-        ee_validation, validation_error = _command_ee_phase(
-            "grasp_validation",
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            gripper_dofs,
-            validation_target_np,
-            sim_app,
-            args,
-            counter,
-            phase_log,
-            {"object_pose_before_validation": validation_before},
-            gripper_effort_value=args.gripper_hold_effort,
-        )
-        validation_after = _bbox_state(stage, target_path)
-        validation_after_center = _center_from_bbox(validation_after["bbox"])
-        validation_delta = validation_after_center - validation_before_center
-        ee_to_object_after_validation = _distance(ee_validation, validation_after_center)
-        validation_safety = _ee_front_safety_checks(
-            ee_validation,
-            front_workspace_x,
-            front_workspace_y,
-            table_top_z,
-            args.min_ee_table_clearance,
-        )
-        object_lifted = bool(
-            validation_delta[2] >= args.min_lift_delta
-            and ee_to_object_after_validation <= args.descend_object_tolerance
-            and validation_safety["front_safety_ok"]
-        )
-        payload["result_flags"]["object_lifted"] = object_lifted
-        payload["object_trace"]["after_grasp_validation"] = validation_after
-        phase_log[-1]["details"].update(
-            {
-                "object_pose_after_validation": validation_after,
-                "object_delta_during_validation": validation_delta.tolist(),
-                "ee_to_object_after_validation": ee_to_object_after_validation,
-                "ee_to_validation_target_distance": validation_error,
-                "grasp_validation_front_safety_checks": validation_safety,
-                "object_lifted": object_lifted,
-                "object_delta_during_validation_m": validation_delta.tolist(),
-                "gripper_effort_active_during_validation": True,
-                "gripper_effort_value": args.gripper_hold_effort,
-            }
-        )
-        phase_log[-1]["condition_met"] = bool(object_lifted)
-        if not object_lifted:
-            _fail("object_not_lifted", "Object did not move upward with the gripper during mandatory grasp validation")
-
-        lift_target_np = validation_target_np.copy()
-        lift_target_np[2] = max(lift_target_np[2], initial_center[2] + args.pre_grasp_clearance + args.min_lift_delta)
-        ee_lift, lift_error = _command_ee_phase(
-            "lift_front",
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            gripper_dofs,
-            lift_target_np,
-            sim_app,
-            args,
-            counter,
-            phase_log,
-            gripper_effort_value=args.gripper_hold_effort,
-        )
-        after_lift = _bbox_state(stage, target_path)
-        payload["object_trace"]["after_lift"] = after_lift
-        lift_center = _center_from_bbox(after_lift["bbox"])
-        lift_delta = lift_center - validation_after_center
-        ee_to_object_after_lift = _distance(ee_lift, lift_center)
-        lift_safety = _ee_front_safety_checks(
-            ee_lift,
-            front_workspace_x,
-            front_workspace_y,
-            table_top_z,
-            args.min_ee_table_clearance,
-        )
-        object_retained_after_lift = bool(
-            lift_center[2] >= initial_center[2] + args.min_lift_delta
-            and ee_to_object_after_lift <= args.descend_object_tolerance
-            and lift_safety["front_safety_ok"]
-        )
-        payload["result_flags"]["object_retained_after_lift"] = object_retained_after_lift
-        phase_log[-1]["details"].update(
-            {
-                "ee_to_lift_target_distance": lift_error,
-                "lift_front_safety_checks": lift_safety,
-                "object_delta_during_lift_m": lift_delta.tolist(),
-                "ee_to_object_after_lift": ee_to_object_after_lift,
-                "object_retained_after_lift": object_retained_after_lift,
-                "gripper_effort_active_during_lift": True,
-                "gripper_effort_value": args.gripper_hold_effort,
-            }
-        )
-        phase_log[-1]["condition_met"] = bool(object_retained_after_lift)
-        if not lift_safety["front_safety_ok"]:
-            _fail("dropped_during_lift", "Lift front target left the front workspace or moved too close to the table")
-        if lift_center[2] < initial_center[2] + args.min_lift_delta:
-            _fail("dropped_during_lift", "Object was not above initial height after lift")
-        if ee_to_object_after_lift > args.descend_object_tolerance:
-            _fail("dropped_during_lift", "Object did not remain near gripper after lift")
-
-        bin_target_np = np.array(bin_drop_pose["position"], dtype=float)
-        ee_bin, bin_error = _command_ee_phase(
-            "move_to_bin_front",
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            gripper_dofs,
-            bin_target_np,
-            sim_app,
-            args,
-            counter,
-            phase_log,
-            {"explicit_bin_drop_pose": bin_drop_pose},
-        )
-        after_transport = _bbox_state(stage, target_path)
-        payload["object_trace"]["after_transport"] = after_transport
-        transport_center = _center_from_bbox(after_transport["bbox"])
-        transport_distance = _distance(transport_center, initial_center)
-        distance_to_bin_initial = _distance(initial_center, np.array(bin_bbox["center"], dtype=float))
-        distance_to_bin_after = _distance(transport_center, np.array(bin_bbox["center"], dtype=float))
-        bin_safety = _ee_front_safety_checks(
-            ee_bin,
-            front_workspace_x,
-            front_workspace_y,
-            table_top_z,
-            args.min_ee_table_clearance,
-        )
-        above_bin_wall = bool(transport_center[2] >= float(bin_bbox["max"][2]) - 0.02)
-        object_transported = bool(
-            transport_distance >= args.min_transport_distance
-            and distance_to_bin_after < distance_to_bin_initial
-            and bin_safety["front_safety_ok"]
-            and above_bin_wall
-        )
-        payload["result_flags"]["object_transported"] = object_transported
-        payload["result_flags"]["transport_distance_m"] = transport_distance
-        phase_log[-1]["details"].update(
-            {
-                "ee_to_explicit_bin_drop_target_distance": _distance(ee_bin, bin_target_np),
-                "bin_target_position_error": bin_error,
-                "object_transport_distance_from_initial": transport_distance,
-                "object_distance_to_bin_initial": distance_to_bin_initial,
-                "object_distance_to_bin_after_transport": distance_to_bin_after,
-                "move_to_bin_front_safety_checks": bin_safety,
-                "object_above_bin_wall_or_near_drop_height": above_bin_wall,
-                "object_transported": object_transported,
-            }
-        )
-        phase_log[-1]["condition_met"] = bool(object_transported)
-        if not object_transported:
-            _fail("dropped_during_transport", "Object did not move the required minimum distance toward the destination bin")
-
-        release_ok = _command_gripper_phase(
-            "release",
-            dc,
-            gripper_dofs,
-            end_effector_body,
-            [OFFICIAL_GRIPPER_OPEN_WIDTH] * len(gripper_dofs),
-            sim_app,
-            args.pause_steps,
-            counter,
-            phase_log,
-            skipped=args.skip_release,
-            effort_value=0.0,
-        )
-        payload["object_trace"]["after_release"] = _bbox_state(stage, target_path)
-        if not release_ok:
-            _fail("release_failed", "Right gripper release command failed")
-
-        settle_start = counter["step"]
-        final_state, final_jitter = _settle_and_measure(stage, target_path, sim_app, args.settle_steps, counter)
-        final_center = _center_from_bbox(final_state["bbox"])
-        marker_paths.append(
-            _debug_marker(
-                stage,
-                "/World/DebugTask1FinalEndEffector",
-                _body_pose_position(dc, end_effector_body).tolist(),
-                0.02,
-                (1.0, 1.0, 0.1),
-            )
-        )
-        payload["scene"]["debug_marker_paths"] = marker_paths
-        final_inside_bin = _inside_bin(
-            final_center,
-            bin_bbox,
-            float(bin_collider["wall_thickness"]),
-            float(bin_collider["floor_top_z"]),
-        )
-        object_stable = bool(final_jitter <= args.stable_jitter)
-        payload["object_trace"]["final_after_settle"] = final_state
-        payload["result_flags"]["final_inside_bin"] = final_inside_bin
-        payload["result_flags"]["object_stable"] = object_stable
-        _append_phase(
-            phase_log,
-            phase="settle",
-            start_step=settle_start,
-            end_step=counter["step"],
-            commanded_targets=None,
-            ee_position=_body_pose_position(dc, end_effector_body),
-            gripper_values=_gripper_values(dc, gripper_dofs),
-            condition_met=bool(final_inside_bin and object_stable),
-            details={
-                "final_target_pose": final_state,
-                "final_jitter_m": final_jitter,
-                "stable_jitter_threshold_m": args.stable_jitter,
-                "final_inside_bin": final_inside_bin,
-                "object_stable": object_stable,
-            },
-        )
-        if not final_inside_bin:
-            _fail("object_outside_bin", "Target object final pose is outside the diagnostic bin volume")
-        if not object_stable:
-            _fail("object_unstable_after_settle", "Target object did not settle stably after release")
-
-        payload["final_status"] = "pass"
-        payload["failure_reason"] = None
-        print("status=pass object_lifted=true object_transported=true final_inside_bin=true object_stable=true")
-
-        if (args.no_headless or args.gui) and args.hold_open:
-            _hold_gui_open(sim_app)
 
     except RunFailure as exc:
         payload["final_status"] = "fail"

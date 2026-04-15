@@ -44,6 +44,8 @@ Current Focus:
 - Phase: Competition stack integration and validation
 - Goal: make official resources, scenes, baseline, dataset access, and robot motion debuggable
 - No serious algorithm or ML optimization until Phase 3 passes
+- Task 1 continuous-motion baseline now has per-object diagnostics and one-knob tuning support in `scripts/task1_smooth_autoseed_multi_object_baseline.py`.
+- Latest controlled Linux runtime sweep for seed=1 target-index=2 showed grasp-depth offsets 0.0, -0.005, and -0.010 all failed before grasp at `pre_grasp_unreachable`; next single tuning family should be approach/soft waypoint reachability, not deeper grasp or carry/place tuning.
 
 Assumptions:
 - Dataset not fully available yet
