@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 from control_walker_s2_arms import (  # type: ignore
     _acquire_articulation,
     _hold_gui_open,
@@ -50,7 +49,6 @@ from load_walker_s2 import (  # type: ignore
 )
 from move_walker_s2_end_effector import (  # type: ignore
     DEFAULT_DAMPING,
-    DEFAULT_HOLD_STEPS,
     DEFAULT_IK_STEPS,
     DEFAULT_POSITION_EPS,
     DEFAULT_POSTURE_GAIN,
@@ -59,8 +57,6 @@ from move_walker_s2_end_effector import (  # type: ignore
     _body_pose_position,
     _create_debug_marker,
     _identify_end_effector_body,
-    _select_right_arm_dofs,
-    move_end_effector_to_target,
 )
 from validate_task1_object_assets import _bbox, _physics_summary  # type: ignore
 from validate_task1_scene_builder_scene import (  # type: ignore
@@ -77,8 +73,9 @@ from validate_task1_scene_builder_scene import (  # type: ignore
 SCRIPT_NAME = "task1_smooth_autoseed_multi_object_baseline.py"
 LOG_STEM = "task1_smooth_autoseed_multi_object_baseline"
 DEFAULT_PHASE_STEPS = 120
-DEFAULT_PAUSE_STEPS = 30
+DEFAULT_PAUSE_STEPS = 0
 DEFAULT_SETTLE_STEPS = 240
+DEFAULT_STARTUP_TARGET_TRACK_STEPS = 5
 DEFAULT_GRIPPER_DELTA = 0.03
 OFFICIAL_GRIPPER_OPEN_WIDTH = -0.0215
 OFFICIAL_GRIPPER_CLOSE_WIDTH = 0.01
@@ -90,7 +87,7 @@ DEFAULT_SAFE_DROP_HEIGHT = 0.10
 DEFAULT_STABLE_JITTER = 0.01
 DEFAULT_MIN_LIFT_DELTA = 0.015
 DEFAULT_MIN_TRANSPORT_DISTANCE = 0.08
-DEFAULT_PRE_GRASP_EE_TOLERANCE = 0.25
+DEFAULT_PRE_GRASP_EE_TOLERANCE = 0.3
 DEFAULT_DESCEND_OBJECT_TOLERANCE = 0.16
 DEFAULT_JOINT_TOLERANCE = 0.06
 DEFAULT_MAX_LOCAL_JOINT_ADJUSTMENT = 0.04
@@ -101,13 +98,32 @@ DEFAULT_MIN_EE_TABLE_CLEARANCE = 0.025
 DEFAULT_IK_MAX_STEP = 0.03
 DEFAULT_CONTINUOUS_SOFT_TOLERANCE = 0.18
 DEFAULT_CONTINUOUS_BLEND_RADIUS = 0.05
-DEFAULT_CONTINUOUS_CONTACT_DWELL_STEPS = 8
+DEFAULT_CONTINUOUS_CONTACT_DWELL_STEPS = 2
 DEFAULT_CARRY_STABILIZATION_STEPS = 0
 DEFAULT_PLACE_DEPTH_OFFSET = 0.0
 DEFAULT_RELEASE_TIMING_DWELL_STEPS = 0
 DEFAULT_MICRO_STOP_SPEED_THRESHOLD = 0.0005
+DEFAULT_GRASP_CONTACT_OFFSET_X = -0.04
+DEFAULT_GRASP_CONTACT_OFFSET_Y = 0.0
+DEFAULT_PIVOT_TO_PINCH_DISTANCE = 0.32
+DEFAULT_PIVOT_ANCHOR_HEIGHT_OFFSET = 0.03
+DEFAULT_PIVOT_ANCHOR_FORWARD_OFFSET = 0.0
+DEFAULT_PIVOT_ANCHOR_LATERAL_OFFSET = 0.0
+DEFAULT_PIVOT_ARC_CONTACT_TOLERANCE = 0.08
+DEFAULT_PIVOT_ARC_MAX_STEPS = 12
+DEFAULT_PIVOT_ARC_CLOSE_DISTANCE = 0.08
+DEFAULT_PIVOT_ARC_FRAME_STEP_UPDATES = 1
+DEFAULT_PIVOT_ARC_STREAM_SAMPLES = 80
+DEFAULT_STREAM_SAMPLES = 80
+DEFAULT_STREAM_FRAME_STEP_UPDATES = 1
 OFFICIAL_ROBOT_PRIM_PATH = "/Root/Ref_Xform/Ref"
 OFFICIAL_ROBOT_NAME = "walkerS2"
+LEFT_ARM_TOKENS = ("l_shoulder", "l_elbow", "l_wrist", "left_shoulder", "left_elbow", "left_wrist")
+RIGHT_ARM_TOKENS = ("r_shoulder", "r_elbow", "r_wrist", "right_shoulder", "right_elbow", "right_wrist")
+LEFT_GRIPPER_TOKENS = ("l_finger", "left_finger", "l_thumb", "left_thumb", "l_gripper", "left_gripper")
+RIGHT_GRIPPER_TOKENS = ("r_finger", "right_finger", "r_thumb", "right_thumb", "r_gripper", "right_gripper")
+LEFT_END_EFFECTOR_TOKENS = ("l_hand", "left_hand", "l_palm", "left_palm", "l_wrist", "left_wrist")
+END_EFFECTOR_EXCLUDE_TOKENS = ("finger", "thumb", "sensor", "camera")
 
 # The organizer baseline does not define arm startup pose in Part_Sorting.yaml.
 # It applies this posture in IsaacSimRobotInterface.initialize(); load it from
@@ -150,6 +166,13 @@ class MotionSegment:
     contact_window: bool = False
     gripper_effort: float | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    control_body: Any | None = None
+    control_body_name: str | None = None
+    control_body_path: str | None = None
+    control_dofs: list[tuple[int, Any, str]] | None = None
+    locked_dofs: list[tuple[int, Any, str]] | None = None
+    locked_targets: dict[str, float] | None = None
+    pinch_metric_pivot_body: Any | None = None
 
 
 def _as_path(raw_path: str | None, default_path: Path) -> Path:
@@ -166,6 +189,697 @@ def _center_from_bbox(box: dict[str, list[float]]) -> np.ndarray:
 
 def _distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b))
+
+
+def _quintic_blend(t: float) -> float:
+    t = float(np.clip(t, 0.0, 1.0))
+    return (6.0 * t**5) - (15.0 * t**4) + (10.0 * t**3)
+
+
+def _yaw_rad_from_rotation_xyz_deg(rotation_xyz_deg: list[float] | tuple[float, ...] | None) -> float:
+    if not rotation_xyz_deg or len(rotation_xyz_deg) < 3:
+        return 0.0
+    return math.radians(float(rotation_xyz_deg[2]))
+
+
+def _robot_base_xy_axes(robot_base_yaw_rad: float) -> tuple[np.ndarray, np.ndarray]:
+    forward = np.array([math.cos(robot_base_yaw_rad), math.sin(robot_base_yaw_rad)], dtype=float)
+    left = np.array([-math.sin(robot_base_yaw_rad), math.cos(robot_base_yaw_rad)], dtype=float)
+    return forward, left
+
+
+def _arm_mirror_sign(active_arm: str) -> float:
+    return 1.0 if active_arm == "left" else -1.0
+
+
+def _base_frame_motion_components(
+    *,
+    cartesian_delta: np.ndarray,
+    active_arm: str,
+    robot_base_yaw_rad: float,
+    backward_guard_m: float = 0.0,
+) -> dict[str, float]:
+    forward_axis, left_axis = _robot_base_xy_axes(robot_base_yaw_rad)
+    delta = np.array(cartesian_delta, dtype=float)
+    raw_forward = float(np.dot(delta[:2], forward_axis))
+    raw_lateral = float(np.dot(delta[:2], left_axis))
+    side_sign = _arm_mirror_sign(active_arm)
+    outward_lateral = raw_lateral * side_sign
+
+    # Normal task targets should stay in front of the torso. If a local target
+    # requests rearward motion, do not let the heuristic turn that into a large
+    # behind-the-back shoulder/wrist command.
+    guarded_forward = raw_forward
+    if raw_forward < -abs(float(backward_guard_m)):
+        guarded_forward = 0.0
+
+    # Crossing the torso is sometimes necessary near the bin, but it should not
+    # dominate the mirrored arm joints. Attenuate inward lateral requests.
+    guarded_lateral = raw_lateral
+    if outward_lateral < 0.0:
+        guarded_lateral *= 0.35
+        outward_lateral = guarded_lateral * side_sign
+
+    return {
+        "signed_forward": guarded_forward,
+        "raw_signed_forward": raw_forward,
+        "signed_lateral": guarded_lateral,
+        "raw_signed_lateral": raw_lateral,
+        "arm_outward_lateral": outward_lateral,
+        "vertical": float(delta[2]),
+        "backward_component_clamped": float(min(raw_forward, 0.0)) if guarded_forward == 0.0 else 0.0,
+    }
+
+
+def _select_arm_dofs_for_side(dc: Any, articulation: Any, active_arm: str, max_dofs: int) -> list[tuple[int, Any, str]]:
+    tokens = RIGHT_ARM_TOKENS if active_arm == "right" else LEFT_ARM_TOKENS
+    selected: list[tuple[int, Any, str]] = []
+    for index in range(dc.get_articulation_dof_count(articulation)):
+        dof = dc.get_articulation_dof(articulation, index)
+        name = str(dc.get_dof_name(dof))
+        if any(token in name.lower() for token in tokens):
+            selected.append((index, dof, name))
+        if len(selected) >= max_dofs:
+            break
+
+    if not selected:
+        all_names = [
+            str(dc.get_dof_name(dc.get_articulation_dof(articulation, index)))
+            for index in range(dc.get_articulation_dof_count(articulation))
+        ]
+        raise RuntimeError(f"No {active_arm}-arm DOFs matched tokens={tokens}; available_dof_names={all_names}")
+    return selected
+
+
+def _select_gripper_dofs_for_side(dc: Any, articulation: Any, active_arm: str) -> list[tuple[int, Any, str]]:
+    if active_arm == "right":
+        return _select_right_gripper_dofs(dc, articulation)
+
+    selected: list[tuple[int, Any, str]] = []
+    for index in range(dc.get_articulation_dof_count(articulation)):
+        dof = dc.get_articulation_dof(articulation, index)
+        name = str(dc.get_dof_name(dof))
+        if any(token in name.lower() for token in LEFT_GRIPPER_TOKENS):
+            selected.append((index, dof, name))
+
+    if not selected:
+        all_names = [
+            str(dc.get_dof_name(dc.get_articulation_dof(articulation, index)))
+            for index in range(dc.get_articulation_dof_count(articulation))
+        ]
+        raise RuntimeError(f"No left gripper/finger DOFs matched tokens={LEFT_GRIPPER_TOKENS}; available_dof_names={all_names}")
+    return selected
+
+
+def _identify_end_effector_body_for_side(
+    dc: Any,
+    articulation: Any,
+    active_arm: str,
+    requested_body: str | None,
+) -> tuple[Any, str, str]:
+    if active_arm == "right":
+        return _identify_end_effector_body(dc, articulation, requested_body)
+
+    bodies: list[tuple[int, Any, str, str]] = []
+    for index in range(dc.get_articulation_body_count(articulation)):
+        body = dc.get_articulation_body(articulation, index)
+        bodies.append((index, body, str(dc.get_rigid_body_name(body)), str(dc.get_rigid_body_path(body))))
+
+    if requested_body:
+        requested_lower = requested_body.lower()
+        for _, body, name, path in bodies:
+            if requested_body == name or requested_body == path or requested_lower in path.lower():
+                return body, name, path
+
+    candidates: list[tuple[int, Any, str, str]] = []
+    for index, body, name, path in bodies:
+        lower = f"{name} {path}".lower()
+        if any(token in lower for token in END_EFFECTOR_EXCLUDE_TOKENS):
+            continue
+        if any(token in lower for token in LEFT_END_EFFECTOR_TOKENS):
+            candidates.append((index, body, name, path))
+
+    if not candidates:
+        raise RuntimeError(
+            "Could not identify a left-arm end-effector body. "
+            f"Tokens={LEFT_END_EFFECTOR_TOKENS}; available body paths={[path for _, _, _, path in bodies]}"
+        )
+
+    _, body, name, path = candidates[-1]
+    return body, name, path
+
+
+def _find_body_for_side(dc: Any, articulation: Any, active_arm: str, link_token: str) -> tuple[Any, str, str]:
+    side_prefix = "R_" if active_arm == "right" else "L_"
+    expected = f"{side_prefix}{link_token}"
+    bodies: list[tuple[int, Any, str, str]] = []
+    for index in range(dc.get_articulation_body_count(articulation)):
+        body = dc.get_articulation_body(articulation, index)
+        bodies.append((index, body, str(dc.get_rigid_body_name(body)), str(dc.get_rigid_body_path(body))))
+
+    expected_lower = expected.lower()
+    for _, body, name, path in bodies:
+        if name.lower() == expected_lower or path.lower().endswith(f"/{expected_lower}"):
+            return body, name, path
+    for _, body, name, path in bodies:
+        if expected_lower in f"{name} {path}".lower():
+            return body, name, path
+
+    raise RuntimeError(
+        f"Could not find {active_arm} body for token={link_token}; expected={expected}; "
+        f"available_body_paths={[path for _, _, _, path in bodies]}"
+    )
+
+
+def _select_dofs_by_names(
+    selected_dofs: list[tuple[int, Any, str]],
+    names: set[str],
+) -> list[tuple[int, Any, str]]:
+    return [item for item in selected_dofs if item[2] in names]
+
+
+def _capture_locked_joint_targets(dc: Any, dofs: list[tuple[int, Any, str]]) -> dict[str, float]:
+    return {name: float(dc.get_dof_position(dof)) for _, dof, name in dofs}
+
+
+def _apply_locked_joint_targets(
+    dc: Any,
+    locked_dofs: list[tuple[int, Any, str]],
+    locked_targets: dict[str, float],
+) -> None:
+    targets = [float(locked_targets[name]) for _, _, name in locked_dofs]
+    _send_position_targets(dc, locked_dofs, targets)
+
+
+def _compute_pivot_drift(reference_pivot_position: np.ndarray, current_pivot_position: np.ndarray) -> float:
+    return float(np.linalg.norm(np.array(current_pivot_position, dtype=float) - np.array(reference_pivot_position, dtype=float)))
+
+
+def _summarize_pivot_drift(drifts: list[float]) -> dict[str, Any]:
+    if not drifts:
+        return {
+            "pivot_drift_norm_max": 0.0,
+            "pivot_drift_norm_mean": 0.0,
+            "pivot_drift_norm_final": 0.0,
+            "pivot_drift_sample_count": 0,
+        }
+    drift_array = np.array(drifts, dtype=float)
+    return {
+        "pivot_drift_norm_max": float(np.max(drift_array)),
+        "pivot_drift_norm_mean": float(np.mean(drift_array)),
+        "pivot_drift_norm_final": float(drift_array[-1]),
+        "pivot_drift_sample_count": int(len(drifts)),
+    }
+
+
+def _summarize_scalar_samples(samples: list[float], prefix: str) -> dict[str, Any]:
+    if not samples:
+        return {
+            f"{prefix}_max": 0.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_final": 0.0,
+            f"{prefix}_sample_count": 0,
+        }
+    sample_array = np.array(samples, dtype=float)
+    return {
+        f"{prefix}_max": float(np.max(sample_array)),
+        f"{prefix}_mean": float(np.mean(sample_array)),
+        f"{prefix}_final": float(sample_array[-1]),
+        f"{prefix}_sample_count": int(len(samples)),
+    }
+
+
+def _locked_joint_error(
+    dc: Any,
+    locked_dofs: list[tuple[int, Any, str]],
+    locked_targets: dict[str, float],
+) -> dict[str, Any]:
+    by_joint = {
+        name: abs(float(dc.get_dof_position(dof)) - float(locked_targets[name]))
+        for _, dof, name in locked_dofs
+    }
+    values = list(by_joint.values())
+    return {
+        "by_joint": by_joint,
+        "max": max(values) if values else 0.0,
+        "mean": float(np.mean(np.array(values, dtype=float))) if values else 0.0,
+    }
+
+
+def _arc_micro_stop_estimate(
+    trace: list[dict[str, Any]],
+    frame_span_per_trace_sample: int,
+    threshold: float,
+) -> dict[str, Any]:
+    previous: np.ndarray | None = None
+    micro_stop_frames = 0
+    micro_stop_samples = 0
+    for sample in trace:
+        actual = np.array(sample["actual"], dtype=float)
+        if previous is not None:
+            speed = _distance(previous, actual) / float(max(frame_span_per_trace_sample, 1))
+            if speed <= threshold:
+                micro_stop_samples += 1
+                micro_stop_frames += max(frame_span_per_trace_sample, 1)
+        previous = actual
+    return {
+        "micro_stop_frames": int(micro_stop_frames),
+        "micro_stop_samples": int(micro_stop_samples),
+    }
+
+
+def _estimate_unlocked_stream_endpoint(
+    *,
+    dc: Any,
+    articulation: Any,
+    selected_dofs: list[tuple[int, Any, str]],
+    body: Any,
+    start_positions: np.ndarray,
+    start_body_position: np.ndarray,
+    target_position: np.ndarray,
+    sim_app: Any,
+    counter: dict[str, int],
+    eps: float,
+    damping: float,
+    max_step: float,
+    sample_count: int,
+) -> np.ndarray:
+    jacobian = np.zeros((3, len(selected_dofs)), dtype=float)
+    for column in range(len(selected_dofs)):
+        trial = start_positions.copy()
+        trial[column] += eps
+        _send_position_targets(dc, selected_dofs, [float(value) for value in trial])
+        sim_app.update()
+        counter["step"] += 1
+        dc.wake_up_articulation(articulation)
+        moved_position = _body_pose_position(dc, body)
+        jacobian[:, column] = (moved_position - start_body_position) / eps
+
+    _send_position_targets(dc, selected_dofs, [float(value) for value in start_positions])
+    sim_app.update()
+    counter["step"] += 1
+    dc.wake_up_articulation(articulation)
+    error_vector = target_position - start_body_position
+    lhs = jacobian @ jacobian.T + (damping**2) * np.eye(3)
+    delta = jacobian.T @ np.linalg.solve(lhs, error_vector)
+    delta_norm = float(np.linalg.norm(delta))
+    max_total = min(max_step * float(max(int(sample_count), 1)), 0.25)
+    if delta_norm > max_total:
+        delta *= max_total / delta_norm
+    return start_positions + delta
+
+
+def _heuristic_lower_chain_arc_endpoint(
+    *,
+    lower_dofs: list[tuple[int, Any, str]],
+    start_positions: np.ndarray,
+    start_body_position: np.ndarray,
+    target_position: np.ndarray,
+    active_arm: str,
+    robot_base_yaw_rad: float,
+    max_step: float,
+    sample_count: int,
+) -> np.ndarray:
+    motion = _base_frame_motion_components(
+        cartesian_delta=target_position - start_body_position,
+        active_arm=active_arm,
+        robot_base_yaw_rad=robot_base_yaw_rad,
+    )
+    forward = max(float(motion["signed_forward"]), 0.0)
+    lateral = float(motion["signed_lateral"])
+    outward_lateral = float(motion["arm_outward_lateral"])
+    vertical = float(motion["vertical"])
+    mirror_sign = _arm_mirror_sign(active_arm)
+    max_total = min(max_step * float(max(int(sample_count), 1)), 0.55)
+    endpoint = start_positions.copy()
+    for index, (_, _, name) in enumerate(lower_dofs):
+        lower_name = name.lower()
+        if "elbow_yaw" in lower_name:
+            delta = 0.45 * mirror_sign * outward_lateral
+        elif "wrist_pitch" in lower_name:
+            delta = mirror_sign * (0.95 * forward + 0.55 * vertical)
+        elif "wrist_roll" in lower_name:
+            delta = 0.18 * lateral
+        else:
+            delta = 0.0
+        endpoint[index] += float(np.clip(delta, -max_total, max_total))
+    return endpoint
+
+
+def _heuristic_upper_chain_anchor_endpoint(
+    *,
+    selected_dofs: list[tuple[int, Any, str]],
+    start_positions: np.ndarray,
+    start_body_position: np.ndarray,
+    target_position: np.ndarray,
+    active_arm: str,
+    robot_base_yaw_rad: float,
+    max_step: float,
+    sample_count: int,
+) -> np.ndarray:
+    motion = _base_frame_motion_components(
+        cartesian_delta=target_position - start_body_position,
+        active_arm=active_arm,
+        robot_base_yaw_rad=robot_base_yaw_rad,
+    )
+    forward = max(float(motion["signed_forward"]), 0.0)
+    lateral = float(motion["signed_lateral"])
+    outward_lateral = float(motion["arm_outward_lateral"])
+    vertical = float(motion["vertical"])
+    mirror_sign = _arm_mirror_sign(active_arm)
+    max_total = max_step * float(max(int(sample_count), 1))
+    endpoint = start_positions.copy()
+    for index, (_, _, name) in enumerate(selected_dofs):
+        lower_name = name.lower()
+        if "shoulder_pitch" in lower_name:
+            delta = mirror_sign * (0.85 * forward + 0.30 * vertical)
+        elif "shoulder_roll" in lower_name:
+            delta = 0.50 * outward_lateral + 0.18 * vertical
+        elif "shoulder_yaw" in lower_name:
+            delta = 0.36 * mirror_sign * outward_lateral
+        elif "elbow_roll" in lower_name:
+            delta = -0.65 * forward + 0.30 * vertical
+        else:
+            delta = 0.0
+        endpoint[index] += float(np.clip(delta, -max_total, max_total))
+    return endpoint
+
+
+def _heuristic_main_cycle_endpoint_delta(
+    *,
+    selected_dofs: list[tuple[int, Any, str]],
+    cartesian_delta: np.ndarray,
+    active_arm: str,
+    robot_base_yaw_rad: float,
+    max_step: float,
+    sample_count: int,
+) -> np.ndarray:
+    motion = _base_frame_motion_components(
+        cartesian_delta=cartesian_delta,
+        active_arm=active_arm,
+        robot_base_yaw_rad=robot_base_yaw_rad,
+    )
+    forward = max(float(motion["signed_forward"]), 0.0)
+    lateral = float(motion["signed_lateral"])
+    outward_lateral = float(motion["arm_outward_lateral"])
+    vertical = float(motion["vertical"])
+    mirror_sign = _arm_mirror_sign(active_arm)
+    max_total = min(max_step * float(max(int(sample_count), 1)), 0.35)
+    delta = np.zeros(len(selected_dofs), dtype=float)
+    for index, (_, _, name) in enumerate(selected_dofs):
+        lower_name = name.lower()
+        if "shoulder_pitch" in lower_name:
+            value = mirror_sign * (0.42 * forward + 0.16 * vertical)
+        elif "shoulder_roll" in lower_name:
+            value = 0.24 * outward_lateral + 0.08 * vertical
+        elif "shoulder_yaw" in lower_name:
+            value = 0.20 * mirror_sign * outward_lateral
+        elif "elbow_roll" in lower_name:
+            value = -0.30 * forward + 0.12 * vertical
+        elif "elbow_yaw" in lower_name:
+            value = 0.14 * mirror_sign * outward_lateral
+        elif "wrist_pitch" in lower_name:
+            value = mirror_sign * (0.14 * forward + 0.20 * vertical)
+        elif "wrist_roll" in lower_name:
+            value = 0.06 * lateral
+        else:
+            value = 0.0
+        delta[index] = float(np.clip(value, -max_total, max_total))
+    return delta
+
+
+def _precompute_main_cycle_joint_waypoints(
+    *,
+    selected_dofs: list[tuple[int, Any, str]],
+    start_positions: np.ndarray,
+    start_body_position: np.ndarray,
+    segments: list[MotionSegment],
+    active_arm: str,
+    robot_base_yaw_rad: float,
+    args: argparse.Namespace,
+) -> list[np.ndarray]:
+    waypoints = [start_positions.copy()]
+    for segment in segments:
+        sample_count = int(segment.details.get("streaming_sample_count", segment.max_ik_steps))
+        absolute_cartesian_delta = np.array(segment.target_position, dtype=float) - np.array(start_body_position, dtype=float)
+        endpoint = start_positions + _heuristic_main_cycle_endpoint_delta(
+            selected_dofs=selected_dofs,
+            cartesian_delta=absolute_cartesian_delta,
+            active_arm=active_arm,
+            robot_base_yaw_rad=robot_base_yaw_rad,
+            max_step=args.ik_max_step,
+            sample_count=sample_count,
+        )
+        waypoints.append(endpoint.copy())
+    return waypoints
+
+
+def _joint_waypoint_tangents(waypoints: list[np.ndarray], cumulative_samples: list[float]) -> list[np.ndarray]:
+    if len(waypoints) <= 1:
+        return [np.zeros_like(waypoints[0])] if waypoints else []
+
+    tangents: list[np.ndarray] = []
+    for index, waypoint in enumerate(waypoints):
+        if index == 0:
+            dt = max(float(cumulative_samples[1] - cumulative_samples[0]), 1.0)
+            tangents.append((waypoints[1] - waypoint) / dt)
+            continue
+        if index == len(waypoints) - 1:
+            dt = max(float(cumulative_samples[index] - cumulative_samples[index - 1]), 1.0)
+            tangents.append((waypoint - waypoints[index - 1]) / dt)
+            continue
+
+        dt_prev = max(float(cumulative_samples[index] - cumulative_samples[index - 1]), 1.0)
+        dt_next = max(float(cumulative_samples[index + 1] - cumulative_samples[index]), 1.0)
+        prev_slope = (waypoint - waypoints[index - 1]) / dt_prev
+        next_slope = (waypoints[index + 1] - waypoint) / dt_next
+        same_direction = (prev_slope * next_slope) > 0.0
+        tangent = np.zeros_like(waypoint)
+        tangent[same_direction] = np.sign(prev_slope[same_direction]) * np.minimum(
+            np.abs(prev_slope[same_direction]),
+            np.abs(next_slope[same_direction]),
+        )
+        tangents.append(tangent)
+    return tangents
+
+
+def _sample_cubic_hermite_joint_chain(
+    *,
+    waypoints: list[np.ndarray],
+    tangents: list[np.ndarray],
+    cumulative_samples: list[float],
+    progress: float,
+) -> tuple[int, float, np.ndarray]:
+    if len(waypoints) == 1:
+        return 0, 0.0, waypoints[0].copy()
+
+    segment_index = _segment_index_for_progress(cumulative_samples, progress)
+    segment_start = float(cumulative_samples[segment_index])
+    segment_end = float(cumulative_samples[segment_index + 1])
+    segment_span = max(segment_end - segment_start, 1.0)
+    u = float(np.clip((progress - segment_start) / segment_span, 0.0, 1.0))
+    u2 = u * u
+    u3 = u2 * u
+    p0 = waypoints[segment_index]
+    p1 = waypoints[segment_index + 1]
+    m0 = tangents[segment_index]
+    m1 = tangents[segment_index + 1]
+    target = (
+        (2.0 * u3 - 3.0 * u2 + 1.0) * p0
+        + (u3 - 2.0 * u2 + u) * segment_span * m0
+        + (-2.0 * u3 + 3.0 * u2) * p1
+        + (u3 - u2) * segment_span * m1
+    )
+    return segment_index, u, target
+
+
+def _execute_streaming_body_segment(
+    *,
+    target_index: int,
+    dc: Any,
+    articulation: Any,
+    sim_app: Any,
+    counter: dict[str, int],
+    selected_dofs: list[tuple[int, Any, str]],
+    body: Any,
+    body_name: str,
+    body_path: str,
+    target_position: np.ndarray,
+    sample_count: int,
+    frame_step_updates: int,
+    endpoint_strategy: str,
+    args: argparse.Namespace,
+    phase_name: str,
+    phase_tag: str,
+    waypoint_type: str,
+    speed_profile: str,
+    gripper_dofs: list[tuple[int, Any, str]],
+    phase_log: list[dict[str, Any]],
+    extra_details: dict[str, Any],
+    gripper_effort_value: float | None = None,
+    locked_dofs: list[tuple[int, Any, str]] | None = None,
+    locked_targets: dict[str, float] | None = None,
+    append_phase: bool = True,
+    stop_tolerance: float | None = None,
+) -> dict[str, Any]:
+    start_step = counter["step"]
+    start_positions = np.array(_current_positions(dc, selected_dofs), dtype=float)
+    start_body_position = _body_pose_position(dc, body)
+    samples = max(int(sample_count), 1)
+    frame_updates = max(int(frame_step_updates), 1)
+    if endpoint_strategy == "hold_current":
+        end_positions = start_positions.copy()
+    elif endpoint_strategy == "upper_anchor_heuristic":
+        active_arm = str(extra_details.get("active_arm", "right"))
+        robot_base_yaw_rad = float(extra_details.get("robot_base_yaw_rad", 0.0))
+        end_positions = _heuristic_upper_chain_anchor_endpoint(
+            selected_dofs=selected_dofs,
+            start_positions=start_positions,
+            start_body_position=start_body_position,
+            target_position=target_position,
+            active_arm=active_arm,
+            robot_base_yaw_rad=robot_base_yaw_rad,
+            max_step=args.ik_max_step,
+            sample_count=samples,
+        )
+    elif endpoint_strategy in {"main_cycle_heuristic_endpoint", "global_precomputed_joint_waypoint"}:
+        active_arm = str(extra_details.get("active_arm", "right"))
+        robot_base_yaw_rad = float(extra_details.get("robot_base_yaw_rad", 0.0))
+        end_positions = start_positions + _heuristic_main_cycle_endpoint_delta(
+            selected_dofs=selected_dofs,
+            cartesian_delta=target_position - start_body_position,
+            active_arm=active_arm,
+            robot_base_yaw_rad=robot_base_yaw_rad,
+            max_step=args.ik_max_step,
+            sample_count=samples,
+        )
+    elif endpoint_strategy == "single_dls_endpoint":
+        end_positions = _estimate_unlocked_stream_endpoint(
+            dc=dc,
+            articulation=articulation,
+            selected_dofs=selected_dofs,
+            body=body,
+            start_positions=start_positions,
+            start_body_position=start_body_position,
+            target_position=target_position,
+            sim_app=sim_app,
+            counter=counter,
+            eps=args.ik_position_eps,
+            damping=args.ik_damping,
+            max_step=args.ik_max_step,
+            sample_count=samples,
+        )
+    else:
+        raise RuntimeError(f"Unknown streaming endpoint strategy: {endpoint_strategy}")
+
+    if gripper_effort_value is not None:
+        effort_before = _apply_gripper_effort(dc, gripper_dofs, gripper_effort_value)
+        if not effort_before["supported"]:
+            raise RuntimeError(f"Gripper effort command failed before {phase_name}: {effort_before}")
+    else:
+        effort_before = None
+
+    trace: list[dict[str, Any]] = []
+    for sample_index in range(samples):
+        t = (sample_index + 1) / float(samples)
+        alpha = _quintic_blend(t)
+        target_joints = start_positions + alpha * (end_positions - start_positions)
+        _send_position_targets(dc, selected_dofs, [float(value) for value in target_joints])
+        for _ in range(frame_updates):
+            if locked_dofs is not None and locked_targets is not None:
+                _apply_locked_joint_targets(dc, locked_dofs, locked_targets)
+            if gripper_effort_value is not None:
+                effort_during = _apply_gripper_effort(dc, gripper_dofs, gripper_effort_value)
+                if not effort_during["supported"]:
+                    raise RuntimeError(f"Gripper effort command failed during {phase_name}: {effort_during}")
+            sim_app.update()
+            counter["step"] += 1
+        dc.wake_up_articulation(articulation)
+        actual_position = _body_pose_position(dc, body)
+        trace.append(
+            {
+                "phase": phase_name,
+                "sample_index": int(sample_index),
+                "target_joint_positions": _named_positions(selected_dofs, target_joints),
+                "target": target_position.tolist(),
+                "actual": actual_position.tolist(),
+                "error_norm": float(np.linalg.norm(target_position - actual_position)),
+            }
+        )
+
+    actual_position = _body_pose_position(dc, body)
+    position_error = float(np.linalg.norm(target_position - actual_position))
+    micro_stop_estimate = _arc_micro_stop_estimate(
+        trace=trace,
+        frame_span_per_trace_sample=frame_updates,
+        threshold=args.micro_stop_speed_threshold,
+    )
+    effective_stop_tolerance = float(stop_tolerance if stop_tolerance is not None else args.ik_stop_tolerance)
+    condition_met = bool(position_error <= effective_stop_tolerance)
+    details = {
+        "target_index": target_index,
+        "continuous_motion": True,
+        "phase_tag": phase_tag,
+        "waypoint_type": waypoint_type,
+        "speed_profile": speed_profile,
+        "streaming_controller": True,
+        "streaming_endpoint_strategy": endpoint_strategy,
+        "finite_difference_jacobian_calls_during_stream": 0 if endpoint_strategy != "single_dls_endpoint" else 1,
+        "stream_sample_count": samples,
+        "frame_step_updates": frame_updates,
+        "interpolation_profile": "quintic_minimum_jerk",
+        "control_body_name": body_name,
+        "control_body_path": body_path,
+        "control_dof_names": [name for _, _, name in selected_dofs],
+        "target_position": target_position.tolist(),
+        "position_error": position_error,
+        "stop_tolerance": effective_stop_tolerance,
+        "ik_step_count": 0,
+        "ik_trace": trace,
+        "micro_stop_frames": micro_stop_estimate["micro_stop_frames"],
+        "micro_stop_samples": micro_stop_estimate["micro_stop_samples"],
+        "gripper_effort_before_segment": effort_before,
+        "locked_target_reapplication_active": bool(locked_dofs is not None and locked_targets is not None),
+    }
+    details.update(extra_details)
+    if append_phase:
+        _append_phase(
+            phase_log,
+            phase=phase_name,
+            start_step=start_step,
+            end_step=counter["step"],
+            commanded_targets=_named_positions(selected_dofs, _current_positions(dc, selected_dofs)),
+            ee_position=actual_position,
+            gripper_values=_gripper_values(dc, gripper_dofs),
+            condition_met=condition_met,
+            details=details,
+        )
+    return {
+        "actual_position": actual_position,
+        "position_error": position_error,
+        "trace": trace,
+        "condition_met": condition_met,
+        "details": details,
+        "micro_stop_estimate": micro_stop_estimate,
+    }
+
+
+def _interpolate_arc_waypoints(
+    start_pos: np.ndarray,
+    mid_pos: np.ndarray,
+    end_pos: np.ndarray,
+    num_steps: int,
+) -> list[np.ndarray]:
+    count = max(int(num_steps), 1)
+    start = np.array(start_pos, dtype=float)
+    mid = np.array(mid_pos, dtype=float)
+    end = np.array(end_pos, dtype=float)
+    waypoints: list[np.ndarray] = []
+    for index in range(1, count + 1):
+        t = index / float(count)
+        waypoint = ((1.0 - t) ** 2) * start + 2.0 * (1.0 - t) * t * mid + (t**2) * end
+        waypoints.append(waypoint)
+    return waypoints
 
 
 def _pregrasp_geometry_summary(
@@ -199,6 +913,181 @@ def _pregrasp_geometry_summary(
 
 def _print_pregrasp_geometry(summary: dict[str, Any]) -> None:
     print(f"pregrasp_geometry={json.dumps(summary, sort_keys=True)}")
+
+
+def _pregrasp_with_pullback(
+    pre_grasp_position: np.ndarray,
+    robot_base_position: list[float],
+    pullback_m: float,
+    max_bias_m: float,
+) -> tuple[np.ndarray, float, float]:
+    biased = np.array(pre_grasp_position, dtype=float).copy()
+    robot_base = np.array(robot_base_position, dtype=float)
+    vx = float(robot_base[0] - biased[0])
+    vy = float(robot_base[1] - biased[1])
+    dist = math.sqrt(vx * vx + vy * vy) + 1e-9
+    applied = min(max(float(pullback_m), 0.0), max(float(max_bias_m), 0.0))
+    scale = applied / dist
+    biased[0] += scale * vx
+    biased[1] += scale * vy
+    return biased, applied, dist
+
+
+def _build_pregrasp_candidates(
+    *,
+    pregrasp_before_bias: np.ndarray,
+    pregrasp_after_bias: np.ndarray,
+    robot_base_position: list[float],
+    active_arm: str,
+    args: argparse.Namespace,
+    front_workspace_z: tuple[float, float],
+) -> list[dict[str, Any]]:
+    candidate_specs = [
+        ("center", float(np.linalg.norm(pregrasp_after_bias[:2] - pregrasp_before_bias[:2])), 0.0),
+        ("pullback_2cm", 0.02, 0.0),
+        ("pullback_4cm", 0.04, 0.0),
+        ("center_z_plus_2cm", float(np.linalg.norm(pregrasp_after_bias[:2] - pregrasp_before_bias[:2])), 0.02),
+        ("pullback_2cm_z_plus_2cm", 0.02, 0.02),
+        ("pullback_4cm_z_minus_2cm", 0.04, -0.02),
+    ]
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[float, float, float]] = set()
+    for label, pullback_m, z_offset in candidate_specs:
+        candidate_position, applied, _ = _pregrasp_with_pullback(
+            pregrasp_before_bias,
+            robot_base_position,
+            pullback_m,
+            args.pregrasp_max_bias_m,
+        )
+        candidate_position[2] = float(np.clip(pregrasp_before_bias[2] + z_offset, *front_workspace_z))
+        key = tuple(round(float(value), 6) for value in candidate_position)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(
+            {
+                "candidate_index": len(candidates),
+                "label": label,
+                "active_arm": active_arm,
+                "pregrasp_before_bias": pregrasp_before_bias.tolist(),
+                "pregrasp_after_bias": pregrasp_after_bias.tolist(),
+                "position": candidate_position,
+                "pullback_applied": float(applied),
+                "base_to_target_xy": {
+                    "dx": float(candidate_position[0] - robot_base_position[0]),
+                    "dy": float(candidate_position[1] - robot_base_position[1]),
+                    "distance": float(np.linalg.norm(candidate_position[:2] - np.array(robot_base_position[:2], dtype=float))),
+                },
+                "z_offset": float(z_offset),
+                "z_clamped": bool(abs(float(candidate_position[2] - (pregrasp_before_bias[2] + z_offset))) > 1e-9),
+            }
+        )
+        if len(candidates) >= 6:
+            break
+    return candidates
+
+
+def _select_pregrasp_candidate(
+    *,
+    target_index: int,
+    active_arm: str,
+    fallback_triggered: bool,
+    candidates: list[dict[str, Any]],
+    dc: Any,
+    articulation: Any,
+    arm_dofs: list[tuple[int, Any, str]],
+    gripper_dofs: list[tuple[int, Any, str]],
+    end_effector_body: Any,
+    sim_app: Any,
+    args: argparse.Namespace,
+    counter: dict[str, int],
+    phase_log: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for candidate in candidates:
+        start_step = counter["step"]
+        target_position = np.array(candidate["position"], dtype=float)
+        stream_result = _execute_streaming_body_segment(
+            target_index=target_index,
+            dc=dc,
+            articulation=articulation,
+            sim_app=sim_app,
+            counter=counter,
+            selected_dofs=arm_dofs,
+            body=end_effector_body,
+            body_name=f"{active_arm}_candidate_end_effector",
+            body_path=f"{active_arm}_candidate_end_effector",
+            target_position=target_position,
+            sample_count=args.stream_samples,
+            frame_step_updates=args.stream_frame_step_updates,
+            endpoint_strategy="single_dls_endpoint",
+            args=args,
+            phase_name=f"pregrasp_candidate_{active_arm}_{candidate['candidate_index']}",
+            phase_tag="approach",
+            waypoint_type="soft",
+            speed_profile="streaming_pregrasp_candidate",
+            gripper_dofs=gripper_dofs,
+            phase_log=phase_log,
+            extra_details={
+                "pregrasp_candidate_streaming": True,
+                "streaming_endpoint_strategy": "single_dls_endpoint",
+                "streaming_sample_count": int(args.stream_samples),
+                "interpolation_profile": "quintic_minimum_jerk",
+            },
+            append_phase=False,
+            stop_tolerance=args.continuous_soft_tolerance,
+        )
+        actual_position = stream_result["actual_position"]
+        pre_distance = float(stream_result["position_error"])
+        trace = stream_result["trace"]
+        error_vector = target_position - actual_position
+        candidate_log = {
+            "target_index": target_index,
+            "active_arm": active_arm,
+            "fallback_triggered": bool(fallback_triggered),
+            "candidate_index": int(candidate["candidate_index"]),
+            "candidate_label": candidate["label"],
+            "pregrasp_before_bias": candidate["pregrasp_before_bias"],
+            "pregrasp_after_bias": candidate["pregrasp_after_bias"],
+            "target_position": target_position.tolist(),
+            "actual_position": actual_position.tolist(),
+            "pullback_applied": float(candidate["pullback_applied"]),
+            "base_to_target_xy": candidate["base_to_target_xy"],
+            "error_vector": {
+                "dx": float(error_vector[0]),
+                "dy": float(error_vector[1]),
+                "dz": float(error_vector[2]),
+            },
+            "error_norm": float(pre_distance),
+            "pre_grasp_ee_tolerance": args.pre_grasp_ee_tolerance,
+            "z_clamped": bool(candidate["z_clamped"]),
+            "ik_step_count": len(trace),
+            "ik_trace": trace,
+            "streaming_controller": True,
+            "no_blocking_ik": True,
+            "stream_sample_count": int(args.stream_samples),
+            "frame_step_updates": int(args.stream_frame_step_updates),
+            "interpolation_profile": "quintic_minimum_jerk",
+        }
+        _append_phase(
+            phase_log,
+            phase="pregrasp_candidate_selection",
+            start_step=start_step,
+            end_step=counter["step"],
+            commanded_targets=_named_positions(arm_dofs, _current_positions(dc, arm_dofs)),
+            ee_position=actual_position,
+            gripper_values=_gripper_values(dc, gripper_dofs),
+            condition_met=bool(pre_distance <= args.pre_grasp_ee_tolerance),
+            details=candidate_log,
+        )
+        print(f"pregrasp_candidate={json.dumps(candidate_log, sort_keys=True)}")
+        if pre_distance <= args.pre_grasp_ee_tolerance:
+            selected = dict(candidate)
+            selected["actual_position"] = actual_position.tolist()
+            selected["pre_distance"] = float(pre_distance)
+            selected["error_vector"] = candidate_log["error_vector"]
+            selected["fallback_triggered"] = bool(fallback_triggered)
+            return selected
+    return None
 
 
 def _parse_bounds(raw_values: list[float], name: str) -> tuple[float, float]:
@@ -309,9 +1198,13 @@ def _run_updates_with_optional_gripper_effort(
     dc: Any,
     gripper_dofs: list[tuple[int, Any, str]],
     effort_value: float | None,
+    locked_dofs: list[tuple[int, Any, str]] | None = None,
+    locked_targets: dict[str, float] | None = None,
 ) -> dict[str, Any] | None:
     last_effort_result: dict[str, Any] | None = None
     for _ in range(steps):
+        if locked_dofs is not None and locked_targets is not None:
+            _apply_locked_joint_targets(dc, locked_dofs, locked_targets)
         if effort_value is not None:
             last_effort_result = _apply_gripper_effort(dc, gripper_dofs, effort_value)
             if not last_effort_result["supported"]:
@@ -376,11 +1269,80 @@ def _set_joint_positions_and_targets(
     selected_dofs: list[tuple[int, Any, str]],
     target_positions: list[float],
 ) -> None:
-    for (_, dof, _), target in zip(selected_dofs, target_positions):
-        if hasattr(dc, "set_dof_position"):
-            dc.set_dof_position(dof, float(target))
-        if hasattr(dc, "set_dof_position_target"):
-            dc.set_dof_position_target(dof, float(target))
+    _send_position_targets(dc, selected_dofs, [float(target) for target in target_positions])
+
+
+def _seed_joint_positions_for_initialization(
+    dc: Any,
+    selected_dofs: list[tuple[int, Any, str]],
+    target_positions: list[float],
+) -> dict[str, Any]:
+    """Seed the official startup pose once before manipulation streaming begins."""
+    targets = [float(target) for target in target_positions]
+    applied: dict[str, float] = {}
+    errors: list[str] = []
+    if not hasattr(dc, "set_dof_position"):
+        errors.append("dynamic_control does not expose set_dof_position")
+    else:
+        for (index, dof, name), target in zip(selected_dofs, targets):
+            try:
+                dc.set_dof_position(dof, target)
+                applied[name] = target
+            except Exception as exc:  # pragma: no cover - Isaac runtime API detail.
+                errors.append(f"{index}:{name}: {exc}")
+
+    _send_position_targets(dc, selected_dofs, targets)
+    return {
+        "supported": not errors and len(applied) == len(selected_dofs),
+        "method": "dynamic_control.set_dof_position_initialization_only_then_set_dof_position_target",
+        "normal_motion_runtime_uses_set_dof_position": False,
+        "dof_indices": [index for index, _, _ in selected_dofs],
+        "dof_names": [name for _, _, name in selected_dofs],
+        "applied_positions": applied,
+        "errors": errors,
+    }
+
+
+def _articulation_acquire_candidates(detected_path: str, robot_prim_path: str) -> list[str]:
+    candidates: list[str] = []
+
+    def _add(path: str) -> None:
+        if path and path not in candidates:
+            candidates.append(path)
+
+    _add(detected_path)
+    _add(robot_prim_path)
+    current = detected_path.rstrip("/")
+    while "/" in current:
+        current = current.rsplit("/", 1)[0]
+        if not current:
+            break
+        _add(current)
+        if current == robot_prim_path:
+            break
+    return candidates
+
+
+def _acquire_articulation_with_fallback(
+    detected_path: str,
+    robot_prim_path: str,
+) -> tuple[Any, Any, dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    for candidate_path in _articulation_acquire_candidates(detected_path, robot_prim_path):
+        try:
+            dc, articulation = _acquire_articulation(candidate_path)
+            return dc, articulation, {
+                "detected_articulation_path": detected_path,
+                "acquired_articulation_path": candidate_path,
+                "candidate_paths": _articulation_acquire_candidates(detected_path, robot_prim_path),
+                "attempts": attempts + [{"path": candidate_path, "success": True}],
+            }
+        except Exception as exc:
+            attempts.append({"path": candidate_path, "success": False, "error": str(exc)})
+    raise RuntimeError(
+        "dynamic_control could not acquire the Walker S2 articulation from any candidate path: "
+        f"{json.dumps(attempts, sort_keys=True)}"
+    )
 
 
 def _debug_marker(stage: Any, path: str, position: list[float], radius: float, color: tuple[float, float, float]) -> str:
@@ -489,12 +1451,29 @@ def _tuning_knob_summary(args: argparse.Namespace) -> dict[str, Any]:
         "soft_tolerance": {
             "continuous_soft_tolerance": args.continuous_soft_tolerance,
         },
+        "experimental_pivot_arc_grasp": {
+            "enabled": bool(args.experimental_pivot_arc_grasp),
+            "pivot_to_pinch_distance_m": args.pivot_to_pinch_distance_m,
+            "pivot_anchor_height_offset_m": args.pivot_anchor_height_offset_m,
+            "pivot_anchor_forward_offset_m": args.pivot_anchor_forward_offset_m,
+            "pivot_anchor_lateral_offset_m": args.pivot_anchor_lateral_offset_m,
+            "pivot_arc_contact_tolerance_m": args.pivot_arc_contact_tolerance_m,
+            "pivot_arc_max_steps": args.pivot_arc_max_steps,
+            "pivot_arc_close_distance_m": args.pivot_arc_close_distance_m,
+            "pivot_arc_frame_step_updates": args.pivot_arc_frame_step_updates,
+            "pivot_arc_stream_samples": args.pivot_arc_stream_samples,
+            "stream_samples": args.stream_samples,
+            "stream_frame_step_updates": args.stream_frame_step_updates,
+        },
     }
 
 
 def _build_continuous_cycle_plan(
     *,
+    active_arm: str,
+    robot_base_rotation: list[float],
     pre_grasp_target: np.ndarray,
+    grasp_align_target: np.ndarray | None,
     grasp_depth_target: np.ndarray,
     lift_clearance_target: np.ndarray,
     prebin_target: np.ndarray,
@@ -502,91 +1481,480 @@ def _build_continuous_cycle_plan(
     retreat_target: np.ndarray,
     args: argparse.Namespace,
 ) -> list[MotionSegment]:
-    soft_hold_steps = 0 if args.smooth_motion else args.ik_hold_steps
-    contact_hold_steps = args.continuous_contact_dwell_steps if args.smooth_motion else args.ik_hold_steps
     soft_tolerance = args.continuous_soft_tolerance if args.smooth_motion else args.ik_stop_tolerance
-    return [
+    soft_samples = max(int(args.stream_samples), 1)
+    hard_samples = max(int(args.stream_samples), 1)
+    main_endpoint_strategy = "global_precomputed_joint_waypoint"
+    robot_base_yaw_rad = _yaw_rad_from_rotation_xyz_deg(robot_base_rotation)
+
+    def _stream_details(legacy_phase: str, endpoint_strategy: str, sample_count: int) -> dict[str, Any]:
+        return {
+            "legacy_phase": legacy_phase,
+            "streaming_segment": True,
+            "streaming_endpoint_strategy": endpoint_strategy,
+            "streaming_sample_count": int(sample_count),
+            "interpolation_profile": "global_quintic_timewarp_cubic_hermite_joint_chain",
+            "endpoint_rebuilds_before_segment": 0,
+            "finite_difference_jacobian_calls_during_stream": 0,
+            "active_arm": active_arm,
+            "robot_base_yaw_rad": float(robot_base_yaw_rad),
+        }
+
+    segments = [
         MotionSegment(
             name="continuous_pregrasp",
             phase_tag="approach",
             target_position=pre_grasp_target,
             waypoint_type="soft",
-            speed_profile="transit_blended",
-            max_ik_steps=args.ik_steps,
+            speed_profile="streaming_transit",
+            max_ik_steps=soft_samples,
             stop_tolerance=soft_tolerance,
-            hold_steps=soft_hold_steps,
+            hold_steps=0,
             blend_radius=args.continuous_blend_radius,
-            details={"legacy_phase": "move_to_pre_grasp_front"},
+            details=_stream_details("move_to_pre_grasp_front", main_endpoint_strategy, soft_samples),
+        ),
+    ]
+    if grasp_align_target is not None:
+        segments.append(
+            MotionSegment(
+                name="continuous_grasp_align",
+                phase_tag="grasp_window",
+                target_position=grasp_align_target,
+                waypoint_type="soft",
+                speed_profile="streaming_pre_contact_alignment",
+                max_ik_steps=hard_samples,
+                stop_tolerance=soft_tolerance,
+                hold_steps=0,
+                blend_radius=args.continuous_blend_radius,
+                details=_stream_details("pre_contact_alignment", main_endpoint_strategy, hard_samples),
+            )
+        )
+    segments.extend(
+        [
+            MotionSegment(
+                name="continuous_grasp_depth",
+                phase_tag="grasp_window",
+                target_position=grasp_depth_target,
+                waypoint_type="hard",
+                speed_profile="streaming_contact_approach",
+                max_ik_steps=hard_samples,
+                stop_tolerance=args.ik_stop_tolerance,
+                hold_steps=0,
+                blend_radius=0.0,
+                event_marker="close_gripper",
+                contact_window=True,
+                details=_stream_details("descend_front", main_endpoint_strategy, hard_samples),
+            ),
+            MotionSegment(
+                name="continuous_lift_clearance",
+                phase_tag="lift",
+                target_position=lift_clearance_target,
+                waypoint_type="hard",
+                speed_profile="streaming_lift",
+                max_ik_steps=hard_samples,
+                stop_tolerance=args.ik_stop_tolerance,
+                hold_steps=0,
+                blend_radius=0.0,
+                contact_window=True,
+                gripper_effort=args.gripper_hold_effort,
+                details=_stream_details("grasp_validation_and_lift_front", main_endpoint_strategy, hard_samples),
+            ),
+            MotionSegment(
+                name="continuous_prebin",
+                phase_tag="carry",
+                target_position=prebin_target,
+                waypoint_type="soft",
+                speed_profile="streaming_carry",
+                max_ik_steps=soft_samples,
+                stop_tolerance=soft_tolerance,
+                hold_steps=0,
+                blend_radius=args.continuous_blend_radius,
+                gripper_effort=args.gripper_hold_effort,
+                details=_stream_details("move_to_bin_front", main_endpoint_strategy, soft_samples),
+            ),
+            MotionSegment(
+                name="continuous_place_depth",
+                phase_tag="place_window",
+                target_position=place_depth_target,
+                waypoint_type="hard",
+                speed_profile="streaming_place_release",
+                max_ik_steps=hard_samples,
+                stop_tolerance=args.ik_stop_tolerance,
+                hold_steps=0,
+                blend_radius=0.0,
+                event_marker="open_gripper",
+                contact_window=True,
+                gripper_effort=args.gripper_hold_effort,
+                details=_stream_details("release", main_endpoint_strategy, hard_samples),
+            ),
+            MotionSegment(
+                name="continuous_retreat",
+                phase_tag="retreat",
+                target_position=retreat_target,
+                waypoint_type="soft",
+                speed_profile="streaming_retreat",
+                max_ik_steps=soft_samples,
+                stop_tolerance=soft_tolerance,
+                hold_steps=0,
+                blend_radius=args.continuous_blend_radius,
+                details=_stream_details("retreat", main_endpoint_strategy, soft_samples),
+            ),
+        ]
+    )
+    return segments
+
+
+def _grasp_contact_geometry(
+    *,
+    selected_pregrasp_target: np.ndarray,
+    object_center: np.ndarray,
+    bbox_top_z: float,
+    table_top_z: float,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    contact_target = np.array(selected_pregrasp_target, dtype=float).copy()
+    contact_target[0] += float(args.grasp_contact_offset_x)
+    contact_target[1] += float(args.grasp_contact_offset_y)
+    contact_target[2] = max(
+        float(bbox_top_z) + args.descend_clearance + args.grasp_depth_offset,
+        table_top_z + args.min_ee_table_clearance,
+    )
+    align_target = np.array(contact_target, dtype=float).copy()
+    align_target[2] = float(selected_pregrasp_target[2])
+    xy_delta = object_center[:2] - contact_target[:2]
+    vertical_only = bool(np.allclose(align_target[:2], contact_target[:2], atol=1e-9))
+    return {
+        "selected_pregrasp_target": selected_pregrasp_target.tolist(),
+        "grasp_contact_target": contact_target.tolist(),
+        "pre_contact_alignment_target": align_target.tolist(),
+        "object_center": object_center.tolist(),
+        "align_target_xy": align_target[:2].tolist(),
+        "descend_target_xy": contact_target[:2].tolist(),
+        "vertical_only_descend": vertical_only,
+        "xy_delta_contact_to_object": {
+            "dx": float(xy_delta[0]),
+            "dy": float(xy_delta[1]),
+            "distance": float(np.linalg.norm(xy_delta)),
+        },
+        "grasp_contact_offset": {
+            "x": float(args.grasp_contact_offset_x),
+            "y": float(args.grasp_contact_offset_y),
+        },
+        "final_descend_vertical_only": vertical_only,
+    }
+
+
+def _unit_xy_from_base_to_target(robot_base_position: list[float], object_center: np.ndarray) -> np.ndarray:
+    delta_xy = object_center[:2] - np.array(robot_base_position[:2], dtype=float)
+    norm = float(np.linalg.norm(delta_xy))
+    if norm <= 1.0e-9:
+        return np.array([1.0, 0.0], dtype=float)
+    return delta_xy / norm
+
+
+def _estimate_pinch_center_from_pivot(
+    *,
+    pivot_position: np.ndarray,
+    wrist_position: np.ndarray,
+    object_center: np.ndarray,
+    pivot_to_pinch_distance: float,
+) -> dict[str, Any]:
+    approach = object_center - pivot_position
+    approach_norm = float(np.linalg.norm(approach))
+    if approach_norm <= 1.0e-9:
+        approach_unit = np.array([1.0, 0.0, 0.0], dtype=float)
+    else:
+        approach_unit = approach / approach_norm
+    pivot_to_wrist = float(np.linalg.norm(wrist_position - pivot_position))
+    wrist_to_pinch = max(float(pivot_to_pinch_distance) - pivot_to_wrist, 0.0)
+    pinch_center = wrist_position + approach_unit * wrist_to_pinch
+    return {
+        "approach_unit": approach_unit.tolist(),
+        "pivot_to_wrist_distance": pivot_to_wrist,
+        "wrist_to_pinch_distance_estimated": wrist_to_pinch,
+        "pinch_center_estimated_position": pinch_center.tolist(),
+        "pinch_center_to_object_distance": float(np.linalg.norm(pinch_center - object_center)),
+        "wrist_to_object_distance": float(np.linalg.norm(wrist_position - object_center)),
+    }
+
+
+def _experimental_pivot_arc_plan(
+    *,
+    target_index: int,
+    active_arm: str,
+    arm_dofs: list[tuple[int, Any, str]],
+    end_effector_body: Any,
+    end_effector_name: str,
+    end_effector_path: str,
+    pivot_body: Any,
+    pivot_name: str,
+    pivot_path: str,
+    object_center: np.ndarray,
+    bbox_top_z: float,
+    table_top_z: float,
+    robot_base_position: list[float],
+    robot_base_rotation: list[float],
+    pre_grasp_target: np.ndarray,
+    lift_clearance_target: np.ndarray,
+    prebin_target: np.ndarray,
+    place_depth_target: np.ndarray,
+    retreat_target: np.ndarray,
+    args: argparse.Namespace,
+    front_workspace_z: tuple[float, float],
+) -> tuple[list[MotionSegment], dict[str, Any]]:
+    upper_names = {
+        f"{'R' if active_arm == 'right' else 'L'}_shoulder_pitch_joint",
+        f"{'R' if active_arm == 'right' else 'L'}_shoulder_roll_joint",
+        f"{'R' if active_arm == 'right' else 'L'}_shoulder_yaw_joint",
+        f"{'R' if active_arm == 'right' else 'L'}_elbow_roll_joint",
+    }
+    lower_names = {
+        f"{'R' if active_arm == 'right' else 'L'}_elbow_yaw_joint",
+        f"{'R' if active_arm == 'right' else 'L'}_wrist_pitch_joint",
+        f"{'R' if active_arm == 'right' else 'L'}_wrist_roll_joint",
+    }
+    upper_dofs = _select_dofs_by_names(arm_dofs, upper_names)
+    lower_dofs = _select_dofs_by_names(arm_dofs, lower_names)
+    if len(upper_dofs) != 4 or len(lower_dofs) != 3:
+        raise RuntimeError(
+            f"Experimental pivot arc missing expected DOFs: "
+            f"upper={[name for _, _, name in upper_dofs]} lower={[name for _, _, name in lower_dofs]}"
+        )
+
+    robot_base_yaw_rad = _yaw_rad_from_rotation_xyz_deg(robot_base_rotation)
+    approach_xy = _unit_xy_from_base_to_target(robot_base_position, object_center)
+    lateral_xy = np.array([-approach_xy[1], approach_xy[0]], dtype=float)
+    contact_object = np.array(object_center, dtype=float).copy()
+    contact_object[2] = max(
+        float(bbox_top_z) + args.descend_clearance + args.grasp_depth_offset,
+        table_top_z + args.min_ee_table_clearance,
+    )
+    contact_object[2] = float(np.clip(contact_object[2], *front_workspace_z))
+    pivot_anchor = contact_object.copy()
+    pivot_anchor[:2] -= approach_xy * (float(args.pivot_to_pinch_distance_m) + float(args.pivot_anchor_forward_offset_m))
+    pivot_anchor[:2] += lateral_xy * float(args.pivot_anchor_lateral_offset_m)
+    pivot_anchor[2] = float(np.clip(contact_object[2] + float(args.pivot_anchor_height_offset_m), *front_workspace_z))
+
+    # Approximate the remaining wrist-to-pinch distance after the wrist-pitch pivot.
+    wrist_roll_offset_from_pivot = 0.076
+    wrist_to_pinch = max(float(args.pivot_to_pinch_distance_m) - wrist_roll_offset_from_pivot, 0.03)
+    contact_wrist_target = contact_object.copy()
+    contact_wrist_target[:2] -= approach_xy * wrist_to_pinch
+    contact_wrist_target[2] = contact_object[2]
+    arc_mid_target = contact_wrist_target.copy()
+    arc_mid_target[:2] -= approach_xy * 0.03
+    arc_mid_target[2] = float(np.clip(contact_object[2] + 0.025, *front_workspace_z))
+
+    details = {
+        "enabled": True,
+        "fallback_to_baseline_used": False,
+        "control_pivot_frame_name": pivot_name,
+        "control_pivot_frame_path": pivot_path,
+        "pinch_center_reference_frame_name": "estimated_pinch_center_from_wrist_roll_plus_pivot_line_offset",
+        "pinch_center_reference_wrist_frame_name": end_effector_name,
+        "pinch_center_reference_wrist_frame_path": end_effector_path,
+        "target_object_center": object_center.tolist(),
+        "target_object_contact_point": contact_object.tolist(),
+        "pivot_anchor_target": pivot_anchor.tolist(),
+        "pivot_to_object_distance": float(np.linalg.norm(pivot_anchor - contact_object)),
+        "pivot_to_pinch_distance_used": float(args.pivot_to_pinch_distance_m),
+        "wrist_to_pinch_distance_estimated_for_targets": float(wrist_to_pinch),
+        "stage_a_succeeded": None,
+        "stage_b_started": False,
+        "close_condition_satisfied_before_close": False,
+        "final_local_approach_shape": "arc-like",
+        "object_under_wrist_or_near_finger_gap": "not_evaluated",
+        "upper_chain_dof_names": [name for _, _, name in upper_dofs],
+        "lower_chain_dof_names": [name for _, _, name in lower_dofs],
+        "approach_xy_unit_from_base_to_object": approach_xy.tolist(),
+        "active_arm": active_arm,
+        "robot_base_yaw_rad": float(robot_base_yaw_rad),
+        "estimated_defaults": {
+            "pivot_to_pinch_distance_m": float(args.pivot_to_pinch_distance_m),
+            "wrist_roll_offset_from_pivot_m": wrist_roll_offset_from_pivot,
+        },
+    }
+    common_close_details = {
+        "experimental_pivot_arc": True,
+        "pivot_arc_conditional_close": True,
+        "pivot_arc_object_center": contact_object.tolist(),
+        "pivot_arc_close_distance_m": float(args.pivot_arc_close_distance_m),
+        "pivot_to_pinch_distance_used": float(args.pivot_to_pinch_distance_m),
+    }
+    contact_hold_steps = args.continuous_contact_dwell_steps if args.smooth_motion else args.ik_hold_steps
+    soft_tolerance = args.continuous_soft_tolerance if args.smooth_motion else args.ik_stop_tolerance
+    max_arc_steps = max(int(args.pivot_arc_stream_samples), int(args.pivot_arc_max_steps), 1)
+    stream_samples = max(int(args.stream_samples), 1)
+    segments = [
+        MotionSegment(
+            name="continuous_pregrasp",
+            phase_tag="approach",
+            target_position=pre_grasp_target,
+            waypoint_type="soft",
+            speed_profile="experimental_streaming_pregrasp",
+            max_ik_steps=max_arc_steps,
+            stop_tolerance=soft_tolerance,
+            hold_steps=0,
+            blend_radius=args.continuous_blend_radius,
+            details={
+                "legacy_phase": "move_to_pre_grasp_front",
+                "experimental_pivot_arc": True,
+                "experimental_streaming_segment": True,
+                "streaming_endpoint_strategy": "hold_current",
+                "streaming_sample_count": max_arc_steps,
+                "interpolation_profile": "quintic_minimum_jerk",
+                "active_arm": active_arm,
+                "robot_base_yaw_rad": float(robot_base_yaw_rad),
+            },
         ),
         MotionSegment(
-            name="continuous_grasp_depth",
+            name="experimental_pivot_anchor",
             phase_tag="grasp_window",
-            target_position=grasp_depth_target,
+            target_position=pivot_anchor,
+            waypoint_type="soft",
+            speed_profile="experimental_streaming_pivot_anchor",
+            max_ik_steps=max_arc_steps,
+            stop_tolerance=args.pivot_arc_contact_tolerance_m,
+            hold_steps=0,
+            blend_radius=args.continuous_blend_radius,
+            details={
+                "experimental_pivot_arc": True,
+                "experimental_streaming_segment": True,
+                "streaming_endpoint_strategy": "upper_anchor_heuristic",
+                "streaming_sample_count": max_arc_steps,
+                "interpolation_profile": "quintic_minimum_jerk",
+                "active_arm": active_arm,
+                "robot_base_yaw_rad": float(robot_base_yaw_rad),
+                "stage": "A_pivot_positioning",
+                **details,
+            },
+            control_body=pivot_body,
+            control_body_name=pivot_name,
+            control_body_path=pivot_path,
+            control_dofs=upper_dofs,
+        ),
+        MotionSegment(
+            name="experimental_locked_lower_chain_arc",
+            phase_tag="grasp_window",
+            target_position=contact_wrist_target,
             waypoint_type="hard",
-            speed_profile="slow_contact_approach",
-            max_ik_steps=args.ik_steps,
-            stop_tolerance=args.ik_stop_tolerance,
-            hold_steps=contact_hold_steps,
+            speed_profile="locked_pivot_lower_chain_arc",
+            max_ik_steps=max_arc_steps,
+            stop_tolerance=args.pivot_arc_contact_tolerance_m,
+            hold_steps=0,
             blend_radius=0.0,
             event_marker="close_gripper",
             contact_window=True,
-            details={"legacy_phase": "descend_front"},
+            details={
+                **common_close_details,
+                "stage": "B_locked_lower_chain_arc",
+                "locked_lower_chain_arc": True,
+                "pivot_anchor_target": pivot_anchor.tolist(),
+                "arc_mid_target": arc_mid_target.tolist(),
+                "arc_contact_target": contact_wrist_target.tolist(),
+                "arc_waypoint_count": max_arc_steps,
+                "contact_dwell_steps_after_close": contact_hold_steps,
+                "active_arm": active_arm,
+                "robot_base_yaw_rad": float(robot_base_yaw_rad),
+            },
+            control_body=end_effector_body,
+            control_body_name=end_effector_name,
+            control_body_path=end_effector_path,
+            control_dofs=lower_dofs,
+            pinch_metric_pivot_body=pivot_body,
         ),
         MotionSegment(
             name="continuous_lift_clearance",
             phase_tag="lift",
             target_position=lift_clearance_target,
             waypoint_type="hard",
-            speed_profile="slow_grasp_validation_lift",
-            max_ik_steps=args.ik_steps,
+            speed_profile="streaming_lift",
+            max_ik_steps=stream_samples,
             stop_tolerance=args.ik_stop_tolerance,
-            hold_steps=contact_hold_steps,
+            hold_steps=0,
             blend_radius=0.0,
             contact_window=True,
             gripper_effort=args.gripper_hold_effort,
-            details={"legacy_phase": "grasp_validation_and_lift_front"},
+            details={
+                "legacy_phase": "grasp_validation_and_lift_front",
+                "experimental_pivot_arc": True,
+                "streaming_segment": True,
+                "streaming_endpoint_strategy": "main_cycle_heuristic_endpoint",
+                "streaming_sample_count": stream_samples,
+                "interpolation_profile": "quintic_minimum_jerk",
+                "active_arm": active_arm,
+                "robot_base_yaw_rad": float(robot_base_yaw_rad),
+            },
         ),
         MotionSegment(
             name="continuous_prebin",
             phase_tag="carry",
             target_position=prebin_target,
             waypoint_type="soft",
-            speed_profile="transit_blended_with_grip_effort",
-            max_ik_steps=args.ik_steps,
+            speed_profile="streaming_carry",
+            max_ik_steps=stream_samples,
             stop_tolerance=soft_tolerance,
-            hold_steps=soft_hold_steps,
+            hold_steps=0,
             blend_radius=args.continuous_blend_radius,
             gripper_effort=args.gripper_hold_effort,
-            details={"legacy_phase": "move_to_bin_front"},
+            details={
+                "legacy_phase": "move_to_bin_front",
+                "experimental_pivot_arc": True,
+                "streaming_segment": True,
+                "streaming_endpoint_strategy": "main_cycle_heuristic_endpoint",
+                "streaming_sample_count": stream_samples,
+                "interpolation_profile": "quintic_minimum_jerk",
+                "active_arm": active_arm,
+                "robot_base_yaw_rad": float(robot_base_yaw_rad),
+            },
         ),
         MotionSegment(
             name="continuous_place_depth",
             phase_tag="place_window",
             target_position=place_depth_target,
             waypoint_type="hard",
-            speed_profile="slow_place_release",
-            max_ik_steps=args.ik_steps,
+            speed_profile="streaming_place_release",
+            max_ik_steps=stream_samples,
             stop_tolerance=args.ik_stop_tolerance,
-            hold_steps=contact_hold_steps,
+            hold_steps=0,
             blend_radius=0.0,
             event_marker="open_gripper",
             contact_window=True,
             gripper_effort=args.gripper_hold_effort,
-            details={"legacy_phase": "release"},
+            details={
+                "legacy_phase": "release",
+                "experimental_pivot_arc": True,
+                "streaming_segment": True,
+                "streaming_endpoint_strategy": "main_cycle_heuristic_endpoint",
+                "streaming_sample_count": stream_samples,
+                "interpolation_profile": "quintic_minimum_jerk",
+                "active_arm": active_arm,
+                "robot_base_yaw_rad": float(robot_base_yaw_rad),
+            },
         ),
         MotionSegment(
             name="continuous_retreat",
             phase_tag="retreat",
             target_position=retreat_target,
             waypoint_type="soft",
-            speed_profile="transit_blended_after_release",
-            max_ik_steps=args.ik_steps,
+            speed_profile="streaming_retreat",
+            max_ik_steps=stream_samples,
             stop_tolerance=soft_tolerance,
-            hold_steps=soft_hold_steps,
+            hold_steps=0,
             blend_radius=args.continuous_blend_radius,
-            details={"legacy_phase": "retreat"},
+            details={
+                "legacy_phase": "retreat",
+                "experimental_pivot_arc": True,
+                "streaming_segment": True,
+                "streaming_endpoint_strategy": "main_cycle_heuristic_endpoint",
+                "streaming_sample_count": stream_samples,
+                "interpolation_profile": "quintic_minimum_jerk",
+                "active_arm": active_arm,
+                "robot_base_yaw_rad": float(robot_base_yaw_rad),
+            },
         ),
     ]
+    return segments, details
 
 
 def _trigger_motion_event(
@@ -597,6 +1965,8 @@ def _trigger_motion_event(
     sim_app: Any,
     args: argparse.Namespace,
     counter: dict[str, int],
+    locked_dofs: list[tuple[int, Any, str]] | None = None,
+    locked_targets: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any], float | None]:
     if event_marker == "close_gripper":
         if args.skip_gripper_close:
@@ -607,6 +1977,8 @@ def _trigger_motion_event(
                 dc,
                 gripper_dofs,
                 args.gripper_hold_effort,
+                locked_dofs,
+                locked_targets,
             )
             return {
                 "event_marker": event_marker,
@@ -623,6 +1995,8 @@ def _trigger_motion_event(
             dc,
             gripper_dofs,
             args.gripper_hold_effort,
+            locked_dofs,
+            locked_targets,
         )
         return {
             "event_marker": event_marker,
@@ -641,6 +2015,8 @@ def _trigger_motion_event(
                 dc,
                 gripper_dofs,
                 0.0,
+                locked_dofs,
+                locked_targets,
             )
             return {
                 "event_marker": event_marker,
@@ -657,6 +2033,8 @@ def _trigger_motion_event(
             dc,
             gripper_dofs,
             0.0,
+            locked_dofs,
+            locked_targets,
         )
         return {
             "event_marker": event_marker,
@@ -667,6 +2045,344 @@ def _trigger_motion_event(
         }, None
 
     raise RuntimeError(f"Unknown motion event marker: {event_marker}")
+
+
+def _run_locked_updates(
+    *,
+    dc: Any,
+    sim_app: Any,
+    counter: dict[str, int],
+    locked_dofs: list[tuple[int, Any, str]],
+    locked_targets: dict[str, float],
+    steps: int,
+) -> None:
+    for _ in range(max(int(steps), 1)):
+        _apply_locked_joint_targets(dc, locked_dofs, locked_targets)
+        sim_app.update()
+        counter["step"] += 1
+
+
+def _apply_lower_chain_positions_with_lock(
+    *,
+    dc: Any,
+    lower_dofs: list[tuple[int, Any, str]],
+    positions: np.ndarray,
+    sim_app: Any,
+    counter: dict[str, int],
+    locked_dofs: list[tuple[int, Any, str]],
+    locked_targets: dict[str, float],
+    settle_steps: int,
+) -> None:
+    _send_position_targets(dc, lower_dofs, [float(value) for value in positions])
+    _run_locked_updates(
+        dc=dc,
+        sim_app=sim_app,
+        counter=counter,
+        locked_dofs=locked_dofs,
+        locked_targets=locked_targets,
+        steps=settle_steps,
+    )
+
+
+def _estimate_position_jacobian_with_lock(
+    *,
+    dc: Any,
+    articulation: Any,
+    lower_dofs: list[tuple[int, Any, str]],
+    lower_body: Any,
+    base_positions: np.ndarray,
+    base_body_position: np.ndarray,
+    sim_app: Any,
+    counter: dict[str, int],
+    locked_dofs: list[tuple[int, Any, str]],
+    locked_targets: dict[str, float],
+    eps: float,
+    settle_steps: int,
+) -> np.ndarray:
+    jacobian = np.zeros((3, len(lower_dofs)), dtype=float)
+    for column in range(len(lower_dofs)):
+        trial = base_positions.copy()
+        trial[column] += eps
+        _apply_lower_chain_positions_with_lock(
+            dc=dc,
+            lower_dofs=lower_dofs,
+            positions=trial,
+            sim_app=sim_app,
+            counter=counter,
+            locked_dofs=locked_dofs,
+            locked_targets=locked_targets,
+            settle_steps=settle_steps,
+        )
+        dc.wake_up_articulation(articulation)
+        moved_position = _body_pose_position(dc, lower_body)
+        jacobian[:, column] = (moved_position - base_body_position) / eps
+
+    _apply_lower_chain_positions_with_lock(
+        dc=dc,
+        lower_dofs=lower_dofs,
+        positions=base_positions,
+        sim_app=sim_app,
+        counter=counter,
+        locked_dofs=locked_dofs,
+        locked_targets=locked_targets,
+        settle_steps=settle_steps,
+    )
+    dc.wake_up_articulation(articulation)
+    return jacobian
+
+
+def _execute_locked_lower_chain_arc(
+    *,
+    target_index: int,
+    target_path: str,
+    stage: Any,
+    dc: Any,
+    articulation: Any,
+    sim_app: Any,
+    counter: dict[str, int],
+    lower_dofs: list[tuple[int, Any, str]],
+    lower_body: Any,
+    lower_body_name: str,
+    lower_body_path: str,
+    pivot_body: Any,
+    upper_locked_dofs: list[tuple[int, Any, str]],
+    upper_locked_targets: dict[str, float],
+    pivot_reference_position: np.ndarray,
+    arc_waypoints: list[np.ndarray],
+    ik_steps_per_waypoint: int,
+    ik_settle_steps: int,
+    ik_position_eps: float,
+    ik_damping: float,
+    ik_max_step: float,
+    ik_posture_gain: float,
+    stop_tolerance: float,
+    frame_step_updates: int,
+    phase_label_prefix: str,
+    phase_log: list[dict[str, Any]],
+    gripper_dofs: list[tuple[int, Any, str]],
+    args: argparse.Namespace,
+    object_center: np.ndarray,
+    pivot_to_pinch_distance: float,
+    close_distance: float,
+    active_arm: str,
+    robot_base_yaw_rad: float,
+) -> dict[str, Any]:
+    start_step = counter["step"]
+    start_positions = np.array(_current_positions(dc, lower_dofs), dtype=float)
+    trace: list[dict[str, Any]] = []
+    drift_samples: list[float] = []
+    drift_per_waypoint: list[dict[str, Any]] = []
+    lock_active_per_step: list[bool] = []
+    upper_joint_error_per_step: list[dict[str, Any]] = []
+    upper_joint_error_max_samples: list[float] = []
+    snapshots: dict[str, Any] = {}
+    event_details = None
+    active_effort: float | None = None
+    close_event_fired = False
+    close_condition_satisfied = False
+    close_condition_metric: dict[str, Any] | None = None
+    pivot_position_during_arc_start = _body_pose_position(dc, pivot_body)
+    pivot_position_during_arc_end = pivot_position_during_arc_start.copy()
+    target_position = arc_waypoints[-1] if arc_waypoints else _body_pose_position(dc, lower_body)
+    start_body_position = _body_pose_position(dc, lower_body)
+    frame_updates = max(int(frame_step_updates), 1)
+
+    end_positions = _heuristic_lower_chain_arc_endpoint(
+        lower_dofs=lower_dofs,
+        start_positions=start_positions,
+        start_body_position=start_body_position,
+        target_position=target_position,
+        active_arm=active_arm,
+        robot_base_yaw_rad=robot_base_yaw_rad,
+        max_step=ik_max_step,
+        sample_count=len(arc_waypoints),
+    )
+
+    def _record_stream_state(sample_index: int, target: np.ndarray, actual_position: np.ndarray, error_norm: float) -> None:
+        nonlocal pivot_position_during_arc_end
+        pivot_position = _body_pose_position(dc, pivot_body)
+        drift = _compute_pivot_drift(pivot_reference_position, pivot_position)
+        joint_error = _locked_joint_error(dc, upper_locked_dofs, upper_locked_targets)
+        pivot_position_during_arc_end = pivot_position.copy()
+        drift_samples.append(drift)
+        lock_active_per_step.append(True)
+        upper_joint_error_max_samples.append(float(joint_error["max"]))
+        upper_joint_error_per_step.append(
+            {
+                "sample_index": int(sample_index),
+                "max": float(joint_error["max"]),
+                "mean": float(joint_error["mean"]),
+                "by_joint": joint_error["by_joint"],
+            }
+        )
+        trace.append(
+            {
+                "phase": phase_label_prefix,
+                "sample_index": int(sample_index),
+                "target": target.tolist(),
+                "actual": actual_position.tolist(),
+                "error_norm": float(error_norm),
+                "pivot_position": pivot_position.tolist(),
+                "pivot_drift_norm": drift,
+                "upper_chain_lock_active": True,
+                "upper_chain_joint_error_max": float(joint_error["max"]),
+            }
+        )
+
+    for waypoint_index, waypoint in enumerate(arc_waypoints):
+        waypoint_drift_before = len(drift_samples)
+        t = (waypoint_index + 1) / float(max(len(arc_waypoints), 1))
+        alpha = _quintic_blend(t)
+        lower_target = start_positions + alpha * (end_positions - start_positions)
+        _send_position_targets(dc, lower_dofs, [float(value) for value in lower_target])
+        for _ in range(frame_updates):
+            _apply_locked_joint_targets(dc, upper_locked_dofs, upper_locked_targets)
+            sim_app.update()
+            counter["step"] += 1
+            dc.wake_up_articulation(articulation)
+            current_position = _body_pose_position(dc, lower_body)
+            current_error = float(np.linalg.norm(waypoint - current_position))
+            _record_stream_state(waypoint_index, waypoint, current_position, current_error)
+            close_condition_metric = _estimate_pinch_center_from_pivot(
+                pivot_position=_body_pose_position(dc, pivot_body),
+                wrist_position=current_position,
+                object_center=object_center,
+                pivot_to_pinch_distance=pivot_to_pinch_distance,
+            )
+            close_condition_satisfied = bool(
+                close_condition_metric["pinch_center_to_object_distance"] <= float(close_distance)
+            )
+            if close_condition_satisfied and not close_event_fired:
+                snapshots["before_close_gripper"] = _bbox_state(stage, target_path)
+                event_details, active_effort = _trigger_motion_event(
+                    event_marker="close_gripper",
+                    dc=dc,
+                    gripper_dofs=gripper_dofs,
+                    sim_app=sim_app,
+                    args=args,
+                    counter=counter,
+                    locked_dofs=upper_locked_dofs,
+                    locked_targets=upper_locked_targets,
+                )
+                _apply_locked_joint_targets(dc, upper_locked_dofs, upper_locked_targets)
+                snapshots["after_close_gripper"] = _bbox_state(stage, target_path)
+                close_event_fired = True
+                break
+        waypoint_drifts = drift_samples[waypoint_drift_before:]
+        drift_per_waypoint.append(
+            {
+                "waypoint_index": int(waypoint_index),
+                "target": waypoint.tolist(),
+                **_summarize_pivot_drift(waypoint_drifts),
+            }
+        )
+        if close_event_fired:
+            break
+
+    actual_position = _body_pose_position(dc, lower_body)
+    position_error = float(np.linalg.norm(target_position - actual_position))
+    if close_condition_metric is None:
+        close_condition_metric = _estimate_pinch_center_from_pivot(
+            pivot_position=_body_pose_position(dc, pivot_body),
+            wrist_position=actual_position,
+            object_center=object_center,
+            pivot_to_pinch_distance=pivot_to_pinch_distance,
+        )
+        close_condition_satisfied = bool(
+            close_condition_metric["pinch_center_to_object_distance"] <= float(close_distance)
+        )
+    drift_summary = _summarize_pivot_drift(drift_samples)
+    upper_error_summary = _summarize_scalar_samples(upper_joint_error_max_samples, "upper_chain_joint_error")
+    micro_stop_estimate = _arc_micro_stop_estimate(
+        trace=trace,
+        frame_span_per_trace_sample=frame_updates,
+        threshold=args.micro_stop_speed_threshold,
+    )
+    final_pivot_position = _body_pose_position(dc, pivot_body)
+    object_alignment = (
+        "near_finger_gap"
+        if close_condition_metric["pinch_center_to_object_distance"] < close_condition_metric["wrist_to_object_distance"]
+        else "under_wrist_or_palm_projection"
+    )
+    condition_met = bool(close_event_fired or position_error <= stop_tolerance)
+    details = {
+        "target_index": target_index,
+        "continuous_motion": True,
+        "phase_tag": "grasp_window",
+        "waypoint_type": "hard",
+        "speed_profile": "locked_pivot_lower_chain_arc",
+        "streaming_controller": True,
+        "arc_runtime_controller": "streaming_lower_joint_interpolation",
+        "finite_difference_jacobian_calls_during_arc_stream": 0,
+        "arc_endpoint_strategy": "heuristic_lower_joint_offsets_no_runtime_jacobian",
+        "interpolation_profile": "quintic_minimum_jerk",
+        "control_body_name": lower_body_name,
+        "control_body_path": lower_body_path,
+        "control_dof_names": [name for _, _, name in lower_dofs],
+        "locked_dof_names": [name for _, _, name in upper_locked_dofs],
+        "upper_chain_locked_targets": dict(upper_locked_targets),
+        "upper_chain_lock_active": True,
+        "upper_chain_lock_active_during_arc": True,
+        "upper_chain_lock_active_per_step": lock_active_per_step,
+        "upper_chain_joint_error_per_step": upper_joint_error_per_step,
+        "upper_chain_joint_error_max_during_arc": upper_error_summary["upper_chain_joint_error_max"],
+        "upper_chain_joint_error_mean_during_arc": upper_error_summary["upper_chain_joint_error_mean"],
+        "upper_chain_joint_error_final_during_arc": upper_error_summary["upper_chain_joint_error_final"],
+        "upper_chain_joint_error_sample_count": upper_error_summary["upper_chain_joint_error_sample_count"],
+        "pivot_reference_position": pivot_reference_position.tolist(),
+        "pivot_position_after_anchor": pivot_reference_position.tolist(),
+        "pivot_position_during_arc_start": pivot_position_during_arc_start.tolist(),
+        "pivot_position_during_arc_end": final_pivot_position.tolist(),
+        "pivot_drift_per_waypoint": drift_per_waypoint,
+        **drift_summary,
+        "arc_waypoints": [waypoint.tolist() for waypoint in arc_waypoints],
+        "lower_chain_start_targets": _named_positions(lower_dofs, start_positions),
+        "lower_chain_stream_endpoint_targets": _named_positions(lower_dofs, end_positions),
+        "pivot_arc_frame_step_updates": frame_updates,
+        "configured_stream_sample_count": len(arc_waypoints),
+        "target_position": target_position.tolist(),
+        "position_error": position_error,
+        "ik_step_count": 0,
+        "stream_sample_count": len(trace),
+        "ik_trace": trace,
+        "micro_stop_frames": micro_stop_estimate["micro_stop_frames"],
+        "micro_stop_samples": micro_stop_estimate["micro_stop_samples"],
+        "stop_tolerance": stop_tolerance,
+        "hold_steps": 0,
+        "event": event_details,
+        "stage": "B_locked_lower_chain_arc",
+        "experimental_pivot_arc": True,
+        "stage_b_started": True,
+        "close_condition_metric": close_condition_metric,
+        "close_condition_satisfied_before_close": bool(close_condition_satisfied and close_event_fired),
+        "close_event_fired": close_event_fired,
+        "final_local_approach_shape": "arc-like_locked_lower_chain",
+        "object_under_wrist_or_near_finger_gap": object_alignment,
+    }
+    _append_phase(
+        phase_log,
+        phase=phase_label_prefix,
+        start_step=start_step,
+        end_step=counter["step"],
+        commanded_targets=_named_positions(lower_dofs, _current_positions(dc, lower_dofs)),
+        ee_position=actual_position,
+        gripper_values=_gripper_values(dc, gripper_dofs),
+        condition_met=condition_met,
+        details=details,
+    )
+    return {
+        "actual_position": actual_position,
+        "position_error": position_error,
+        "trace": trace,
+        "event": event_details,
+        "active_effort": active_effort,
+        "close_event_fired": close_event_fired,
+        "snapshots": snapshots,
+        "condition_met": condition_met,
+        "experimental_details": details,
+        "pivot_drift_summary": drift_summary,
+        "micro_stop_estimate": micro_stop_estimate,
+    }
 
 
 def _micro_stop_estimate(
@@ -695,7 +2411,31 @@ def _micro_stop_estimate(
     }
 
 
-def _execute_continuous_motion_cycle(
+def _can_execute_as_global_precomputed_cycle(segments: list[MotionSegment]) -> bool:
+    if not segments:
+        return False
+    return all(
+        segment.control_body is None
+        and segment.control_dofs is None
+        and not segment.details.get("locked_lower_chain_arc")
+        and str(segment.details.get("streaming_endpoint_strategy")) == "global_precomputed_joint_waypoint"
+        for segment in segments
+    )
+
+
+def _segment_stream_sample_count(segment: MotionSegment) -> int:
+    return max(int(segment.details.get("streaming_sample_count", segment.max_ik_steps)), 1)
+
+
+def _segment_index_for_progress(cumulative_samples: list[float], progress: float) -> int:
+    last_segment = len(cumulative_samples) - 2
+    for index in range(last_segment + 1):
+        if progress <= cumulative_samples[index + 1]:
+            return index
+    return last_segment
+
+
+def _execute_global_precomputed_motion_cycle(
     *,
     target_index: int,
     target_path: str,
@@ -712,11 +2452,43 @@ def _execute_continuous_motion_cycle(
     segments: list[MotionSegment],
 ) -> dict[str, Any]:
     cycle_start_step = counter["step"]
-    frame_span_per_trace_sample = (len(arm_dofs) + 1) * args.ik_settle_steps
+    start_positions = np.array(_current_positions(dc, arm_dofs), dtype=float)
+    start_body_position = _body_pose_position(dc, end_effector_body)
+    sample_counts = [_segment_stream_sample_count(segment) for segment in segments]
+    total_samples = max(sum(sample_counts), 1)
+    cumulative_samples = [0.0]
+    for sample_count in sample_counts:
+        cumulative_samples.append(cumulative_samples[-1] + float(sample_count))
+    active_arm = str(segments[0].details.get("active_arm", "right"))
+    robot_base_yaw_rad = float(segments[0].details.get("robot_base_yaw_rad", 0.0))
+    joint_waypoints = _precompute_main_cycle_joint_waypoints(
+        selected_dofs=arm_dofs,
+        start_positions=start_positions,
+        start_body_position=start_body_position,
+        segments=segments,
+        active_arm=active_arm,
+        robot_base_yaw_rad=robot_base_yaw_rad,
+        args=args,
+    )
+    joint_waypoint_tangents = _joint_waypoint_tangents(joint_waypoints, cumulative_samples)
+
     metrics: dict[str, Any] = {
         "target_index": target_index,
         "cycle_start_step": cycle_start_step,
         "segment_count": len(segments),
+        "execution_style": "global_absolute_joint_waypoint_cubic_hermite_stream_no_per_segment_endpoint_rebuild",
+        "streaming_controller_active": True,
+        "endpoint_rebuilds_during_cycle": 0,
+        "finite_difference_jacobian_calls_during_cycle": 0,
+        "stream_samples": int(args.stream_samples),
+        "stream_frame_step_updates": int(args.stream_frame_step_updates),
+        "pivot_arc_stream_samples": int(args.pivot_arc_stream_samples),
+        "pivot_arc_frame_step_updates": int(args.pivot_arc_frame_step_updates),
+        "interpolation_profile": "global_quintic_timewarp_cubic_hermite_joint_chain",
+        "waypoint_generation": "absolute_target_relative_to_cycle_start_no_cumulative_heuristic_drift",
+        "directional_heuristic_frame": "robot_base_xy_signed_forward_lateral_with_backward_guard",
+        "active_arm": active_arm,
+        "robot_base_yaw_rad": float(robot_base_yaw_rad),
         "micro_stop_frames": 0,
         "micro_stop_samples": 0,
         "micro_stop_speed_threshold_m_per_frame": args.micro_stop_speed_threshold,
@@ -726,53 +2498,81 @@ def _execute_continuous_motion_cycle(
         "open_event_fired": False,
         "snapshots": {},
         "segment_summaries": [],
+        "global_stream": {
+            "total_samples": int(total_samples),
+            "segment_sample_counts": {segment.name: count for segment, count in zip(segments, sample_counts)},
+            "joint_waypoint_count": len(joint_waypoints),
+            "joint_trajectory_interpolator": "cubic_hermite_minmod_tangents",
+            "slope_continuity_across_waypoints": True,
+            "joint_waypoint_tangent_norm_max": float(
+                max((np.linalg.norm(tangent) for tangent in joint_waypoint_tangents), default=0.0)
+            ),
+            "target_updates_per_sim_update": 1,
+        },
     }
-    active_effort: float | None = None
 
-    for segment in segments:
-        start_step = counter["step"]
-        start_ee = _body_pose_position(dc, end_effector_body)
-        if active_effort is not None:
-            effort_before = _apply_gripper_effort(dc, gripper_dofs, active_effort)
-            if not effort_before["supported"]:
-                raise RuntimeError(f"Gripper effort command failed before {segment.name}: {effort_before}")
-        else:
-            effort_before = None
+    active_effort: float | None = None
+    segment_traces: list[list[dict[str, Any]]] = [[] for _ in segments]
+    segment_start_steps: dict[int, int] = {}
+    completed_segments: set[int] = set()
+    started_segments: set[int] = set()
+    frame_updates = max(int(args.stream_frame_step_updates), 1)
+
+    def _start_segment(segment_index: int) -> None:
+        nonlocal active_effort
+        if segment_index in started_segments:
+            return
+        segment = segments[segment_index]
+        started_segments.add(segment_index)
+        segment_start_steps[segment_index] = counter["step"]
+        metrics["snapshots"][f"before_{segment.name}"] = _bbox_state(stage, target_path)
         if segment.gripper_effort is not None:
-            effort_before = _apply_gripper_effort(dc, gripper_dofs, segment.gripper_effort)
-            if not effort_before["supported"]:
-                raise RuntimeError(f"Gripper effort command failed before {segment.name}: {effort_before}")
             active_effort = segment.gripper_effort
 
-        trace: list[dict[str, Any]] = []
-        actual_position, position_error = move_end_effector_to_target(
-            dc,
-            articulation,
-            arm_dofs,
-            end_effector_body,
-            segment.target_position,
-            sim_app,
-            segment.max_ik_steps,
-            args.ik_settle_steps,
-            args.ik_position_eps,
-            args.ik_damping,
-            args.ik_max_step,
-            posture_positions=np.array(_current_positions(dc, arm_dofs), dtype=float),
-            posture_gain=args.ik_posture_gain,
-            stop_tolerance=segment.stop_tolerance,
-            hold_steps=segment.hold_steps,
-            phase_label=segment.name,
+    def _complete_segment(segment_index: int) -> None:
+        nonlocal active_effort
+        if segment_index in completed_segments:
+            return
+        _start_segment(segment_index)
+        segment = segments[segment_index]
+        actual_position = _body_pose_position(dc, end_effector_body)
+        position_error = float(np.linalg.norm(segment.target_position - actual_position))
+        trace = segment_traces[segment_index]
+        micro_stop_estimate = _arc_micro_stop_estimate(
             trace=trace,
+            frame_span_per_trace_sample=frame_updates,
+            threshold=args.micro_stop_speed_threshold,
         )
-        counter["step"] += len(trace) * frame_span_per_trace_sample + segment.hold_steps
-        if active_effort is not None:
-            effort_after = _apply_gripper_effort(dc, gripper_dofs, active_effort)
-            if not effort_after["supported"]:
-                raise RuntimeError(f"Gripper effort command failed after {segment.name}: {effort_after}")
-        else:
-            effort_after = None
-
-        event_details = None
+        details = {
+            **segment.details,
+            "target_index": target_index,
+            "continuous_motion": True,
+            "phase_tag": segment.phase_tag,
+            "waypoint_type": segment.waypoint_type,
+            "speed_profile": segment.speed_profile,
+            "streaming_controller": True,
+            "streaming_endpoint_strategy": "global_precomputed_joint_waypoint",
+            "single_global_stream_cycle": True,
+            "endpoint_rebuilds_before_segment": 0,
+            "finite_difference_jacobian_calls_during_stream": 0,
+            "stream_sample_count": sample_counts[segment_index],
+            "frame_step_updates": frame_updates,
+            "interpolation_profile": "global_quintic_timewarp_cubic_hermite_joint_chain",
+            "joint_trajectory_interpolator": "cubic_hermite_minmod_tangents",
+            "waypoint_generation": "absolute_target_relative_to_cycle_start_no_cumulative_heuristic_drift",
+            "control_body_name": "default_end_effector",
+            "control_body_path": "default_end_effector",
+            "control_dof_names": [name for _, _, name in arm_dofs],
+            "target_position": segment.target_position.tolist(),
+            "position_error": position_error,
+            "stop_tolerance": segment.stop_tolerance,
+            "ik_step_count": 0,
+            "ik_trace": trace,
+            "micro_stop_frames": micro_stop_estimate["micro_stop_frames"],
+            "micro_stop_samples": micro_stop_estimate["micro_stop_samples"],
+            "joint_waypoint_start": _named_positions(arm_dofs, joint_waypoints[segment_index]),
+            "joint_waypoint_end": _named_positions(arm_dofs, joint_waypoints[segment_index + 1]),
+        }
         if segment.event_marker is not None:
             if segment.event_marker == "open_gripper" and args.release_timing_dwell_steps > 0:
                 _run_updates_with_optional_gripper_effort(
@@ -792,82 +2592,36 @@ def _execute_continuous_motion_cycle(
                 args=args,
                 counter=counter,
             )
+            details["event"] = event_details
             if segment.event_marker == "close_gripper":
                 metrics["close_event_fired"] = True
             if segment.event_marker == "open_gripper":
                 metrics["open_event_fired"] = True
             metrics["snapshots"][f"after_{segment.event_marker}"] = _bbox_state(stage, target_path)
-
-        snapshot_name = f"after_{segment.name}"
-        metrics["snapshots"][snapshot_name] = _bbox_state(stage, target_path)
-        stop_estimate = _micro_stop_estimate(
-            start_position=start_ee,
-            trace=trace,
-            frame_span_per_trace_sample=frame_span_per_trace_sample,
-            threshold=args.micro_stop_speed_threshold,
-            contact_window=segment.contact_window,
-        )
-        if not segment.contact_window and segment.hold_steps > 0:
-            stop_estimate["micro_stop_frames"] += segment.hold_steps
+        if active_effort is not None:
+            effort_after = _apply_gripper_effort(dc, gripper_dofs, active_effort)
+            if not effort_after["supported"]:
+                raise RuntimeError(f"Gripper effort command failed after {segment.name}: {effort_after}")
+        else:
+            effort_after = None
+        details["gripper_effort_after_segment"] = effort_after
+        details["carry_stabilization_steps"] = args.carry_stabilization_steps if segment.phase_tag == "carry" else 0
+        details["carry_stabilization_effort"] = None
         if segment.phase_tag == "carry" and args.carry_stabilization_steps > 0:
-            carry_effort = active_effort if active_effort is not None else segment.gripper_effort
-            carry_stabilization_effort = _run_updates_with_optional_gripper_effort(
+            details["carry_stabilization_effort"] = _run_updates_with_optional_gripper_effort(
                 sim_app,
                 args.carry_stabilization_steps,
                 counter,
                 dc,
                 gripper_dofs,
-                carry_effort,
+                active_effort,
             )
             metrics["snapshots"]["after_carry_stabilization"] = _bbox_state(stage, target_path)
-        else:
-            carry_stabilization_effort = None
-        metrics["micro_stop_frames"] += int(stop_estimate["micro_stop_frames"])
-        metrics["micro_stop_samples"] += int(stop_estimate["micro_stop_samples"])
-
-        condition_met = bool(
-            position_error <= segment.stop_tolerance
-            or (segment.waypoint_type == "soft" and position_error <= args.pre_grasp_ee_tolerance)
-        )
-        segment_summary = {
-            "name": segment.name,
-            "phase_tag": segment.phase_tag,
-            "waypoint_type": segment.waypoint_type,
-            "speed_profile": segment.speed_profile,
-            "blend_radius": segment.blend_radius,
-            "target_position": segment.target_position.tolist(),
-            "actual_position": actual_position.tolist(),
-            "position_error": position_error,
-            "condition_met": condition_met,
-            "contact_window": segment.contact_window,
-            "event_marker": segment.event_marker,
-            "micro_stop_estimate": stop_estimate,
-        }
-        metrics["segment_summaries"].append(segment_summary)
-        details = {
-            "target_index": target_index,
-            "continuous_motion": True,
-            "phase_tag": segment.phase_tag,
-            "waypoint_type": segment.waypoint_type,
-            "speed_profile": segment.speed_profile,
-            "blend_radius": segment.blend_radius,
-            "target_position": segment.target_position.tolist(),
-            "position_error": position_error,
-            "ik_step_count": len(trace),
-            "ik_trace": trace,
-            "stop_tolerance": segment.stop_tolerance,
-            "hold_steps": segment.hold_steps,
-            "gripper_effort_before_segment": effort_before,
-            "gripper_effort_after_segment": effort_after,
-            "event": event_details,
-            "carry_stabilization_steps": args.carry_stabilization_steps if segment.phase_tag == "carry" else 0,
-            "carry_stabilization_effort": carry_stabilization_effort,
-        }
-        details.update(segment.details)
+        condition_met = bool(position_error <= segment.stop_tolerance)
         _append_phase(
             phase_log,
             phase=segment.name,
-            start_step=start_step,
+            start_step=segment_start_steps.get(segment_index, cycle_start_step),
             end_step=counter["step"],
             commanded_targets=_named_positions(arm_dofs, _current_positions(dc, arm_dofs)),
             ee_position=actual_position,
@@ -875,10 +2629,361 @@ def _execute_continuous_motion_cycle(
             condition_met=condition_met,
             details=details,
         )
-        print(
-            f"phase={segment.name} waypoint_type={segment.waypoint_type} "
-            f"position_error={position_error} event={segment.event_marker}"
+        metrics["micro_stop_frames"] += int(micro_stop_estimate["micro_stop_frames"])
+        metrics["micro_stop_samples"] += int(micro_stop_estimate["micro_stop_samples"])
+        metrics["snapshots"][f"after_{segment.name}"] = _bbox_state(stage, target_path)
+        metrics["segment_summaries"].append(
+            {
+                "name": segment.name,
+                "phase_tag": segment.phase_tag,
+                "waypoint_type": segment.waypoint_type,
+                "speed_profile": segment.speed_profile,
+                "control_body_name": "default_end_effector",
+                "control_body_path": "default_end_effector",
+                "control_dof_names": [name for _, _, name in arm_dofs],
+                "blend_radius": segment.blend_radius,
+                "target_position": segment.target_position.tolist(),
+                "actual_position": actual_position.tolist(),
+                "position_error": position_error,
+                "condition_met": condition_met,
+                "contact_window": segment.contact_window,
+                "event_marker": segment.event_marker,
+                "micro_stop_estimate": micro_stop_estimate,
+                "streaming_details": details,
+            }
         )
+        print(
+            f"phase={segment.name} streaming_controller=True no_blocking_ik=True "
+            f"global_stream=True stream_samples={sample_counts[segment_index]} "
+            f"frame_step_updates={frame_updates} position_error={position_error} event={segment.event_marker}"
+        )
+        completed_segments.add(segment_index)
+
+    next_boundary_index = 0
+    _start_segment(0)
+    for sample_index in range(total_samples):
+        t = (sample_index + 1) / float(total_samples)
+        progress = _quintic_blend(t) * float(total_samples)
+        segment_index, local_alpha, target_joints = _sample_cubic_hermite_joint_chain(
+            waypoints=joint_waypoints,
+            tangents=joint_waypoint_tangents,
+            cumulative_samples=cumulative_samples,
+            progress=progress,
+        )
+        _start_segment(segment_index)
+        _send_position_targets(dc, arm_dofs, [float(value) for value in target_joints])
+        for _ in range(frame_updates):
+            if active_effort is not None:
+                effort_during = _apply_gripper_effort(dc, gripper_dofs, active_effort)
+                if not effort_during["supported"]:
+                    raise RuntimeError(f"Gripper effort command failed during global stream: {effort_during}")
+            sim_app.update()
+            counter["step"] += 1
+        dc.wake_up_articulation(articulation)
+        actual_position = _body_pose_position(dc, end_effector_body)
+        segment_traces[segment_index].append(
+            {
+                "phase": segments[segment_index].name,
+                "sample_index": int(sample_index),
+                "target_joint_positions": _named_positions(arm_dofs, target_joints),
+                "target": segments[segment_index].target_position.tolist(),
+                "actual": actual_position.tolist(),
+                "error_norm": float(np.linalg.norm(segments[segment_index].target_position - actual_position)),
+                "global_progress_sample": float(progress),
+                "local_spline_alpha": float(local_alpha),
+            }
+        )
+        while (
+            next_boundary_index < len(segments)
+            and progress >= cumulative_samples[next_boundary_index + 1] - 1.0e-9
+        ):
+            _complete_segment(next_boundary_index)
+            next_boundary_index += 1
+            if next_boundary_index < len(segments):
+                _start_segment(next_boundary_index)
+
+    for segment_index in range(len(segments)):
+        _complete_segment(segment_index)
+
+    metrics["cycle_end_step"] = counter["step"]
+    metrics["cycle_time_steps"] = counter["step"] - cycle_start_step
+    return metrics
+
+
+def _execute_continuous_motion_cycle(
+    *,
+    target_index: int,
+    target_path: str,
+    stage: Any,
+    dc: Any,
+    articulation: Any,
+    arm_dofs: list[tuple[int, Any, str]],
+    gripper_dofs: list[tuple[int, Any, str]],
+    end_effector_body: Any,
+    sim_app: Any,
+    args: argparse.Namespace,
+    counter: dict[str, int],
+    phase_log: list[dict[str, Any]],
+    segments: list[MotionSegment],
+) -> dict[str, Any]:
+    if _can_execute_as_global_precomputed_cycle(segments):
+        return _execute_global_precomputed_motion_cycle(
+            target_index=target_index,
+            target_path=target_path,
+            stage=stage,
+            dc=dc,
+            articulation=articulation,
+            arm_dofs=arm_dofs,
+            gripper_dofs=gripper_dofs,
+            end_effector_body=end_effector_body,
+            sim_app=sim_app,
+            args=args,
+            counter=counter,
+            phase_log=phase_log,
+            segments=segments,
+        )
+
+    cycle_start_step = counter["step"]
+    metrics: dict[str, Any] = {
+        "target_index": target_index,
+        "cycle_start_step": cycle_start_step,
+        "segment_count": len(segments),
+        "execution_style": "streaming_targets_no_blocking_ik_for_main_smooth_path",
+        "streaming_controller_active": True,
+        "stream_samples": int(args.stream_samples),
+        "stream_frame_step_updates": int(args.stream_frame_step_updates),
+        "pivot_arc_stream_samples": int(args.pivot_arc_stream_samples),
+        "pivot_arc_frame_step_updates": int(args.pivot_arc_frame_step_updates),
+        "interpolation_profile": "quintic_minimum_jerk",
+        "micro_stop_frames": 0,
+        "micro_stop_samples": 0,
+        "micro_stop_speed_threshold_m_per_frame": args.micro_stop_speed_threshold,
+        "phase_tags": ["approach", "grasp_window", "post_close_verify", "lift", "carry", "place_window", "retreat"],
+        "tuning_knobs": _tuning_knob_summary(args),
+        "close_event_fired": False,
+        "open_event_fired": False,
+        "snapshots": {},
+        "segment_summaries": [],
+    }
+    active_effort: float | None = None
+    experimental_lock_state: dict[str, Any] | None = None
+
+    for segment in segments:
+        start_step = counter["step"]
+        segment_body = segment.control_body if segment.control_body is not None else end_effector_body
+        segment_dofs = segment.control_dofs if segment.control_dofs is not None else arm_dofs
+        segment_body_name = segment.control_body_name or "default_end_effector"
+        segment_body_path = segment.control_body_path or "default_end_effector"
+        start_ee = _body_pose_position(dc, segment_body)
+
+        if not segment.details.get("locked_lower_chain_arc"):
+            if segment.gripper_effort is not None:
+                active_effort = segment.gripper_effort
+            metrics["snapshots"][f"before_{segment.name}"] = _bbox_state(stage, target_path)
+            stream_sample_count = int(segment.details.get("streaming_sample_count", segment.max_ik_steps))
+            stream_result = _execute_streaming_body_segment(
+                target_index=target_index,
+                dc=dc,
+                articulation=articulation,
+                sim_app=sim_app,
+                counter=counter,
+                selected_dofs=segment_dofs,
+                body=segment_body,
+                body_name=segment_body_name,
+                body_path=segment_body_path,
+                target_position=segment.target_position,
+                sample_count=stream_sample_count,
+                frame_step_updates=args.stream_frame_step_updates,
+                endpoint_strategy=str(segment.details.get("streaming_endpoint_strategy", "main_cycle_heuristic_endpoint")),
+                args=args,
+                phase_name=segment.name,
+                phase_tag=segment.phase_tag,
+                waypoint_type=segment.waypoint_type,
+                speed_profile=segment.speed_profile,
+                gripper_dofs=gripper_dofs,
+                phase_log=phase_log,
+                extra_details=segment.details,
+                gripper_effort_value=active_effort,
+                stop_tolerance=segment.stop_tolerance,
+            )
+            event_details = None
+            if segment.event_marker is not None:
+                if segment.event_marker == "open_gripper" and args.release_timing_dwell_steps > 0:
+                    _run_updates_with_optional_gripper_effort(
+                        sim_app,
+                        args.release_timing_dwell_steps,
+                        counter,
+                        dc,
+                        gripper_dofs,
+                        active_effort,
+                    )
+                metrics["snapshots"][f"before_{segment.event_marker}"] = _bbox_state(stage, target_path)
+                event_details, active_effort = _trigger_motion_event(
+                    event_marker=segment.event_marker,
+                    dc=dc,
+                    gripper_dofs=gripper_dofs,
+                    sim_app=sim_app,
+                    args=args,
+                    counter=counter,
+                )
+                if segment.event_marker == "close_gripper":
+                    metrics["close_event_fired"] = True
+                if segment.event_marker == "open_gripper":
+                    metrics["open_event_fired"] = True
+                metrics["snapshots"][f"after_{segment.event_marker}"] = _bbox_state(stage, target_path)
+                stream_result["details"]["event"] = event_details
+            if active_effort is not None:
+                effort_after = _apply_gripper_effort(dc, gripper_dofs, active_effort)
+                if not effort_after["supported"]:
+                    raise RuntimeError(f"Gripper effort command failed after {segment.name}: {effort_after}")
+            else:
+                effort_after = None
+            stream_result["details"]["gripper_effort_after_segment"] = effort_after
+            if segment.phase_tag == "carry" and args.carry_stabilization_steps > 0:
+                carry_stabilization_effort = _run_updates_with_optional_gripper_effort(
+                    sim_app,
+                    args.carry_stabilization_steps,
+                    counter,
+                    dc,
+                    gripper_dofs,
+                    active_effort,
+                )
+                metrics["snapshots"]["after_carry_stabilization"] = _bbox_state(stage, target_path)
+            else:
+                carry_stabilization_effort = None
+            stream_result["details"]["carry_stabilization_steps"] = args.carry_stabilization_steps if segment.phase_tag == "carry" else 0
+            stream_result["details"]["carry_stabilization_effort"] = carry_stabilization_effort
+            metrics["micro_stop_frames"] += int(stream_result["micro_stop_estimate"]["micro_stop_frames"])
+            metrics["micro_stop_samples"] += int(stream_result["micro_stop_estimate"]["micro_stop_samples"])
+            metrics["snapshots"][f"after_{segment.name}"] = _bbox_state(stage, target_path)
+            if segment.name == "experimental_pivot_anchor" and segment.details.get("experimental_pivot_arc"):
+                upper_locked_targets = _capture_locked_joint_targets(dc, segment_dofs)
+                pivot_reference_position = _body_pose_position(dc, segment_body)
+                experimental_lock_state = {
+                    "upper_locked_dofs": segment_dofs,
+                    "upper_locked_targets": upper_locked_targets,
+                    "pivot_reference_position": pivot_reference_position,
+                    "pivot_position_after_anchor": pivot_reference_position,
+                }
+                stream_result["details"]["upper_chain_locked_targets"] = dict(upper_locked_targets)
+                stream_result["details"]["upper_chain_lock_captured"] = True
+                stream_result["details"]["upper_chain_lock_active_during_anchor"] = False
+                stream_result["details"]["upper_chain_lock_active_during_arc"] = True
+                stream_result["details"]["pivot_reference_position"] = pivot_reference_position.tolist()
+                stream_result["details"]["pivot_position_after_anchor"] = pivot_reference_position.tolist()
+            segment_summary = {
+                "name": segment.name,
+                "phase_tag": segment.phase_tag,
+                "waypoint_type": segment.waypoint_type,
+                "speed_profile": segment.speed_profile,
+                "control_body_name": segment_body_name,
+                "control_body_path": segment_body_path,
+                "control_dof_names": [name for _, _, name in segment_dofs],
+                "blend_radius": segment.blend_radius,
+                "target_position": segment.target_position.tolist(),
+                "actual_position": stream_result["actual_position"].tolist(),
+                "position_error": stream_result["position_error"],
+                "condition_met": bool(stream_result["condition_met"]),
+                "contact_window": segment.contact_window,
+                "event_marker": segment.event_marker,
+                "micro_stop_estimate": stream_result["micro_stop_estimate"],
+                "streaming_details": stream_result["details"],
+            }
+            if segment.details.get("experimental_pivot_arc"):
+                segment_summary["experimental_details"] = stream_result["details"]
+            metrics["segment_summaries"].append(segment_summary)
+            print(
+                f"phase={segment.name} streaming_controller=True "
+                f"no_blocking_ik=True stream_samples={stream_sample_count} "
+                f"frame_step_updates={args.stream_frame_step_updates} "
+                f"position_error={stream_result['position_error']} event={segment.event_marker}"
+            )
+            continue
+
+        if segment.details.get("locked_lower_chain_arc"):
+            if experimental_lock_state is None:
+                raise RuntimeError("Experimental lower-chain arc requested before upper-chain lock capture")
+            pivot_body = segment.pinch_metric_pivot_body
+            if pivot_body is None:
+                raise RuntimeError("Experimental lower-chain arc missing pivot body for lock/drift monitoring")
+            arc_waypoints = _interpolate_arc_waypoints(
+                start_ee,
+                np.array(segment.details["arc_mid_target"], dtype=float),
+                np.array(segment.details["arc_contact_target"], dtype=float),
+                int(segment.details.get("arc_waypoint_count", segment.max_ik_steps)),
+            )
+            segment.locked_dofs = experimental_lock_state["upper_locked_dofs"]
+            segment.locked_targets = experimental_lock_state["upper_locked_targets"]
+            metrics["snapshots"][f"before_{segment.name}"] = _bbox_state(stage, target_path)
+            arc_result = _execute_locked_lower_chain_arc(
+                target_index=target_index,
+                target_path=target_path,
+                stage=stage,
+                dc=dc,
+                articulation=articulation,
+                sim_app=sim_app,
+                counter=counter,
+                lower_dofs=segment_dofs,
+                lower_body=segment_body,
+                lower_body_name=segment_body_name,
+                lower_body_path=segment_body_path,
+                pivot_body=pivot_body,
+                upper_locked_dofs=experimental_lock_state["upper_locked_dofs"],
+                upper_locked_targets=experimental_lock_state["upper_locked_targets"],
+                pivot_reference_position=experimental_lock_state["pivot_reference_position"],
+                arc_waypoints=arc_waypoints,
+                ik_steps_per_waypoint=1,
+                ik_settle_steps=args.ik_settle_steps,
+                ik_position_eps=args.ik_position_eps,
+                ik_damping=args.ik_damping,
+                ik_max_step=args.ik_max_step,
+                ik_posture_gain=args.ik_posture_gain,
+                stop_tolerance=segment.stop_tolerance,
+                frame_step_updates=args.pivot_arc_frame_step_updates,
+                phase_label_prefix=segment.name,
+                phase_log=phase_log,
+                gripper_dofs=gripper_dofs,
+                args=args,
+                object_center=np.array(segment.details["pivot_arc_object_center"], dtype=float),
+                pivot_to_pinch_distance=float(segment.details["pivot_to_pinch_distance_used"]),
+                close_distance=float(segment.details["pivot_arc_close_distance_m"]),
+                active_arm=str(segment.details.get("active_arm", "right")),
+                robot_base_yaw_rad=float(segment.details.get("robot_base_yaw_rad", 0.0)),
+            )
+            if arc_result.get("active_effort") is not None:
+                active_effort = arc_result["active_effort"]
+            metrics["close_event_fired"] = bool(metrics["close_event_fired"] or arc_result["close_event_fired"])
+            metrics["micro_stop_frames"] += int(arc_result["micro_stop_estimate"]["micro_stop_frames"])
+            metrics["micro_stop_samples"] += int(arc_result["micro_stop_estimate"]["micro_stop_samples"])
+            metrics["snapshots"].update(arc_result.get("snapshots", {}))
+            metrics["snapshots"][f"after_{segment.name}"] = _bbox_state(stage, target_path)
+            segment_summary = {
+                "name": segment.name,
+                "phase_tag": segment.phase_tag,
+                "waypoint_type": segment.waypoint_type,
+                "speed_profile": segment.speed_profile,
+                "control_body_name": segment_body_name,
+                "control_body_path": segment_body_path,
+                "control_dof_names": [name for _, _, name in segment_dofs],
+                "locked_dof_names": [name for _, _, name in experimental_lock_state["upper_locked_dofs"]],
+                "blend_radius": segment.blend_radius,
+                "target_position": segment.target_position.tolist(),
+                "actual_position": arc_result["actual_position"].tolist(),
+                "position_error": arc_result["position_error"],
+                "condition_met": bool(arc_result["condition_met"]),
+                "contact_window": segment.contact_window,
+                "event_marker": segment.event_marker,
+                "micro_stop_estimate": arc_result["micro_stop_estimate"],
+                "experimental_details": arc_result["experimental_details"],
+            }
+            metrics["segment_summaries"].append(segment_summary)
+            print(
+                f"phase={segment.name} streaming_controller=True no_blocking_ik=True "
+                f"stream_samples={int(segment.details.get('arc_waypoint_count', segment.max_ik_steps))} "
+                f"frame_step_updates={args.pivot_arc_frame_step_updates} waypoint_type={segment.waypoint_type} "
+                f"position_error={arc_result['position_error']} event={segment.event_marker}"
+            )
+            continue
 
     metrics["cycle_end_step"] = counter["step"]
     metrics["cycle_time_steps"] = counter["step"] - cycle_start_step
@@ -888,167 +2993,7 @@ def _execute_continuous_motion_cycle(
 def _smooth_pause_steps(args: argparse.Namespace, phase_name: str) -> int:
     if not args.smooth_motion:
         return args.pause_steps
-    if phase_name in {"close_gripper", "grasp_validation", "release"}:
-        return args.pause_steps
     return args.smooth_non_contact_pause_steps
-
-
-def _smooth_ik_hold_steps(args: argparse.Namespace, phase_name: str) -> int:
-    if not args.smooth_motion:
-        return args.ik_hold_steps
-    if phase_name == "grasp_validation":
-        return args.ik_hold_steps
-    return args.smooth_ik_hold_steps
-
-
-def _command_joint_phase(
-    phase_name: str,
-    dc: Any,
-    arm_dofs: list[tuple[int, Any, str]],
-    end_effector_body: Any,
-    gripper_dofs: list[tuple[int, Any, str]],
-    target_positions: list[float],
-    sim_app: Any,
-    phase_steps: int,
-    pause_steps: int,
-    counter: dict[str, int],
-    phase_log: list[dict[str, Any]],
-    joint_tolerance: float,
-    extra_details: dict[str, Any] | None = None,
-) -> tuple[np.ndarray, bool]:
-    start_step = counter["step"]
-    start_positions = _current_positions(dc, arm_dofs)
-    for step in range(1, phase_steps + 1):
-        alpha = step / float(phase_steps)
-        command = [
-            float(start + alpha * (target - start))
-            for start, target in zip(start_positions, target_positions)
-        ]
-        _send_position_targets(dc, arm_dofs, command)
-        sim_app.update()
-        counter["step"] += 1
-    _run_updates(sim_app, pause_steps, counter)
-
-    observed = _current_positions(dc, arm_dofs)
-    ee_position = _body_pose_position(dc, end_effector_body)
-    max_joint_error = max(abs(float(obs - target)) for obs, target in zip(observed, target_positions))
-    condition_met = bool(max_joint_error <= joint_tolerance)
-    details = {
-        "max_joint_error": max_joint_error,
-        "joint_tolerance": joint_tolerance,
-        "observed_joint_values": _named_positions(arm_dofs, observed),
-    }
-    if extra_details:
-        details.update(extra_details)
-    _append_phase(
-        phase_log,
-        phase=phase_name,
-        start_step=start_step,
-        end_step=counter["step"],
-        commanded_targets=_named_positions(arm_dofs, target_positions),
-        ee_position=ee_position,
-        gripper_values=_gripper_values(dc, gripper_dofs),
-        condition_met=condition_met,
-        details=details,
-    )
-    print(f"phase={phase_name} condition_met={condition_met} ee={ee_position.tolist()}")
-    return ee_position, condition_met
-
-
-def _command_ee_phase(
-    phase_name: str,
-    dc: Any,
-    articulation: Any,
-    arm_dofs: list[tuple[int, Any, str]],
-    end_effector_body: Any,
-    gripper_dofs: list[tuple[int, Any, str]],
-    target_position: np.ndarray,
-    sim_app: Any,
-    args: argparse.Namespace,
-    counter: dict[str, int],
-    phase_log: list[dict[str, Any]],
-    extra_details: dict[str, Any] | None = None,
-    gripper_effort_value: float | None = None,
-) -> tuple[np.ndarray, float]:
-    start_step = counter["step"]
-    trace: list[dict[str, Any]] = []
-    phase_hold_steps = _smooth_ik_hold_steps(args, phase_name)
-    gripper_effort_before = None
-    if gripper_effort_value is not None:
-        gripper_effort_before = _apply_gripper_effort(dc, gripper_dofs, gripper_effort_value)
-        if not gripper_effort_before["supported"]:
-            raise RuntimeError(f"Gripper effort command failed before {phase_name}: {gripper_effort_before}")
-    actual_position, position_error = move_end_effector_to_target(
-        dc,
-        articulation,
-        arm_dofs,
-        end_effector_body,
-        target_position,
-        sim_app,
-        args.ik_steps,
-        args.ik_settle_steps,
-        args.ik_position_eps,
-        args.ik_damping,
-        args.ik_max_step,
-        posture_positions=np.array(_current_positions(dc, arm_dofs), dtype=float),
-        posture_gain=args.ik_posture_gain,
-        stop_tolerance=args.ik_stop_tolerance,
-        hold_steps=phase_hold_steps,
-        phase_label=phase_name,
-        trace=trace,
-    )
-    gripper_effort_after = None
-    if gripper_effort_value is not None:
-        gripper_effort_after = _apply_gripper_effort(dc, gripper_dofs, gripper_effort_value)
-        if not gripper_effort_after["supported"]:
-            raise RuntimeError(f"Gripper effort command failed after {phase_name}: {gripper_effort_after}")
-    counter["step"] += len(trace) * (len(arm_dofs) + 1) * args.ik_settle_steps + phase_hold_steps
-    observed_positions = _current_positions(dc, arm_dofs)
-    details = {
-        "target_position": target_position.tolist(),
-        "position_error": position_error,
-        "ik_step_count": len(trace),
-        "ik_trace": trace,
-        "observed_joint_values": _named_positions(arm_dofs, observed_positions),
-        "ik_parameters": {
-            "ik_steps": args.ik_steps,
-            "ik_settle_steps": args.ik_settle_steps,
-            "ik_position_eps": args.ik_position_eps,
-            "ik_damping": args.ik_damping,
-            "ik_max_step": args.ik_max_step,
-            "ik_posture_gain": args.ik_posture_gain,
-            "ik_stop_tolerance": args.ik_stop_tolerance,
-            "ik_hold_steps": phase_hold_steps,
-            "smooth_motion": bool(args.smooth_motion),
-        },
-    }
-    if gripper_effort_value is not None:
-        details.update(
-            {
-                "gripper_effort_active": True,
-                "gripper_effort_value": float(gripper_effort_value),
-                "gripper_effort_before_phase": gripper_effort_before,
-                "gripper_effort_after_phase": gripper_effort_after,
-            }
-        )
-    if extra_details:
-        details.update(extra_details)
-    _append_phase(
-        phase_log,
-        phase=phase_name,
-        start_step=start_step,
-        end_step=counter["step"],
-        commanded_targets=_named_positions(arm_dofs, observed_positions),
-        ee_position=actual_position,
-        gripper_values=_gripper_values(dc, gripper_dofs),
-        condition_met=bool(position_error <= args.pre_grasp_ee_tolerance),
-        details=details,
-    )
-    print(
-        f"phase={phase_name} position_error={position_error} "
-        f"condition_met={position_error <= args.pre_grasp_ee_tolerance} ee={actual_position.tolist()}"
-    )
-    return actual_position, position_error
 
 
 def _command_gripper_phase(
@@ -1207,9 +3152,7 @@ def _attempt_pick_place_target(
     cfg: dict[str, Any],
     dc: Any,
     articulation: Any,
-    arm_dofs: list[tuple[int, Any, str]],
-    gripper_dofs: list[tuple[int, Any, str]],
-    end_effector_body: Any,
+    arm_bundles: dict[str, dict[str, Any]],
     sim_app: Any,
     args: argparse.Namespace,
     counter: dict[str, int],
@@ -1219,6 +3162,7 @@ def _attempt_pick_place_target(
     front_workspace_z: tuple[float, float],
     table_top_z: float,
     robot_base_position: list[float],
+    robot_base_rotation: list[float],
     bin_bbox: dict[str, list[float]],
     bin_collider: dict[str, Any],
     marker_paths: list[str],
@@ -1265,12 +3209,27 @@ def _attempt_pick_place_target(
     category_inference_method = "reference_path" if category_from_refs != "unknown" else "scene_builder_creation_order"
     initial_state = _bbox_state(stage, target_path)
     initial_center = _center_from_bbox(initial_state["bbox"])
-    pre_grasp_pose = {
-        "position": [
+    robot_base_np = np.array(robot_base_position, dtype=float)
+    active_arm = "right" if float(initial_center[1]) >= float(robot_base_np[1]) else "left"
+    fallback_arm = "left" if active_arm == "right" else "right"
+    pregrasp_before_bias = np.array(
+        [
             initial_state["bbox"]["center"][0],
             initial_state["bbox"]["center"][1],
             initial_state["bbox"]["max"][2] + args.pre_grasp_clearance,
         ],
+        dtype=float,
+    )
+    pregrasp_before_bias[2] = float(np.clip(pregrasp_before_bias[2], *front_workspace_z))
+    pregrasp_after_bias, initial_pullback_applied, initial_base_to_target_xy = _pregrasp_with_pullback(
+        pregrasp_before_bias,
+        robot_base_position,
+        args.pregrasp_pullback_m,
+        args.pregrasp_max_bias_m,
+    )
+    pregrasp_after_bias[2] = float(np.clip(pregrasp_after_bias[2], *front_workspace_z))
+    pre_grasp_pose = {
+        "position": pregrasp_after_bias.tolist(),
         "orientation": "fixed_downward",
         "orientation_search": False,
     }
@@ -1318,6 +3277,33 @@ def _attempt_pick_place_target(
         robot_base_position=robot_base_position,
         table_top_z=table_top_z,
     )
+    pregrasp_candidates_by_arm: dict[str, list[dict[str, Any]]] = {
+        arm_name: _build_pregrasp_candidates(
+            pregrasp_before_bias=pregrasp_before_bias,
+            pregrasp_after_bias=pregrasp_after_bias,
+            robot_base_position=robot_base_position,
+            active_arm=arm_name,
+            args=args,
+            front_workspace_z=front_workspace_z,
+        )
+        for arm_name in (active_arm, fallback_arm)
+    }
+    pregrasp_selection_log = {
+        "active_arm": active_arm,
+        "fallback_arm": fallback_arm,
+        "fallback_triggered": False,
+        "pregrasp_before_bias": pregrasp_before_bias.tolist(),
+        "pregrasp_after_bias": pregrasp_after_bias.tolist(),
+        "pullback_applied": float(initial_pullback_applied),
+        "base_to_target_xy": {
+            "dx": float(pregrasp_after_bias[0] - robot_base_np[0]),
+            "dy": float(pregrasp_after_bias[1] - robot_base_np[1]),
+            "distance_before_bias": float(initial_base_to_target_xy),
+            "distance_after_bias": float(np.linalg.norm(pregrasp_after_bias[:2] - robot_base_np[:2])),
+        },
+        "candidate_count_by_arm": {arm_name: len(candidates) for arm_name, candidates in pregrasp_candidates_by_arm.items()},
+        "selected_candidate": None,
+    }
     _print_pregrasp_geometry(pre_grasp_geometry)
     marker_paths.extend(
         [
@@ -1332,6 +3318,8 @@ def _attempt_pick_place_target(
             "category_from_scene_builder_order": category_from_order,
             "inferred_category": category_for_log,
             "category_inference_method": category_inference_method,
+            "active_arm": active_arm,
+            "pregrasp_selection": pregrasp_selection_log,
             "initial_pose": initial_state,
             "pre_grasp_pose": pre_grasp_pose,
             "pre_grasp_geometry": pre_grasp_geometry,
@@ -1341,16 +3329,97 @@ def _attempt_pick_place_target(
             "pre_grasp_workspace_checks": pre_grasp_workspace_checks,
         }
     )
+    arm_dofs = arm_bundles[active_arm]["arm_dofs"]
+    gripper_dofs = arm_bundles[active_arm]["gripper_dofs"]
+    end_effector_body = arm_bundles[active_arm]["end_effector_body"]
 
     try:
-        if not target_workspace_checks["front_workspace_ok"] or not pre_grasp_workspace_checks["front_workspace_ok"]:
+        if not target_workspace_checks["front_workspace_ok"]:
             _fail(
                 "target_outside_front_workspace",
-                "Selected target or explicit pre-grasp pose is outside the conservative front tabletop workspace",
+                "Selected target is outside the conservative front tabletop workspace",
             )
 
-        pre_grasp_target_np = np.array(pre_grasp_pose["position"], dtype=float)
-        grasp_depth_target_np = np.array(descend_pose["position"], dtype=float)
+        selected_arm = active_arm
+        selected_candidate = _select_pregrasp_candidate(
+            target_index=target_index,
+            active_arm=active_arm,
+            fallback_triggered=False,
+            candidates=pregrasp_candidates_by_arm[active_arm],
+            dc=dc,
+            articulation=articulation,
+            arm_dofs=arm_bundles[active_arm]["arm_dofs"],
+            gripper_dofs=arm_bundles[active_arm]["gripper_dofs"],
+            end_effector_body=arm_bundles[active_arm]["end_effector_body"],
+            sim_app=sim_app,
+            args=args,
+            counter=counter,
+            phase_log=phase_log,
+        )
+        if selected_candidate is None:
+            pregrasp_selection_log["fallback_triggered"] = True
+            selected_arm = fallback_arm
+            selected_candidate = _select_pregrasp_candidate(
+                target_index=target_index,
+                active_arm=fallback_arm,
+                fallback_triggered=True,
+                candidates=pregrasp_candidates_by_arm[fallback_arm],
+                dc=dc,
+                articulation=articulation,
+                arm_dofs=arm_bundles[fallback_arm]["arm_dofs"],
+                gripper_dofs=arm_bundles[fallback_arm]["gripper_dofs"],
+                end_effector_body=arm_bundles[fallback_arm]["end_effector_body"],
+                sim_app=sim_app,
+                args=args,
+                counter=counter,
+                phase_log=phase_log,
+            )
+        if selected_candidate is None:
+            _fail("pre_grasp_unreachable", "No deterministic pre-grasp candidate reached tolerance for either arm")
+
+        pregrasp_selection_log["selected_arm"] = selected_arm
+        pregrasp_selection_log["selected_candidate"] = {
+            key: (value.tolist() if isinstance(value, np.ndarray) else value)
+            for key, value in selected_candidate.items()
+            if key != "position"
+        }
+        pregrasp_selection_log["selected_candidate"]["position"] = np.array(selected_candidate["position"], dtype=float).tolist()
+        result["selected_arm"] = selected_arm
+        result["pregrasp_selection"] = pregrasp_selection_log
+        arm_dofs = arm_bundles[selected_arm]["arm_dofs"]
+        gripper_dofs = arm_bundles[selected_arm]["gripper_dofs"]
+        end_effector_body = arm_bundles[selected_arm]["end_effector_body"]
+        pre_grasp_target_np = np.array(selected_candidate["position"], dtype=float)
+        pre_grasp_pose["position"] = pre_grasp_target_np.tolist()
+        pre_grasp_workspace_checks = _front_workspace_checks(
+            pre_grasp_target_np,
+            front_workspace_x,
+            front_workspace_y,
+            front_workspace_z,
+            table_top_z,
+        )
+        result["pre_grasp_pose"] = pre_grasp_pose
+        result["pre_grasp_workspace_checks"] = pre_grasp_workspace_checks
+        grasp_contact_geometry = _grasp_contact_geometry(
+            selected_pregrasp_target=pre_grasp_target_np,
+            object_center=initial_center,
+            bbox_top_z=float(initial_state["bbox"]["max"][2]),
+            table_top_z=table_top_z,
+            args=args,
+        )
+        grasp_align_target_np = np.array(grasp_contact_geometry["pre_contact_alignment_target"], dtype=float)
+        grasp_depth_target_np = np.array(grasp_contact_geometry["grasp_contact_target"], dtype=float)
+        descend_pose["position"] = grasp_depth_target_np.tolist()
+        descend_pose["selected_pregrasp_coupled_xy"] = True
+        descend_pose["final_descend_vertical_only"] = grasp_contact_geometry["final_descend_vertical_only"]
+        result["descend_pose"] = descend_pose
+        result["grasp_contact_geometry"] = grasp_contact_geometry
+        marker_paths.extend(
+            [
+                _debug_marker(stage, f"/World/DebugTask1SelectedPreGrasp_{target_index}", pre_grasp_target_np.tolist(), 0.025, (0.0, 0.7, 1.0)),
+                _debug_marker(stage, f"/World/DebugTask1GraspContact_{target_index}", grasp_depth_target_np.tolist(), 0.025, (1.0, 0.9, 0.1)),
+            ]
+        )
         lift_target_np = grasp_depth_target_np.copy()
         lift_target_np[2] = max(
             grasp_depth_target_np[2] + args.pre_grasp_clearance,
@@ -1371,15 +3440,87 @@ def _attempt_pick_place_target(
         }
         result["place_pose"] = place_pose
 
-        continuous_plan = _build_continuous_cycle_plan(
-            pre_grasp_target=pre_grasp_target_np,
-            grasp_depth_target=grasp_depth_target_np,
-            lift_clearance_target=lift_target_np,
-            prebin_target=prebin_target_np,
-            place_depth_target=place_depth_target_np,
-            retreat_target=retreat_target_np,
-            args=args,
-        )
+        experimental_pivot_arc_log: dict[str, Any] = {
+            "enabled": bool(args.experimental_pivot_arc_grasp),
+            "fallback_to_baseline_used": False,
+            "fallback_reason": None,
+        }
+        if args.experimental_pivot_arc_grasp:
+            try:
+                continuous_plan, experimental_details = _experimental_pivot_arc_plan(
+                    target_index=target_index,
+                    active_arm=selected_arm,
+                    arm_dofs=arm_dofs,
+                    end_effector_body=end_effector_body,
+                    end_effector_name=arm_bundles[selected_arm]["end_effector_name"],
+                    end_effector_path=arm_bundles[selected_arm]["end_effector_path"],
+                    pivot_body=arm_bundles[selected_arm]["pivot_body"],
+                    pivot_name=arm_bundles[selected_arm]["pivot_name"],
+                    pivot_path=arm_bundles[selected_arm]["pivot_path"],
+                    object_center=initial_center,
+                    bbox_top_z=float(initial_state["bbox"]["max"][2]),
+                    table_top_z=table_top_z,
+                    robot_base_position=robot_base_position,
+                    robot_base_rotation=robot_base_rotation,
+                    pre_grasp_target=pre_grasp_target_np,
+                    lift_clearance_target=lift_target_np,
+                    prebin_target=prebin_target_np,
+                    place_depth_target=place_depth_target_np,
+                    retreat_target=retreat_target_np,
+                    args=args,
+                    front_workspace_z=front_workspace_z,
+                )
+                experimental_pivot_arc_log.update(experimental_details)
+                marker_paths.extend(
+                    [
+                        _debug_marker(stage, f"/World/DebugTask1PivotAnchor_{target_index}", experimental_details["pivot_anchor_target"], 0.025, (0.9, 0.2, 1.0)),
+                        _debug_marker(stage, f"/World/DebugTask1PivotContactPoint_{target_index}", experimental_details["target_object_contact_point"], 0.02, (0.2, 1.0, 0.3)),
+                    ]
+                )
+            except Exception as exc:
+                experimental_pivot_arc_log["fallback_to_baseline_used"] = True
+                experimental_pivot_arc_log["fallback_reason"] = str(exc)
+                continuous_plan = _build_continuous_cycle_plan(
+                    active_arm=selected_arm,
+                    robot_base_rotation=robot_base_rotation,
+                    pre_grasp_target=pre_grasp_target_np,
+                    grasp_align_target=grasp_align_target_np,
+                    grasp_depth_target=grasp_depth_target_np,
+                    lift_clearance_target=lift_target_np,
+                    prebin_target=prebin_target_np,
+                    place_depth_target=place_depth_target_np,
+                    retreat_target=retreat_target_np,
+                    args=args,
+                )
+        else:
+            continuous_plan = _build_continuous_cycle_plan(
+                active_arm=selected_arm,
+                robot_base_rotation=robot_base_rotation,
+                pre_grasp_target=pre_grasp_target_np,
+                grasp_align_target=grasp_align_target_np,
+                grasp_depth_target=grasp_depth_target_np,
+                lift_clearance_target=lift_target_np,
+                prebin_target=prebin_target_np,
+                place_depth_target=place_depth_target_np,
+                retreat_target=retreat_target_np,
+                args=args,
+            )
+        result["experimental_pivot_arc_grasp"] = experimental_pivot_arc_log
+        for segment in continuous_plan:
+            if segment.name in {"continuous_grasp_align", "continuous_grasp_depth"}:
+                segment.details.update(
+                    {
+                        "selected_pregrasp_target": grasp_contact_geometry["selected_pregrasp_target"],
+                        "grasp_contact_target": grasp_contact_geometry["grasp_contact_target"],
+                        "object_center": grasp_contact_geometry["object_center"],
+                        "align_target_xy": grasp_contact_geometry["align_target_xy"],
+                        "descend_target_xy": grasp_contact_geometry["descend_target_xy"],
+                        "vertical_only_descend": grasp_contact_geometry["vertical_only_descend"],
+                        "xy_delta_contact_to_object": grasp_contact_geometry["xy_delta_contact_to_object"],
+                        "final_descend_vertical_only": grasp_contact_geometry["final_descend_vertical_only"],
+                        "close_trigger_attached_to_final_vertical_descend": segment.name == "continuous_grasp_depth",
+                    }
+                )
         result["continuous_motion_plan"] = [
             {
                 "name": segment.name,
@@ -1388,6 +3529,9 @@ def _attempt_pick_place_target(
                 "speed_profile": segment.speed_profile,
                 "blend_radius": segment.blend_radius,
                 "event_marker": segment.event_marker,
+                "control_body_name": segment.control_body_name,
+                "control_body_path": segment.control_body_path,
+                "control_dof_names": [name for _, _, name in segment.control_dofs] if segment.control_dofs else [name for _, _, name in arm_dofs],
                 "target_position": segment.target_position.tolist(),
             }
             for segment in continuous_plan
@@ -1418,6 +3562,50 @@ def _attempt_pick_place_target(
         result["close_event_fired"] = bool(cycle_metrics.get("close_event_fired"))
         result["open_event_fired"] = bool(cycle_metrics.get("open_event_fired"))
         result["continuous_cycle_metrics"] = cycle_metrics
+        if args.experimental_pivot_arc_grasp and not experimental_pivot_arc_log.get("fallback_to_baseline_used"):
+            segment_by_name_for_experiment = {item["name"]: item for item in cycle_metrics["segment_summaries"]}
+            anchor_summary = segment_by_name_for_experiment.get("experimental_pivot_anchor", {})
+            contact_summary = segment_by_name_for_experiment.get("experimental_locked_lower_chain_arc", {})
+            close_metric = (contact_summary.get("experimental_details") or {}).get("close_condition_metric")
+            experimental_pivot_arc_log["stage_a_succeeded"] = bool(anchor_summary.get("condition_met"))
+            experimental_pivot_arc_log["stage_b_started"] = "experimental_locked_lower_chain_arc" in segment_by_name_for_experiment
+            experimental_pivot_arc_log["close_condition_satisfied_before_close"] = bool(
+                (contact_summary.get("experimental_details") or {}).get("close_condition_satisfied_before_close")
+            )
+            experimental_details = contact_summary.get("experimental_details") or {}
+            for key in (
+                "upper_chain_locked_targets",
+                "upper_chain_lock_active",
+                "upper_chain_lock_active_during_arc",
+                "upper_chain_joint_error_max_during_arc",
+                "upper_chain_joint_error_mean_during_arc",
+                "upper_chain_joint_error_final_during_arc",
+                "pivot_reference_position",
+                "pivot_position_after_anchor",
+                "pivot_position_during_arc_start",
+                "pivot_position_during_arc_end",
+                "pivot_drift_per_waypoint",
+                "pivot_drift_norm_max",
+                "pivot_drift_norm_mean",
+                "pivot_drift_norm_final",
+                "micro_stop_frames",
+                "micro_stop_samples",
+            ):
+                if key in experimental_details:
+                    experimental_pivot_arc_log[key] = experimental_details[key]
+            if close_metric:
+                experimental_pivot_arc_log["pinch_center_estimated_position"] = close_metric.get("pinch_center_estimated_position")
+                experimental_pivot_arc_log["pinch_center_to_object_distance"] = close_metric.get("pinch_center_to_object_distance")
+                wrist_dist = close_metric.get("wrist_to_object_distance")
+                pinch_dist = close_metric.get("pinch_center_to_object_distance")
+                if isinstance(wrist_dist, (int, float)) and isinstance(pinch_dist, (int, float)):
+                    experimental_pivot_arc_log["object_under_wrist_or_near_finger_gap"] = (
+                        "near_finger_gap" if pinch_dist < wrist_dist else "under_wrist_or_palm_projection"
+                    )
+            experimental_pivot_arc_log["final_local_approach_shape"] = (
+                experimental_details.get("final_local_approach_shape") or "arc-like_locked_lower_chain"
+            )
+            result["experimental_pivot_arc_grasp"] = experimental_pivot_arc_log
 
         segment_by_name = {item["name"]: item for item in cycle_metrics["segment_summaries"]}
         phase_by_name = {entry["phase"]: entry for entry in phase_log if entry.get("details", {}).get("target_index") == target_index}
@@ -1435,16 +3623,34 @@ def _attempt_pick_place_target(
         if pre_distance > args.pre_grasp_ee_tolerance:
             _fail("pre_grasp_unreachable", f"Pre-grasp end effector remained {pre_distance:.3f} m from explicit pre-grasp pose")
 
-        ee_descend = np.array(segment_by_name["continuous_grasp_depth"]["actual_position"], dtype=float)
-        descend_error = float(segment_by_name["continuous_grasp_depth"]["position_error"])
-        after_descend = cycle_metrics["snapshots"].get("before_close_gripper") or cycle_metrics["snapshots"]["after_continuous_grasp_depth"]
-        object_distance_before_close = _distance(ee_descend, _center_from_bbox(after_descend["bbox"]))
+        if "continuous_grasp_depth" in segment_by_name:
+            descend_segment_name = "continuous_grasp_depth"
+        elif "experimental_locked_lower_chain_arc" in segment_by_name:
+            descend_segment_name = "experimental_locked_lower_chain_arc"
+        else:
+            descend_segment_name = "experimental_pinch_contact"
+        ee_descend = np.array(segment_by_name[descend_segment_name]["actual_position"], dtype=float)
+        descend_error = float(segment_by_name[descend_segment_name]["position_error"])
+        after_descend_key = f"after_{descend_segment_name}"
+        after_descend = cycle_metrics["snapshots"].get("before_close_gripper") or cycle_metrics["snapshots"][after_descend_key]
+        experimental_close_metric = (segment_by_name[descend_segment_name].get("experimental_details") or {}).get("close_condition_metric")
+        if experimental_close_metric and isinstance(experimental_close_metric.get("pinch_center_to_object_distance"), (int, float)):
+            object_distance_before_close = float(experimental_close_metric["pinch_center_to_object_distance"])
+        else:
+            object_distance_before_close = _distance(ee_descend, _center_from_bbox(after_descend["bbox"]))
         descend_safety = _ee_front_safety_checks(ee_descend, front_workspace_x, front_workspace_y, table_top_z, 0.0)
-        if "continuous_grasp_depth" in phase_by_name:
-            phase_by_name["continuous_grasp_depth"]["details"]["target_object_distance_before_close"] = object_distance_before_close
-            phase_by_name["continuous_grasp_depth"]["details"]["ee_to_explicit_descend_target_distance"] = descend_error
-            phase_by_name["continuous_grasp_depth"]["details"]["descend_front_safety_checks"] = descend_safety
-            phase_by_name["continuous_grasp_depth"]["condition_met"] = bool(
+        if "continuous_grasp_align" in phase_by_name and "continuous_grasp_align" in segment_by_name:
+            align_summary = segment_by_name["continuous_grasp_align"]
+            phase_by_name["continuous_grasp_align"]["details"]["ee_to_grasp_alignment_target_distance"] = float(
+                align_summary["position_error"]
+            )
+            phase_by_name["continuous_grasp_align"]["details"]["close_trigger_position"] = None
+        if descend_segment_name in phase_by_name:
+            phase_by_name[descend_segment_name]["details"]["target_object_distance_before_close"] = object_distance_before_close
+            phase_by_name[descend_segment_name]["details"]["ee_to_explicit_descend_target_distance"] = descend_error
+            phase_by_name[descend_segment_name]["details"]["descend_front_safety_checks"] = descend_safety
+            phase_by_name[descend_segment_name]["details"]["close_trigger_position"] = ee_descend.tolist()
+            phase_by_name[descend_segment_name]["condition_met"] = bool(
                 descend_safety["front_safety_ok"] and object_distance_before_close <= args.descend_object_tolerance
             )
         if not descend_safety["front_safety_ok"]:
@@ -1667,6 +3873,8 @@ def main() -> int:
     parser.add_argument("--phase-steps", type=int, default=DEFAULT_PHASE_STEPS)
     parser.add_argument("--pause-steps", type=int, default=DEFAULT_PAUSE_STEPS)
     parser.add_argument("--settle-steps", type=int, default=DEFAULT_SETTLE_STEPS)
+    parser.add_argument("--startup-target-track-steps", type=int, default=DEFAULT_STARTUP_TARGET_TRACK_STEPS)
+    parser.add_argument("--strict-startup-pose", action="store_true")
     parser.add_argument("--target-index", type=int)
     parser.add_argument("--max-arm-dofs", type=int, default=7)
     parser.add_argument("--seed", type=int)
@@ -1674,6 +3882,22 @@ def main() -> int:
     parser.add_argument("--gripper-delta", type=float, default=DEFAULT_GRIPPER_DELTA, help="Deprecated; official fixed gripper widths are used.")
     parser.add_argument("--gripper-hold-effort", type=float, default=DEFAULT_GRIPPER_HOLD_EFFORT)
     parser.add_argument("--pre-grasp-clearance", type=float, default=DEFAULT_PRE_GRASP_CLEARANCE)
+    parser.add_argument("--pregrasp-pullback-m", type=float, default=0.0)
+    parser.add_argument("--pregrasp-max-bias-m", type=float, default=0.06)
+    parser.add_argument("--grasp-contact-offset-x", type=float, default=DEFAULT_GRASP_CONTACT_OFFSET_X)
+    parser.add_argument("--grasp-contact-offset-y", type=float, default=DEFAULT_GRASP_CONTACT_OFFSET_Y)
+    parser.add_argument("--experimental-pivot-arc-grasp", action="store_true")
+    parser.add_argument("--pivot-to-pinch-distance-m", type=float, default=DEFAULT_PIVOT_TO_PINCH_DISTANCE)
+    parser.add_argument("--pivot-anchor-height-offset-m", type=float, default=DEFAULT_PIVOT_ANCHOR_HEIGHT_OFFSET)
+    parser.add_argument("--pivot-anchor-forward-offset-m", type=float, default=DEFAULT_PIVOT_ANCHOR_FORWARD_OFFSET)
+    parser.add_argument("--pivot-anchor-lateral-offset-m", type=float, default=DEFAULT_PIVOT_ANCHOR_LATERAL_OFFSET)
+    parser.add_argument("--pivot-arc-contact-tolerance-m", type=float, default=DEFAULT_PIVOT_ARC_CONTACT_TOLERANCE)
+    parser.add_argument("--pivot-arc-max-steps", type=int, default=DEFAULT_PIVOT_ARC_MAX_STEPS)
+    parser.add_argument("--pivot-arc-close-distance-m", type=float, default=DEFAULT_PIVOT_ARC_CLOSE_DISTANCE)
+    parser.add_argument("--pivot-arc-frame-step-updates", type=int, default=DEFAULT_PIVOT_ARC_FRAME_STEP_UPDATES)
+    parser.add_argument("--pivot-arc-stream-samples", type=int, default=DEFAULT_PIVOT_ARC_STREAM_SAMPLES)
+    parser.add_argument("--stream-samples", type=int, default=DEFAULT_STREAM_SAMPLES)
+    parser.add_argument("--stream-frame-step-updates", type=int, default=DEFAULT_STREAM_FRAME_STEP_UPDATES)
     parser.add_argument("--safe-drop-height", type=float, default=DEFAULT_SAFE_DROP_HEIGHT)
     parser.add_argument("--stable-jitter", type=float, default=DEFAULT_STABLE_JITTER)
     parser.add_argument("--min-lift-delta", type=float, default=DEFAULT_MIN_LIFT_DELTA)
@@ -1693,10 +3917,10 @@ def main() -> int:
     parser.add_argument("--ik-max-step", type=float, default=DEFAULT_IK_MAX_STEP)
     parser.add_argument("--ik-posture-gain", type=float, default=DEFAULT_POSTURE_GAIN)
     parser.add_argument("--ik-stop-tolerance", type=float, default=DEFAULT_STOP_TOLERANCE)
-    parser.add_argument("--ik-hold-steps", type=int, default=DEFAULT_HOLD_STEPS)
+    parser.add_argument("--ik-hold-steps", type=int, default=0)
     parser.add_argument("--smooth-motion", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--smooth-ik-hold-steps", type=int, default=1)
-    parser.add_argument("--smooth-non-contact-pause-steps", type=int, default=1)
+    parser.add_argument("--smooth-ik-hold-steps", type=int, default=0)
+    parser.add_argument("--smooth-non-contact-pause-steps", type=int, default=0)
     parser.add_argument("--continuous-soft-tolerance", type=float, default=DEFAULT_CONTINUOUS_SOFT_TOLERANCE)
     parser.add_argument("--continuous-blend-radius", type=float, default=DEFAULT_CONTINUOUS_BLEND_RADIUS)
     parser.add_argument("--micro-stop-speed-threshold", type=float, default=DEFAULT_MICRO_STOP_SPEED_THRESHOLD)
@@ -1718,24 +3942,40 @@ def main() -> int:
     parser.add_argument("--hold-open", action="store_true")
     args = parser.parse_args()
 
-    if args.init_steps < 1 or args.phase_steps < 1 or args.pause_steps < 1 or args.settle_steps < 1:
-        raise RuntimeError("--init-steps, --phase-steps, --pause-steps, and --settle-steps must be positive")
+    if args.init_steps < 1 or args.phase_steps < 1 or args.pause_steps < 0 or args.settle_steps < 1:
+        raise RuntimeError("--init-steps, --phase-steps, and --settle-steps must be positive; --pause-steps must be non-negative")
+    if args.startup_target_track_steps < 1:
+        raise RuntimeError("--startup-target-track-steps must be positive")
     if args.target_index is not None and args.target_index < 0:
         raise RuntimeError("--target-index must be non-negative")
     if args.max_arm_dofs < 1:
         raise RuntimeError("--max-arm-dofs must be positive")
     if args.pre_grasp_clearance <= 0.0 or args.safe_drop_height <= 0.0:
         raise RuntimeError("--pre-grasp-clearance and --safe-drop-height must be positive")
+    if args.pregrasp_pullback_m < 0.0 or args.pregrasp_max_bias_m < 0.0:
+        raise RuntimeError("--pregrasp-pullback-m and --pregrasp-max-bias-m must be non-negative")
+    if args.pivot_to_pinch_distance_m <= 0.0:
+        raise RuntimeError("--pivot-to-pinch-distance-m must be positive")
+    if args.pivot_arc_contact_tolerance_m <= 0.0 or args.pivot_arc_close_distance_m <= 0.0:
+        raise RuntimeError("--pivot-arc-contact-tolerance-m and --pivot-arc-close-distance-m must be positive")
+    if args.pivot_arc_max_steps < 1:
+        raise RuntimeError("--pivot-arc-max-steps must be positive")
+    if args.pivot_arc_frame_step_updates < 1:
+        raise RuntimeError("--pivot-arc-frame-step-updates must be positive")
+    if args.pivot_arc_stream_samples < 1:
+        raise RuntimeError("--pivot-arc-stream-samples must be positive")
+    if args.stream_samples < 1 or args.stream_frame_step_updates < 1:
+        raise RuntimeError("--stream-samples and --stream-frame-step-updates must be positive")
     if args.stable_jitter <= 0.0 or args.min_lift_delta <= 0.0 or args.min_transport_distance <= 0.0:
         raise RuntimeError("--stable-jitter, --min-lift-delta, and --min-transport-distance must be positive")
     if args.joint_tolerance <= 0.0 or args.max_local_joint_adjustment < 0.0:
         raise RuntimeError("--joint-tolerance must be positive and --max-local-joint-adjustment must be non-negative")
     if args.min_ee_table_clearance < 0.0:
         raise RuntimeError("--min-ee-table-clearance must be non-negative")
-    if args.ik_steps < 1 or args.ik_settle_steps < 1 or args.ik_hold_steps < 1:
-        raise RuntimeError("--ik-steps, --ik-settle-steps, and --ik-hold-steps must be positive")
-    if args.smooth_ik_hold_steps < 1 or args.smooth_non_contact_pause_steps < 0:
-        raise RuntimeError("--smooth-ik-hold-steps must be positive and --smooth-non-contact-pause-steps must be non-negative")
+    if args.ik_steps < 1 or args.ik_settle_steps < 1 or args.ik_hold_steps < 0:
+        raise RuntimeError("--ik-steps and --ik-settle-steps must be positive; --ik-hold-steps must be non-negative")
+    if args.smooth_ik_hold_steps < 0 or args.smooth_non_contact_pause_steps < 0:
+        raise RuntimeError("--smooth-ik-hold-steps and --smooth-non-contact-pause-steps must be non-negative")
     if args.continuous_soft_tolerance <= 0.0 or args.continuous_blend_radius < 0.0:
         raise RuntimeError("--continuous-soft-tolerance must be positive and --continuous-blend-radius must be non-negative")
     if args.continuous_contact_dwell_steps < 0:
@@ -1792,6 +4032,8 @@ def main() -> int:
             "ik_posture_gain": args.ik_posture_gain,
             "ik_stop_tolerance": args.ik_stop_tolerance,
             "ik_hold_steps": args.ik_hold_steps,
+            "startup_target_track_steps": args.startup_target_track_steps,
+            "strict_startup_pose": bool(args.strict_startup_pose),
             "gripper_policy": "official_same_sign_position_targets",
             "gripper_effort_policy": "dynamic_control_set_dof_effort_sustained_during_close_validation_lift",
             "gripper_hold_effort": args.gripper_hold_effort,
@@ -1799,11 +4041,25 @@ def main() -> int:
             "official_gripper_close_width": OFFICIAL_GRIPPER_CLOSE_WIDTH,
             "descend_clearance": args.descend_clearance,
             "grasp_depth_offset": args.grasp_depth_offset,
+            "pregrasp_pullback_m": args.pregrasp_pullback_m,
+            "pregrasp_max_bias_m": args.pregrasp_max_bias_m,
+            "pregrasp_candidate_policy": "arm_aware_greedy_center_pullback2cm_pullback4cm_z_offsets_max_6_with_one_fallback_arm",
+            "grasp_contact_offset_x": args.grasp_contact_offset_x,
+            "grasp_contact_offset_y": args.grasp_contact_offset_y,
+            "grasp_contact_policy": "selected_pregrasp_xy_plus_contact_offset_then_vertical_descend",
             "tuning_knobs": _tuning_knob_summary(args),
             "smooth_motion": bool(args.smooth_motion),
             "smooth_non_contact_pause_steps": args.smooth_non_contact_pause_steps,
             "smooth_ik_hold_steps": args.smooth_ik_hold_steps,
-            "continuous_cycle_policy": "queued_soft_and_hard_waypoints_with_event_markers",
+            "continuous_cycle_policy": "global_absolute_joint_waypoint_cubic_hermite_stream_no_per_segment_endpoint_rebuild",
+            "streaming_controller_active": True,
+            "ordinary_cycle_endpoint_rebuilds": 0,
+            "ordinary_cycle_finite_difference_jacobian_calls": 0,
+            "stream_samples": args.stream_samples,
+            "stream_frame_step_updates": args.stream_frame_step_updates,
+            "pivot_arc_stream_samples": args.pivot_arc_stream_samples,
+            "pivot_arc_frame_step_updates": args.pivot_arc_frame_step_updates,
+            "interpolation_profile": "global_quintic_timewarp_cubic_hermite_joint_chain",
             "continuous_soft_tolerance": args.continuous_soft_tolerance,
             "continuous_blend_radius": args.continuous_blend_radius,
             "continuous_contact_dwell_steps": args.continuous_contact_dwell_steps,
@@ -1818,8 +4074,11 @@ def main() -> int:
         },
         "phase_order": [
             "apply_official_startup_pose",
-            "open_gripper_initial",
+            "open_gripper_initial_right",
+            "open_gripper_initial_left",
+            "pregrasp_candidate_selection",
             "continuous_pregrasp",
+            "continuous_grasp_align",
             "continuous_grasp_depth",
             "continuous_lift_clearance",
             "continuous_prebin",
@@ -2082,12 +4341,40 @@ def main() -> int:
 
         articulation_path = articulation_roots[0]
         timeline = _start_timeline()
-        _run_updates(sim_app, args.pause_steps, counter)
+        articulation_startup_updates = max(args.pause_steps, 5)
+        _run_updates(sim_app, articulation_startup_updates, counter)
 
-        dc, articulation = _acquire_articulation(articulation_path)
+        dc, articulation, articulation_acquire_log = _acquire_articulation_with_fallback(articulation_path, args.prim_path)
         dof_observation = _read_dof_observation(dc, articulation)
-        arm_dofs = _select_right_arm_dofs(dc, articulation, args.max_arm_dofs)
-        gripper_dofs = _select_right_gripper_dofs(dc, articulation)
+        arm_bundles: dict[str, dict[str, Any]] = {}
+        for arm_name in ("right", "left"):
+            end_effector_body_for_arm, end_effector_name_for_arm, end_effector_path_for_arm = _identify_end_effector_body_for_side(
+                dc,
+                articulation,
+                arm_name,
+                args.end_effector_body,
+            )
+            pivot_body_for_arm, pivot_name_for_arm, pivot_path_for_arm = _find_body_for_side(
+                dc,
+                articulation,
+                arm_name,
+                "wrist_pitch_link",
+            )
+            arm_bundles[arm_name] = {
+                "arm_dofs": _select_arm_dofs_for_side(dc, articulation, arm_name, args.max_arm_dofs),
+                "gripper_dofs": _select_gripper_dofs_for_side(dc, articulation, arm_name),
+                "end_effector_body": end_effector_body_for_arm,
+                "end_effector_name": end_effector_name_for_arm,
+                "end_effector_path": end_effector_path_for_arm,
+                "pivot_body": pivot_body_for_arm,
+                "pivot_name": pivot_name_for_arm,
+                "pivot_path": pivot_path_for_arm,
+            }
+        arm_dofs = arm_bundles["right"]["arm_dofs"]
+        gripper_dofs = arm_bundles["right"]["gripper_dofs"]
+        end_effector_body = arm_bundles["right"]["end_effector_body"]
+        end_effector_name = arm_bundles["right"]["end_effector_name"]
+        end_effector_path = arm_bundles["right"]["end_effector_path"]
         official_startup_joint_map = _load_official_startup_joint_map(
             baseline_root,
             args.prim_path,
@@ -2099,11 +4386,6 @@ def main() -> int:
             articulation,
             official_startup_joint_map,
             OFFICIAL_STARTUP_ARM_JOINT_NAMES,
-        )
-        end_effector_body, end_effector_name, end_effector_path = _identify_end_effector_body(
-            dc,
-            articulation,
-            args.end_effector_body,
         )
         official_startup_targets = _targets_from_map(startup_dofs, official_startup_joint_map)
 
@@ -2118,26 +4400,40 @@ def main() -> int:
             "rotation_xyz_deg_applied": configured_robot_rotation,
             "articulation_path": articulation_path,
             "joint_count": len(joint_names),
-            "right_arm_dof_names": [name for _, _, name in arm_dofs],
-            "right_gripper_dof_indices": [index for index, _, _ in gripper_dofs],
-            "right_gripper_dof_names": [name for _, _, name in gripper_dofs],
-            "right_gripper_hold_effort": args.gripper_hold_effort,
+            "arm_dof_names_by_arm": {arm_name: [name for _, _, name in bundle["arm_dofs"]] for arm_name, bundle in arm_bundles.items()},
+            "experimental_pivot_frame_by_arm": {arm_name: bundle["pivot_name"] for arm_name, bundle in arm_bundles.items()},
+            "experimental_pivot_frame_path_by_arm": {arm_name: bundle["pivot_path"] for arm_name, bundle in arm_bundles.items()},
+            "gripper_dof_indices_by_arm": {arm_name: [index for index, _, _ in bundle["gripper_dofs"]] for arm_name, bundle in arm_bundles.items()},
+            "gripper_dof_names_by_arm": {arm_name: [name for _, _, name in bundle["gripper_dofs"]] for arm_name, bundle in arm_bundles.items()},
+            "gripper_hold_effort": args.gripper_hold_effort,
             "official_startup_dof_names": [name for _, _, name in startup_dofs],
             "missing_optional_official_startup_dofs": missing_official_startup_optional_dofs,
             "official_startup_source": "lerobot.common.robot_devices.robots.isaac_sim_robot_interface.IsaacSimRobotInterface._joint_value_map",
+            "official_startup_baseline_source": "Ubtech_sim/source/RobotArticulation.py uses the same _joint_value_map for initialization",
+            "startup_joint_seed_policy": "initialization_only_direct_joint_seed_from_official_baseline_then_target_streaming",
+            "end_effector_by_arm": {
+                arm_name: {
+                    "name": bundle["end_effector_name"],
+                    "path": bundle["end_effector_path"],
+                }
+                for arm_name, bundle in arm_bundles.items()
+            },
             "end_effector_name": end_effector_name,
             "end_effector_path": end_effector_path,
             "dof_observation_sample": dof_observation[:12],
+            "articulation_acquire": articulation_acquire_log,
+            "articulation_startup_updates": articulation_startup_updates,
         }
 
         phase_log: list[dict[str, Any]] = payload["phase_log"]
         startup_start_step = counter["step"]
-        _set_joint_positions_and_targets(dc, startup_dofs, official_startup_targets)
-        _run_updates(sim_app, args.pause_steps, counter)
+        startup_seed_result = _seed_joint_positions_for_initialization(dc, startup_dofs, official_startup_targets)
+        startup_sync_steps = args.startup_target_track_steps
+        _run_updates(sim_app, startup_sync_steps, counter)
         observed_startup = _current_positions(dc, startup_dofs)
         ee_startup = _body_pose_position(dc, end_effector_body)
         startup_max_error = max(abs(float(obs - target)) for obs, target in zip(observed_startup, official_startup_targets))
-        startup_ok = bool(startup_max_error <= args.joint_tolerance)
+        startup_ok = bool(startup_seed_result["supported"] and startup_max_error <= args.joint_tolerance)
         _append_phase(
             phase_log,
             phase="apply_official_startup_pose",
@@ -2153,26 +4449,42 @@ def main() -> int:
                 "observed_joint_values": _named_positions(startup_dofs, observed_startup),
                 "max_joint_error": startup_max_error,
                 "joint_tolerance": args.joint_tolerance,
+                "initialization_seed_result": startup_seed_result,
+                "post_seed_sync_steps": startup_sync_steps,
+                "strict_startup_pose": bool(args.strict_startup_pose),
+                "startup_pose_best_effort": not bool(args.strict_startup_pose),
             },
         )
-        print(f"phase=apply_official_startup_pose condition_met={startup_ok} ee={ee_startup.tolist()}")
-        if not startup_ok:
-            _fail("official_startup_pose_failed", "Official startup joint pose was not reached within tolerance")
-
-        open_ok = _command_gripper_phase(
-            "open_gripper_initial",
-            dc,
-            gripper_dofs,
-            end_effector_body,
-            [OFFICIAL_GRIPPER_OPEN_WIDTH] * len(gripper_dofs),
-            sim_app,
-            _smooth_pause_steps(args, "open_gripper_initial"),
-            counter,
-            phase_log,
-            effort_value=0.0,
+        print(
+            "phase=apply_official_startup_pose "
+            f"condition_met={startup_ok} "
+            f"initialization_seed_supported={startup_seed_result['supported']} "
+            f"max_joint_error={startup_max_error} ee={ee_startup.tolist()}"
         )
-        if not open_ok:
-            _fail("gripper_command_failed", "Right gripper open command failed before approach")
+        if not startup_ok and args.strict_startup_pose:
+            _fail("official_startup_pose_failed", "Official startup joint pose was not reached within tolerance")
+        if not startup_ok:
+            print(
+                "phase=apply_official_startup_pose warning=initialization_startup_pose_not_within_tolerance "
+                f"max_joint_error={startup_max_error} continuing_best_effort=True"
+            )
+
+        for arm_name, bundle in arm_bundles.items():
+            open_gripper_dofs = bundle["gripper_dofs"]
+            open_ok = _command_gripper_phase(
+                f"open_gripper_initial_{arm_name}",
+                dc,
+                open_gripper_dofs,
+                bundle["end_effector_body"],
+                [OFFICIAL_GRIPPER_OPEN_WIDTH] * len(open_gripper_dofs),
+                sim_app,
+                _smooth_pause_steps(args, "open_gripper_initial"),
+                counter,
+                phase_log,
+                effort_value=0.0,
+            )
+            if not open_ok:
+                _fail("gripper_command_failed", f"{arm_name} gripper open command failed before approach")
 
         attempt_results: list[dict[str, Any]] = []
         for attempt_number, target_attempt_index in enumerate(attempt_indices, start=1):
@@ -2189,9 +4501,7 @@ def main() -> int:
                 cfg=cfg,
                 dc=dc,
                 articulation=articulation,
-                arm_dofs=arm_dofs,
-                gripper_dofs=gripper_dofs,
-                end_effector_body=end_effector_body,
+                arm_bundles=arm_bundles,
                 sim_app=sim_app,
                 args=args,
                 counter=counter,
@@ -2201,6 +4511,7 @@ def main() -> int:
                 front_workspace_z=front_workspace_z,
                 table_top_z=table_top_z,
                 robot_base_position=configured_robot_position,
+                robot_base_rotation=configured_robot_rotation,
                 bin_bbox=bin_bbox,
                 bin_collider=bin_collider,
                 marker_paths=marker_paths,

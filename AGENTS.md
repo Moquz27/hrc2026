@@ -2,12 +2,25 @@
 
 ## Required Reading
 
-Before doing any work in this repository, always read:
+Before planning, editing code, refactoring, or reviewing in this repository,
+always read these files in this order:
 
-1. `PROJECT_CONTEXT.md`
-2. `docs/context_full.md`
+1. `AGENTS.md`
+2. `PROJECT_CONTEXT.md`
+3. `CURRENT_PLAN.md`
+4. `TASK_LOG.md`
 
-Do not start coding, refactoring, or reviewing until both files have been read.
+Also read `docs/context_full.md` for full system understanding before coding,
+refactoring, or reviewing.
+
+Do not start planning, coding, refactoring, or reviewing until these required
+files have been read.
+
+`CURRENT_PLAN.md` is the active implementation source of truth. If it disagrees
+with older logs or context, `CURRENT_PLAN.md` wins.
+
+Codex must only implement the current phase in `CURRENT_PLAN.md` unless the user
+explicitly authorizes a phase change.
 
 ---
 
@@ -158,7 +171,8 @@ If the project uses Isaac Sim or other heavy simulator dependencies:
 
 When acting as Codex in this repository:
 
-- read `PROJECT_CONTEXT.md` first
+- read `AGENTS.md`, `PROJECT_CONTEXT.md`, `CURRENT_PLAN.md`, and `TASK_LOG.md`
+  before planning or editing code
 - read `docs/context_full.md` for full system understanding
 - check existing files before creating new ones
 - prefer editing existing files over creating duplicates
@@ -166,6 +180,8 @@ When acting as Codex in this repository:
 - do not add heavy dependencies unless explicitly required
 - do not assume the Mac environment is equivalent to Linux runtime
 - do not assume dataset is available inside the repo
+- implement only the current phase in `CURRENT_PLAN.md` unless the user
+  explicitly authorizes a phase change
 
 If something is uncertain, make the smallest safe assumption and state it clearly.
 
@@ -176,6 +192,8 @@ If something is uncertain, make the smallest safe assumption and state it clearl
 After meaningful changes:
 
 - update `TASK_LOG.md`
+- update `CURRENT_PLAN.md` and `PROJECT_CONTEXT.md` when the plan or project
+  context changes
 - record what changed
 - record why it changed
 - record test result if any

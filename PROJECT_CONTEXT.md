@@ -13,6 +13,15 @@ Use that file to distinguish baseline code, simulation assets, dataset resources
 
 Phase 0, Phase 1, and Phase 2 are complete. Phase 3 is integration and validation, not serious optimization. Phase 4 is reserved for algorithm and ML optimization after the stack is stable.
 
+## Plan-Driven Workflow
+
+- `CURRENT_PLAN.md` is the active implementation contract for plan-driven task work.
+- If `CURRENT_PLAN.md` disagrees with older logs or context, `CURRENT_PLAN.md` wins.
+- Codex must only implement the current phase unless the user explicitly authorizes a phase change.
+- After each implementation run, update `TASK_LOG.md` and update `CURRENT_PLAN.md` / `PROJECT_CONTEXT.md` when relevant.
+- Current Task 1 hybrid grasp plan phase: Phase 0 baseline source lock.
+- Phase 0 selected source: `scripts/task1_dualarmik_phase_baseline.py`.
+
 Architecture:
 - Mac: development machine (coding, planning, lightweight testing)
 - Linux: runtime machine (simulation, evaluation, dataset, logs)

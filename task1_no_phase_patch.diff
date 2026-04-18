@@ -1,0 +1,294 @@
+*** Begin Patch
+*** Update File: scripts/task1_smooth_autoseed_multi_object_baseline.py
+@@
+-DEFAULT_PAUSE_STEPS = 30
++DEFAULT_PAUSE_STEPS = 10
+@@
+-DEFAULT_CONTINUOUS_CONTACT_DWELL_STEPS = 8
++DEFAULT_CONTINUOUS_CONTACT_DWELL_STEPS = 2
+@@
+ DEFAULT_PIVOT_ARC_FRAME_STEP_UPDATES = 1
+ DEFAULT_PIVOT_ARC_STREAM_SAMPLES = 48
++DEFAULT_STREAM_SAMPLES = 72
++DEFAULT_STREAM_FRAME_STEP_UPDATES = 1
+@@
+ def _distance(a: np.ndarray, b: np.ndarray) -> float:
+     return float(np.linalg.norm(a - b))
++
++
++def _quintic_blend(t: float) -> float:
++    t = float(np.clip(t, 0.0, 1.0))
++    return t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+@@
+ def _set_joint_positions_and_targets(
+     dc: Any,
+     selected_dofs: list[tuple[int, Any, str]],
+     target_positions: list[float],
+ ) -> None:
+-    for (_, dof, _), target in zip(selected_dofs, target_positions):
+-        if hasattr(dc, "set_dof_position"):
+-            dc.set_dof_position(dof, float(target))
+-        if hasattr(dc, "set_dof_position_target"):
+-            dc.set_dof_position_target(dof, float(target))
++    _send_position_targets(dc, selected_dofs, [float(target) for target in target_positions])
+@@
+-def _execute_streaming_body_segment(
++def _execute_streaming_body_segment(
+     *,
+@@
+     speed_profile: str,
+     gripper_dofs: list[tuple[int, Any, str]],
+     phase_log: list[dict[str, Any]],
+     extra_details: dict[str, Any],
++    event_marker: str | None = None,
++    contact_window: bool = False,
++    gripper_effort_value: float | None = None,
++    locked_dofs: list[tuple[int, Any, str]] | None = None,
++    locked_targets: dict[str, float] | None = None,
+ ) -> dict[str, Any]:
+@@
+-    trace: list[dict[str, Any]] = []
++    active_effort = gripper_effort_value
++    if active_effort is not None:
++        effort_before = _apply_gripper_effort(dc, gripper_dofs, active_effort)
++        if not effort_before["supported"]:
++            raise RuntimeError(f"Gripper effort command failed before {phase_name}: {effort_before}")
++    else:
++        effort_before = None
++
++    trace: list[dict[str, Any]] = []
+     for sample_index in range(samples):
+         t = (sample_index + 1) / float(samples)
+-        alpha = 3.0 * (t**2) - 2.0 * (t**3)
++        alpha = _quintic_blend(t)
+         target_joints = start_positions + alpha * (end_positions - start_positions)
+         _send_position_targets(dc, selected_dofs, [float(value) for value in target_joints])
+         for _ in range(frame_updates):
++            if locked_dofs is not None and locked_targets is not None:
++                _apply_locked_joint_targets(dc, locked_dofs, locked_targets)
++            if active_effort is not None:
++                effort_result = _apply_gripper_effort(dc, gripper_dofs, active_effort)
++                if not effort_result["supported"]:
++                    raise RuntimeError(f"Gripper effort command failed during {phase_name}: {effort_result}")
+             sim_app.update()
+             counter["step"] += 1
+@@
++    event_details = None
++    if event_marker is not None:
++        event_details, active_effort = _trigger_motion_event(
++            event_marker=event_marker,
++            dc=dc,
++            gripper_dofs=gripper_dofs,
++            sim_app=sim_app,
++            args=args,
++            counter=counter,
++            locked_dofs=locked_dofs,
++            locked_targets=locked_targets,
++        )
++
+     details = {
+@@
+         "micro_stop_frames": micro_stop_estimate["micro_stop_frames"],
+         "micro_stop_samples": micro_stop_estimate["micro_stop_samples"],
++        "event": event_details,
++        "contact_window": contact_window,
++        "gripper_effort_before_segment": effort_before,
+     }
+@@
+     return {
+         "actual_position": actual_position,
+         "position_error": position_error,
+         "trace": trace,
+         "condition_met": condition_met,
+         "details": details,
+         "micro_stop_estimate": micro_stop_estimate,
++        "event": event_details,
++        "active_effort": active_effort,
+     }
+@@
+ def _build_continuous_cycle_plan(
+@@
+ ) -> list[MotionSegment]:
+-    soft_hold_steps = 0 if args.smooth_motion else args.ik_hold_steps
+-    contact_hold_steps = args.continuous_contact_dwell_steps if args.smooth_motion else args.ik_hold_steps
+     soft_tolerance = args.continuous_soft_tolerance if args.smooth_motion else args.ik_stop_tolerance
++    hard_tolerance = args.ik_stop_tolerance
++    soft_samples = max(int(args.stream_samples), 1)
++    hard_samples = max(int(max(args.stream_samples // 2, 24)), 1)
++
++    def _stream_details(legacy_phase: str, endpoint_strategy: str, sample_count: int) -> dict[str, Any]:
++        return {
++            "legacy_phase": legacy_phase,
++            "streaming_segment": True,
++            "streaming_endpoint_strategy": endpoint_strategy,
++            "streaming_sample_count": int(sample_count),
++        }
++
+     segments = [
+         MotionSegment(
+             name="continuous_pregrasp",
+             phase_tag="approach",
+             target_position=pre_grasp_target,
+             waypoint_type="soft",
+-            speed_profile="transit_blended",
+-            max_ik_steps=args.ik_steps,
++            speed_profile="streaming_transit",
++            max_ik_steps=soft_samples,
+             stop_tolerance=soft_tolerance,
+-            hold_steps=soft_hold_steps,
++            hold_steps=0,
+             blend_radius=args.continuous_blend_radius,
+-            details={"legacy_phase": "move_to_pre_grasp_front"},
++            details=_stream_details("move_to_pre_grasp_front", "single_dls_endpoint", soft_samples),
+         ),
+     ]
+@@
+-                speed_profile="pre_contact_xy_alignment",
+-                max_ik_steps=args.ik_steps,
++                speed_profile="streaming_pre_contact_alignment",
++                max_ik_steps=hard_samples,
+                 stop_tolerance=soft_tolerance,
+-                hold_steps=soft_hold_steps,
++                hold_steps=0,
+                 blend_radius=args.continuous_blend_radius,
+-                details={"legacy_phase": "pre_contact_alignment"},
++                details=_stream_details("pre_contact_alignment", "single_dls_endpoint", hard_samples),
+             )
+         )
+@@
+-                speed_profile="slow_contact_approach",
+-                max_ik_steps=args.ik_steps,
+-                stop_tolerance=args.ik_stop_tolerance,
+-                hold_steps=contact_hold_steps,
++                speed_profile="streaming_contact_approach",
++                max_ik_steps=hard_samples,
++                stop_tolerance=hard_tolerance,
++                hold_steps=0,
+                 blend_radius=0.0,
+                 event_marker="close_gripper",
+                 contact_window=True,
+-                details={"legacy_phase": "descend_front"},
++                details=_stream_details("descend_front", "single_dls_endpoint", hard_samples),
+             ),
+@@
+-                speed_profile="slow_grasp_validation_lift",
+-                max_ik_steps=args.ik_steps,
+-                stop_tolerance=args.ik_stop_tolerance,
+-                hold_steps=contact_hold_steps,
++                speed_profile="streaming_lift",
++                max_ik_steps=hard_samples,
++                stop_tolerance=hard_tolerance,
++                hold_steps=0,
+                 blend_radius=0.0,
+                 contact_window=True,
+                 gripper_effort=args.gripper_hold_effort,
+-                details={"legacy_phase": "grasp_validation_and_lift_front"},
++                details=_stream_details("grasp_validation_and_lift_front", "single_dls_endpoint", hard_samples),
+             ),
+@@
+-                speed_profile="transit_blended_with_grip_effort",
+-                max_ik_steps=args.ik_steps,
++                speed_profile="streaming_carry",
++                max_ik_steps=soft_samples,
+                 stop_tolerance=soft_tolerance,
+-                hold_steps=soft_hold_steps,
++                hold_steps=0,
+                 blend_radius=args.continuous_blend_radius,
+                 gripper_effort=args.gripper_hold_effort,
+-                details={"legacy_phase": "move_to_bin_front"},
++                details=_stream_details("move_to_bin_front", "single_dls_endpoint", soft_samples),
+             ),
+@@
+-                speed_profile="slow_place_release",
+-                max_ik_steps=args.ik_steps,
+-                stop_tolerance=args.ik_stop_tolerance,
+-                hold_steps=contact_hold_steps,
++                speed_profile="streaming_place",
++                max_ik_steps=hard_samples,
++                stop_tolerance=hard_tolerance,
++                hold_steps=0,
+                 blend_radius=0.0,
+                 event_marker="open_gripper",
+                 contact_window=True,
+                 gripper_effort=args.gripper_hold_effort,
+-                details={"legacy_phase": "release"},
++                details=_stream_details("release", "single_dls_endpoint", hard_samples),
+             ),
+@@
+-                speed_profile="transit_blended_after_release",
+-                max_ik_steps=args.ik_steps,
++                speed_profile="streaming_retreat",
++                max_ik_steps=soft_samples,
+                 stop_tolerance=soft_tolerance,
+-                hold_steps=soft_hold_steps,
++                hold_steps=0,
+                 blend_radius=args.continuous_blend_radius,
+-                details={"legacy_phase": "retreat"},
++                details=_stream_details("retreat", "single_dls_endpoint", soft_samples),
+             ),
+         ]
+     )
+@@
+-            if segment.details.get("experimental_streaming_segment"):
++            if segment.details.get("streaming_segment"):
+                 metrics["snapshots"][f"before_{segment.name}"] = _bbox_state(stage, target_path)
+                 stream_result = _execute_streaming_body_segment(
+@@
+-                    sample_count=int(segment.details.get("streaming_sample_count", args.pivot_arc_stream_samples)),
+-                    frame_step_updates=args.pivot_arc_frame_step_updates,
++                    sample_count=int(segment.details.get("streaming_sample_count", args.stream_samples)),
++                    frame_step_updates=args.stream_frame_step_updates,
+                     endpoint_strategy=str(segment.details.get("streaming_endpoint_strategy", "single_dls_endpoint")),
+@@
+                     gripper_dofs=gripper_dofs,
+                     phase_log=phase_log,
+                     extra_details=segment.details,
++                    event_marker=segment.event_marker,
++                    contact_window=segment.contact_window,
++                    gripper_effort_value=active_effort if active_effort is not None else segment.gripper_effort,
++                    locked_dofs=segment.locked_dofs,
++                    locked_targets=segment.locked_targets,
+                 )
+                 metrics["micro_stop_frames"] += int(stream_result["micro_stop_estimate"]["micro_stop_frames"])
+                 metrics["micro_stop_samples"] += int(stream_result["micro_stop_estimate"]["micro_stop_samples"])
++                if stream_result.get("active_effort") is not None:
++                    active_effort = stream_result["active_effort"]
++                if segment.event_marker == "close_gripper":
++                    metrics["close_event_fired"] = bool(metrics["close_event_fired"] or stream_result.get("event"))
++                if segment.event_marker == "open_gripper":
++                    metrics["open_event_fired"] = bool(metrics["open_event_fired"] or stream_result.get("event"))
+                 metrics["snapshots"][f"after_{segment.name}"] = _bbox_state(stage, target_path)
+@@
+ def _smooth_pause_steps(args: argparse.Namespace, phase_name: str) -> int:
+     if not args.smooth_motion:
+         return args.pause_steps
+-    if phase_name in {"close_gripper", "grasp_validation", "release"}:
+-        return args.pause_steps
+-    return args.smooth_non_contact_pause_steps
++    return 0
+@@
+ def _smooth_ik_hold_steps(args: argparse.Namespace, phase_name: str) -> int:
+     if not args.smooth_motion:
+         return args.ik_hold_steps
+-    if phase_name == "grasp_validation":
+-        return args.ik_hold_steps
+-    return args.smooth_ik_hold_steps
++    return 0
+@@
+     parser.add_argument("--pivot-arc-close-distance-m", type=float, default=DEFAULT_PIVOT_ARC_CLOSE_DISTANCE)
+     parser.add_argument("--pivot-arc-frame-step-updates", type=int, default=DEFAULT_PIVOT_ARC_FRAME_STEP_UPDATES)
+     parser.add_argument("--pivot-arc-stream-samples", type=int, default=DEFAULT_PIVOT_ARC_STREAM_SAMPLES)
++    parser.add_argument("--stream-samples", type=int, default=DEFAULT_STREAM_SAMPLES)
++    parser.add_argument("--stream-frame-step-updates", type=int, default=DEFAULT_STREAM_FRAME_STEP_UPDATES)
+@@
+     if args.pivot_arc_stream_samples < 1:
+         raise RuntimeError("--pivot-arc-stream-samples must be positive")
++    if args.stream_samples < 1 or args.stream_frame_step_updates < 1:
++        raise RuntimeError("--stream-samples and --stream-frame-step-updates must be positive")
+@@
+             "continuous_contact_dwell_steps": args.continuous_contact_dwell_steps,
+             "micro_stop_speed_threshold": args.micro_stop_speed_threshold,
++            "stream_samples": args.stream_samples,
++            "stream_frame_step_updates": args.stream_frame_step_updates,
+         },
+*** End Patch

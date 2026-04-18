@@ -226,3 +226,621 @@
 - New diagnostic print/payload fields record object center, bbox top z, pregrasp target, robot base position, forward/lateral offsets, horizontal reach, vertical reach, table clearance, and full base-to-pregrasp distance
 - Lightweight test result: python3 -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
 - Runtime limitation: no Isaac runtime was run on Mac; seed=1 target-index=2 numeric geometry still needs a Linux diagnostic run or the referenced LOG_ROOT artifacts
+- Added arm-aware greedy pregrasp candidate selection to scripts/task1_smooth_autoseed_multi_object_baseline.py, limited to pregrasp generation/approach selection while preserving the existing continuous descend, grasp, lift, carry, place, and release segment logic
+- Active arm is selected from object Y relative to robot base Y, with a one-time fallback to the opposite arm only if all pregrasp candidates miss the pre_grasp_ee_tolerance
+- Added --pregrasp-pullback-m and --pregrasp-max-bias-m, deterministic center/pullback/Z-offset candidates capped at 6, Z clamping to workspace limits, and structured per-candidate logs for active_arm, pregrasp_before_bias, pregrasp_after_bias, pullback_applied, base_to_target_xy, error_vector, error_norm, candidate_index, and fallback_triggered
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Runtime limitation: no Isaac runtime was run in this edit pass; next Linux check should rerun seed=1 target-index=2 with default pullback and then with a small --pregrasp-pullback-m sweep if candidate logs still miss tolerance
+- Added scripts/watch_task1_gui.sh as a minimal Isaac GUI launcher for the current Task 1 seed=1 target-index=2 inspection case; it does not modify baseline logic and uses ISAAC_SIM_PYTHON or ISAAC_SIM_ROOT instead of hardcoded machine paths
+- The helper defaults to --pregrasp-pullback-m 0.02, --grasp-depth-offset -0.020, --gui, and --hold-open so the Linux runtime can visually inspect the current contact/depth behavior; SEED, TARGET_INDEX, PREGRASP_PULLBACK_M, GRASP_DEPTH_OFFSET, and LOG_SUFFIX are environment overrides
+- Fixed the Task 1 smooth baseline descend geometry so grasp/contact XY is derived from the selected reachable pregrasp candidate instead of rebuilding from the raw bbox center after candidate selection
+- Split pre-contact motion into continuous_grasp_align, a soft XY alignment at pregrasp height, followed by continuous_grasp_depth, a hard final Z-only descend with close_gripper still attached only to that final vertical segment
+- Added a small configurable wrist-to-pinch contact offset model via --grasp-contact-offset-x/--grasp-contact-offset-y and debug logs/markers for selected pregrasp target, grasp contact target, object center, XY contact delta, final-descend vertical-only status, and close trigger position
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Added an experimental pivot-centered grasp mode to scripts/task1_smooth_autoseed_multi_object_baseline.py behind --experimental-pivot-arc-grasp while leaving the current baseline path as the default/fallback
+- Experimental mode uses the selected arm's wrist_pitch_link as the control pivot, drives a pivot anchor with shoulder_pitch/shoulder_roll/shoulder_yaw/elbow_roll, then drives a short lower-chain wrist_roll arc with elbow_yaw/wrist_pitch/wrist_roll; close_gripper is gated by an estimated pinch-center-to-object distance instead of a vague phase trigger
+- Added sweepable experimental knobs: --pivot-to-pinch-distance-m, --pivot-anchor-height-offset-m, --pivot-anchor-forward-offset-m, --pivot-anchor-lateral-offset-m, --pivot-arc-contact-tolerance-m, --pivot-arc-max-steps, and --pivot-arc-close-distance-m
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Runtime validation: seed=1 target-index=2 --pregrasp-pullback-m 0.02 --experimental-pivot-arc-grasp built and executed the experimental plan without fallback, selected R_wrist_pitch_link as pivot, passed Stage A, started Stage B, and satisfied the close distance gate with estimated pinch_center_to_object_distance approximately 0.03865 m
+- Runtime result: the experimental run failed later at post_close_verify with failure_reason=object_not_lifted; geometry metrics classify the estimated pinch center as nearer the finger gap than the wrist, but no GUI visual confirmation was made in this run, so this is not a claimed grasp success
+- Runtime artifact: LOG_ROOT/task1_smooth_autoseed_multi_object_baseline_20260415T074513Z_experimental_pivot_arc_seed1_target2_pb0p02.log
+- Reworked the experimental pivot-arc runtime path so Stage B is no longer two separate blocking IK segments after the pivot anchor
+- After experimental_pivot_anchor succeeds, the executor now captures the current upper-chain joint targets plus the pivot reference position, then continuously reapplies those upper-chain targets during every lower-chain arc IK update and during the close dwell
+- Replaced experimental_pinch_arc_mid and experimental_pinch_contact with one experimental_locked_lower_chain_arc segment that follows parameterized arc waypoints with only elbow_yaw/wrist_pitch/wrist_roll commanded
+- Added pivot-lock proof logs for upper_chain_locked_targets, upper_chain_lock_active, pivot_reference_position, pivot_position_after_anchor, pivot_position_during_arc_start/end, pivot_drift_per_waypoint, pivot_drift_norm_max/mean/final, and close_condition_satisfied_before_close
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Runtime limitation: no Isaac GUI/runtime validation was run for this patch yet; next validation should run seed=1 target-index=2 --pregrasp-pullback-m 0.02 --experimental-pivot-arc-grasp and inspect pivot drift plus GUI smoothness
+- Narrowed the experimental locked-pivot arc runtime to reduce jerk: the lower-chain arc now performs one pre-stream endpoint estimate, then streams smooth lower-chain joint interpolation samples while continuously reapplying the upper-chain lock
+- Added --pivot-arc-frame-step-updates with default 1 so the experimental arc no longer uses the normal ik_settle_steps behavior inside every arc sample
+- Added proof metrics for upper_chain_joint_error_per_step, upper_chain_joint_error_max_during_arc, upper_chain_joint_error_mean_during_arc, and real arc micro_stop_frames/micro_stop_samples computed from the observed arc trace
+- Cleaned lock-state log semantics: anchor logs upper_chain_lock_captured=true and upper_chain_lock_active_during_anchor=false, while the arc logs upper_chain_lock_active_during_arc=true
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Runtime limitation: no Isaac GUI/runtime validation was run for this smoothing patch yet; next validation should compare GUI stop/go behavior and inspect upper-chain joint error plus pivot drift in the log
+- Unified the experimental pivot-arc runtime control style further: experimental continuous_pregrasp and experimental_pivot_anchor now use streaming joint interpolation instead of move_end_effector_to_target blocking IK
+- continuous_pregrasp is a streaming hold because candidate selection has already positioned the arm at the selected pregrasp; experimental_pivot_anchor uses a deterministic upper-chain endpoint heuristic and streams shoulder/elbow targets over denser samples
+- Removed the remaining finite-difference endpoint estimate from the locked lower-chain arc runtime path; Stage B now uses a deterministic lower-chain endpoint heuristic plus smooth streamed lower-joint interpolation
+- Added --pivot-arc-stream-samples with default 48 and kept --pivot-arc-frame-step-updates default 1 so the experimental branch uses smaller streamed increments across pregrasp, pivot anchor, and lower-chain arc
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Runtime limitation: no Isaac GUI/runtime validation was run for this unified streaming patch yet; next GUI check should verify whether pregrasp, pivot anchor, and lower-chain arc now look consistently smooth
+- Converted the Task 1 smooth manipulation runtime further toward competition-style streaming control: startup joint setup now sends position targets only, and the script no longer calls set_dof_position or move_end_effector_to_target in the smooth runtime path
+- Default smooth pauses and holds are now zero, contact dwell is reduced to 2 steps, generic/pivot stream samples default to 80, and the stream frame-step defaults remain 1 so target updates do not become mini-settle blocks
+- Replaced cubic smoothstep interpolation with a shared quintic minimum-jerk blend for streamed body segments and the locked lower-chain arc; the continuous-cycle executor now routes ordinary pregrasp, descend, lift, carry, place, and retreat through dense streaming target updates
+- Preserved pivot/lock diagnostics for pivot_drift_norm_max/mean/final, upper_chain_joint_error_max/mean/final during arc, and micro_stop_frames/micro_stop_samples while adding explicit streaming_controller/no_blocking_ik/sample-count/frame-step metadata
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Runtime limitation: no Isaac GUI/runtime validation was run for this runtime-motion patch; next Linux GUI run should inspect visible stop/go reduction and compare pivot drift plus micro-stop metrics
+- Fixed the GUI startup pose issue in scripts/task1_smooth_autoseed_multi_object_baseline.py: the robot is now seeded once from the official baseline startup joint map before manipulation begins, matching the Ubtech_sim/source/RobotArticulation.py initialization behavior instead of starting motion from the default stand pose
+- The direct set_dof_position call is isolated to this initialization-only seed; normal smooth manipulation runtime remains target-streamed through set_dof_position_target and does not use blocking IK or runtime joint teleport forcing
+- Reduced the post-startup target sync window from 600 steps to 5 steps because the initial joint state is now seeded directly before the streamed controller path begins
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Linux GUI validation with ISAAC_SIM_PYTHON=/home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/watch_task1_gui.sh passed the previous articulation/startup blocker: apply_official_startup_pose condition_met=true, initialization_seed_supported=true, and max_joint_error was approximately 0.00030 rad
+- The same GUI run continued into streamed manipulation with streaming_controller=true/no_blocking_ik=true/stream_samples=80 and then failed later at descend_failed because the end effector remained approximately 0.276 m from the target before close; this is a grasp geometry/reach issue, not the startup-load failure
+- Runtime artifact: LOG_ROOT/task1_smooth_autoseed_multi_object_baseline_20260415T095431Z_gui_watch_seed1_target2_depth_watch.log
+- Tuned only the experimental pivot reach heuristics in scripts/task1_smooth_autoseed_multi_object_baseline.py while keeping the streaming controller, quintic interpolation, upper-chain lock, and locked-pivot arc structure unchanged
+- _heuristic_upper_chain_anchor_endpoint now drives shoulder_pitch and elbow_roll more aggressively toward the forward target error, with slightly stronger shoulder roll/yaw lateral compensation
+- _heuristic_lower_chain_arc_endpoint now permits a larger lower-chain endpoint cap and stronger wrist_pitch forward/depth response for a deeper approach
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- GUI validation note: the default scripts/watch_task1_gui.sh run does not enable --experimental-pivot-arc-grasp, so it did not exercise these heuristic functions and still failed at descend_failed with the previous approximately 0.276 m pre-close distance
+- GUI validation with scripts/watch_task1_gui.sh --experimental-pivot-arc-grasp exercised experimental_pivot_anchor and experimental_locked_lower_chain_arc with streaming_controller=true/no_blocking_ik=true/stream_samples=80; the pre-close distance improved to approximately 0.210 m but still failed descend_failed
+- Experimental pivot diagnostics from that run remained stable: pivot_drift_norm_max approximately 0.000080 m, pivot_drift_norm_mean approximately 0.000044 m, upper_chain_joint_error_max_during_arc approximately 0.000147 rad, and upper_chain_joint_error_mean_during_arc approximately 0.000116 rad
+- Runtime artifact: LOG_ROOT/task1_smooth_autoseed_multi_object_baseline_20260415T100234Z_gui_watch_seed1_target2_depth_watch.log
+- Reviewed the smooth streaming motion path and found the ordinary continuous cycle still assigned single_dls_endpoint to every conceptual segment, causing _execute_streaming_body_segment to run finite-difference endpoint trials before each streamed phase
+- Replaced ordinary main-cycle single_dls_endpoint usage with a global_precomputed_joint_waypoint stream: the cycle now precomputes lightweight heuristic joint waypoints for the full pregrasp/align/descend/lift/carry/place/retreat chain once, then streams across them with one global quintic progress variable
+- Added diagnostics for endpoint_rebuilds_during_cycle=0, finite_difference_jacobian_calls_during_cycle=0, single_global_stream_cycle=true, and global_quintic_minimum_jerk_over_precomputed_joint_waypoints
+- Left _estimate_unlocked_stream_endpoint available for pregrasp candidate probing/fallback-style paths, but removed it from normal cycle segments and changed experimental post-arc transit segments to main_cycle_heuristic_endpoint instead of single_dls_endpoint
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Patched the remaining smooth-path jerk source in scripts/task1_smooth_autoseed_multi_object_baseline.py: the global precomputed cycle no longer piecewise-linearly blends between joint waypoints, and now samples a cubic Hermite joint chain with minmod tangents under the existing global quintic time warp
+- Changed main-cycle waypoint generation from cumulative heuristic deltas to absolute target-relative endpoints from the cycle start, reducing accumulated heuristic drift and transport/approach overshoot
+- Replaced unsigned world-XY forward heuristics with signed robot-base-frame forward/lateral components, active-arm mirroring, inward-lateral attenuation, and a rearward-motion guard in the upper-chain anchor, lower-chain arc, and main-cycle endpoint heuristics
+- Preserved the target-only streaming controller, no blocking IK in the main smooth cycle, upper-chain lock diagnostics, pivot drift diagnostics, and micro-stop metrics while updating logs to report the cubic-Hermite global stream and absolute waypoint policy
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Tightened the experimental locked-arc close gate so close_gripper now requires pinch distance, wrist-to-object distance, and vertical wrist/object proximity, with a hard block when the wrist is more than 5 cm above the object contact z
+- Routed continuous_prebin, continuous_place_depth, and continuous_retreat through direct_cartesian_target endpoint estimation followed by the existing streamed target interpolation, so post-grasp transport is no longer limited to the lightweight heuristic endpoint
+- Disabled carry stabilization dwell as a non-contact pause source in both continuous executors; release/open dwell remains event-only and close/open event behavior is preserved
+- Added cartesian-distance scaling to _heuristic_main_cycle_endpoint_delta so small target deltas generate proportionally smaller joint deltas and overshoot is reduced
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Added an explicit grasp-geometry layer to scripts/task1_smooth_autoseed_multi_object_baseline.py using the baseline-style planner only as a geometry reference: object targets are converted to signed robot-base components, a grasp frame is built from reach direction plus world-down, and local TCP offset is transformed into an absolute world contact target
+- Refactored _grasp_contact_geometry to emit pregrasp_target_world, contact_target_world, lift_target_world, contact_z_world, R_grasp_world, tcp_offset_local, and tcp_offset_world; pregrasp/contact/lift targets now come from absolute grasp geometry instead of selected-pregrasp XY plus weak offsets
+- Tightened the experimental locked lower-chain close gate to require pinch distance, wrist distance, and wrist/contact-Z alignment, with contact_z/wrist_z/pinch_dist/wrist_dist/z_error/close_gate_passed logged per close check
+- Renamed the post-grasp transport endpoint strategy for continuous_prebin, continuous_place_depth, and continuous_retreat to absolute_cartesian_target; it still performs a single endpoint estimate before streamed quintic target execution and does not introduce a per-frame IK loop
+- Lightweight test result: python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed
+- Stabilized the default Task 1 path for phase-by-phase debugging: the normal cycle now labels approach/grasp/lift segments as main_cycle_heuristic_endpoint and keeps absolute_cartesian_target only for carry/place/retreat, so the logged endpoint strategy matches the executor actually used by the mixed default plan
+- Left experimental_pivot_arc_grasp and locked lower-chain arc logic opt-in only behind --experimental-pivot-arc-grasp; default logs now report stable_phase_logged_streaming_cycle_with_absolute_transport_endpoint_targets instead of the old global-precomputed policy label
+- Static sanity check result: python AST/symtable scan reported undefined_global_count=0, python -m py_compile scripts/task1_smooth_autoseed_multi_object_baseline.py passed, and python scripts/task1_smooth_autoseed_multi_object_baseline.py --help loaded successfully
+- Added scripts/task1_cartesian_dls_phase_baseline.py as a new isolated Task 1 baseline that abandons the old heuristic reach default path and uses measured Isaac 3D Cartesian DLS phases
+- The new script keeps official SceneBuilder setup, official startup pose loading, target selection, gripper commands, grasp geometry planning, phase diagnostics, and final bin/stability checks while leaving scripts/task1_smooth_autoseed_multi_object_baseline.py untouched
+- Pregrasp candidate evaluation now restores the arm to a saved reference joint state before each candidate trial and after each trial, and logs the candidate start EE/joint state so failed trials do not contaminate the next candidate
+- Failure naming is separated for close_gripper_failed, object_not_lifted, place_failed, release_failed, and object_outside_bin
+- Lightweight test result: python -m py_compile scripts/task1_cartesian_dls_phase_baseline.py passed
+- Runtime limitation: no Isaac GUI/runtime validation has been run for the new Cartesian DLS phase baseline yet; first validation should use seed=1 target-index=2 with --gui --hold-open and inspect the per-phase DLS diagnostics
+- Fixed robot prim path selection in scripts/task1_cartesian_dls_phase_baseline.py so the default no longer treats /Root/Ref_Xform/Ref as source of truth; after scene.build_robot it validates scene.robot_prim_path, then stage-detected articulation roots, then optional --prim-path, and finally the hardcoded official path only if valid
+- Added path-selection diagnostics for scene.robot_prim_path, detected articulation roots, chosen robot prim path, fallback status, and selection attempts; lightweight test result: python -m py_compile scripts/task1_cartesian_dls_phase_baseline.py passed
+- Restored /Root stage parent creation immediately after _create_minimal_scene in scripts/task1_cartesian_dls_phase_baseline.py because organizer SceneBuilder composes table/parts/robot under that parent even though /Root/Ref_Xform/Ref is not safe as a robot path source of truth
+- Added early stage_debug root/world validity prints and before/after scene_build_debug prints around build_table, build_parts, and build_robot; lightweight test result: python -m py_compile scripts/task1_cartesian_dls_phase_baseline.py passed
+- Patched scripts/task1_dualarmik_phase_baseline.py after first DualArmIK runtime failure at pregrasp_candidate_failed: log writing now recursively converts numpy arrays/scalars before json.dumps, pregrasp candidate diagnostics now distinguish no-solution IK from solution-exceeded-tolerance, and temporary debug gates/CLI fixed-RPY overrides were added without changing TCP fallback or reverting to DLS
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed; runtime validation still needs Linux Isaac run with seed=1 target-index=2
+- Patched scripts/task1_dualarmik_phase_baseline.py after definitive all_candidates_dualarmik_no_solution diagnostics: pregrasp selection now searches an explicit fixed orientation preset library per arm, builds each preset target with preset-derived approach/up axes, and logs per-preset no-solution summaries while preserving the derived orientation path as reference-only diagnostics
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed, and python scripts/task1_dualarmik_phase_baseline.py --help loaded the debug/pregrasp CLI flags successfully; runtime validation still needs a Linux Isaac run
+- Expanded scripts/task1_dualarmik_phase_baseline.py for the confirmed all_candidates_dualarmik_no_solution pregrasp failure: default IK rotation tolerance is now 0.08, phase rotation tolerance is now 0.15, IK nullspace weight is forced to 0.0 for this debug stage, each arm now searches 20 fixed orientation presets including roll-based families, and pregrasp candidates now include lateral_positive, lateral_negative, and higher_farther variants
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed, and python scripts/task1_dualarmik_phase_baseline.py --help exposes the expanded candidate/debug flags; runtime validation still needs Linux Isaac logs to identify which preset family is reachable
+- Patched scripts/task1_dualarmik_phase_baseline.py candidate classification so official DualArmIK internal ok=False is no longer treated as automatic no-solution: candidate solves now use separate reachability settings max_iter=140, pos_tol=0.02, rot_tol=0.20, null_weight=0.0, classify finite returned poses as catastrophic_no_solution, solved_but_not_internal_ok, candidate_error_exceeded_tolerance, or valid_candidate, and can choose a guarded forced best-effort candidate only within 0.10 m / 0.30 rad
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed, and python scripts/task1_dualarmik_phase_baseline.py --help exposes the candidate IK knobs; runtime validation still needs Linux Isaac logs to see whether failures are truly catastrophic or just internal non-convergence
+- Stabilized scripts/task1_dualarmik_phase_baseline.py after runtime showed bizarre reachable arm postures: removed forced best-effort pregrasp promotion, reduced orientation search to two top-down presets per arm, reduced pregrasp candidates to nominal/slightly_higher/slightly_farther, removed the lateral candidate CLI knob, and tightened candidate IK reachability defaults to max_iter=120, pos_tol=0.015, rot_tol=0.12 with strict candidate success required
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed, and python scripts/task1_dualarmik_phase_baseline.py --help no longer exposes --candidate-lateral-offset; runtime validation still needs Linux Isaac logs to confirm posture quality
+- Patched scripts/task1_dualarmik_phase_baseline.py after runtime showed both sixforce FK-vs-Isaac frame diffs at approximately 0.2200 m: audited the organizer CoordinateTransform path and added a startup frame-alignment selector that compares raw torso_link anchoring against the official compensation matrix variants from Ubtech_sim/main.py, selects the lowest sixforce alignment residual before grasp planning, and logs torso_prim_path, selected transform origin/rotation, and per-arm FK-vs-Isaac residuals after sync
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed, and python scripts/task1_dualarmik_phase_baseline.py --help still loads; runtime validation should first confirm ee_alignment_diagnostics_after_fix drops from the previous approximately 0.2200 m before further reach tuning
+- Patched scripts/task1_dualarmik_phase_baseline.py after runtime showed the torso-compensation selector still chose official_coordinate_utils_from_torso_link_uncompensated with approximately 0.2200 m sixforce residuals on both arms: added full SE3 FK-vs-Isaac EE delta diagnostics, root-cause classification for fixed EE offset vs URDF/USD/link mismatch vs remaining torso/root mismatch, and a conditional EE-frame compensation layer that only activates when left/right local FK-to-Isaac deltas are near-constant
+- The DualArmIK target path now keeps desired targets in the physical Isaac EE frame for logs/gates, converts to Pinocchio targets with target * inverse(EE_delta) only when compensation is active, and reports current FK as Pinocchio FK * EE_delta for candidate/servo error checks; orientation presets, candidate list, approach axis, TCP fallback, and servo architecture were not changed
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed, and python scripts/task1_dualarmik_phase_baseline.py --help loaded successfully; next Linux Isaac run should inspect robot.ee_frame_delta_diagnostics.comparison.root_cause_classification and expect compensated ee_alignment_diagnostics_after_fix.max_diff_m to drop to centimeter scale only if the mismatch is classified as fixed_ee_frame_offset_mismatch
+- Promoted the tilted topdown orientation family in scripts/task1_dualarmik_phase_baseline.py after controlled Isaac sweeps showed pitch=2.80 reduced align error when selected: right_topdown_tilted_forward and left_topdown_tilted_forward are now first in the deterministic preset tables, with the previous topdown_forward and topdown_inward presets kept as fallbacks
+- Slightly improved selected-orientation logging by adding selected_orientation_preset_label and selected_orientation_preset_rpy to the select_pregrasp_candidate phase details and top-level payload; approach-axis logic, TCP fallback, EE-frame compensation, candidate list, servo backend, and state machine were not changed
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed, and python scripts/task1_dualarmik_phase_baseline.py --help loaded successfully; next Linux Isaac validation should rerun seed=1 target-index=2 with --arm right --approach-axis-mode pos_z and confirm the selected preset is right_topdown_tilted_forward before evaluating align/descend errors
+- Checked scripts/task1_dualarmik_phase_baseline.py after an interrupted region-based grasp-family patch and repaired the incomplete wiring: removed duplicate selected-region payload assignments, kept target-mode default at contact_axis, reused one orientation preset library object in the plan log, and made servo_descend lock the selected orientation preset RPY instead of hardcoding the old vertical claw RPY
+- The DualArmIK preset library is now split into right/left vertical and horizontal families, target regions are classified from forward_base with defaults near_body < 0.28, mid 0.28-0.42, far >= 0.42, and candidate selection receives only the ordered family list for that region
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed, python scripts/task1_dualarmik_phase_baseline.py --help loaded and exposes --horizontal-far-threshold / --near-body-threshold; runtime limitation: no Linux Isaac simulation validation was run for this patch yet
+- Updated scripts/task1_dualarmik_phase_baseline.py from misleading vertical/horizontal preset families to approach-direction families: z_approach keeps the existing top-down presets, and world_y_approach is a small first-test calibration set for world-Y-style approach behavior
+- Region policy now uses far >= 0.42 -> world_y_approach, near_body < 0.28 -> z_approach then world_y_approach, and mid -> z_approach; --far-threshold is the primary CLI name while --horizontal-far-threshold remains as a compatibility alias
+- Added preset axis diagnostics to orientation records and candidate logs: approach_axis_base, approach_axis_world, dot_with_world_pos_y, and dot_with_world_neg_y, plus selected preset world-axis fields in top-level payload and descend phase details
+- Preserved the existing DualArmIK candidate validation and servo_descend selected-RPY preservation; no Linux Isaac GUI/runtime validation was run, so world_y_approach RPY candidates remain calibration-oriented and must be verified visually/logged in Isaac
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed; python scripts/task1_dualarmik_phase_baseline.py --help exposes --far-threshold / --near-body-threshold; a helper check confirmed 0.27 -> near_body, 0.28/0.419 -> mid, and 0.42 -> far
+- Updated scripts/task1_dualarmik_phase_baseline.py from approach-family-only planning to explicit world-space AB motion semantics, where point A is the DualArmIK physical EE/sixforce origin and point B is a fingertip/contact proxy computed as point A plus a selected local offset transformed into world space
+- FAR targets now use a far_low_side_B_driven policy: prepare point B low near object/contact Z with AB table-parallel/world-Y-oriented, then advance point B to the object contact before close/lift; MID targets use mid_vertical_Z_descend, aligning point B over object WORLD XY and descending along WORLD Z while preserving the selected vertical AB orientation
+- Added AB diagnostics and debug targets for point A, point B, contact B, low-side prepare B, selected motion policy, AB axis world, AB table-parallel/vertical scores, point-B pre-close error, and stop-after-lift completion; default runtime now stops after lift unless --continue-after-lift is provided
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed; python scripts/task1_dualarmik_phase_baseline.py --help exposes --far-low-side-clearance, --point-b-offset-local, and --continue-after-lift; a helper geometry check confirmed z_approach yields AB along world Z and world_y_approach candidates yield AB along world +/-Y under identity base/world rotation
+- Runtime limitation: no Linux Isaac GUI/runtime validation was run for the AB motion-semantics patch; next validation should inspect whether the point-B proxy matches the actual finger mesh and whether far low-side approach visually advances from the intended world-Y side
+- Patched scripts/task1_dualarmik_phase_baseline.py after far-region runtime reached region/family selection but failed pregrasp candidate strict acceptance: far candidate validation now uses region-specific acceptance tolerances of 0.07 m position and 0.28 rad rotation, with CLI overrides --far-candidate-position-tolerance and --far-candidate-rotation-tolerance
+- Kept region thresholds, phase machine, EE-frame compensation, and far/mid motion policy unchanged; the relaxed values apply only inside _evaluate_pregrasp_candidates for target_region=far, while mid and near_body continue to use the existing pregrasp/rotation tolerance gate unless debug-pregrasp overrides are supplied
+- Added flattened-candidate diagnostics for best_position_error_candidate, best_rotation_error_candidate, best_combined_error_candidate, per-candidate gate margins/excess, combined normalized gate error, dualarmik_success/internal_ok, and the tolerance source policy so far failures can distinguish a too-strict gate from wrong world-Y/Point-B geometry
+- Lightweight test result: python -m py_compile scripts/task1_dualarmik_phase_baseline.py passed; python scripts/task1_dualarmik_phase_baseline.py --help exposes the far candidate tolerance knobs; helper check confirmed far -> 0.07/0.28 and mid/near_body -> existing 0.045/0.15 candidate acceptance defaults
+- Runtime limitation: no Linux Isaac GUI/runtime validation was run for this tolerance/diagnostics patch; next far run should inspect select_pregrasp_candidate.best_*_candidate and candidate gate margin fields before changing presets or geometry
+- Corrected scripts/task1_dualarmik_phase_baseline.py FAR world_y_approach preset definitions after runtime diagnostics showed the old family produced best-candidate approach_axis_world approximately world +X instead of world +/-Y
+- Replaced the old roll-only / yaw-pi world_y_approach candidates with yaw-quarter-turn candidates for both arms, moving the local +Z/AB approach axis to base +/-X so the observed robot/world transform maps it to world +/-Y
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 1 --target-index 2 --log-suffix far_world_y_correction_test
+- Runtime result: target_region=far, approach_family_order=[world_y_approach], selected_approach_family=world_y_approach, selected_orientation_preset_label=right_world_y_approach_pos_y_yaw_plus_quarter, selected_orientation_preset_approach_axis_world approximately [0.0000069, 0.999999999, -0.0000527]
+- Best FAR candidate diagnostics after correction all pointed to world +Y: best_position_error_candidate, best_rotation_error_candidate, and best_combined_error_candidate approach_axis_world were approximately [0.0000069, 0.999999999, -0.0000527], with candidate selection succeeding before the run later failed at far_prepare_low_side_approach
+- Lightweight/static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help; no second preset correction pass was needed
+
+
+- Augmented scripts/task1_dualarmik_phase_baseline.py FAR world_y_approach presets with deterministic AB-axis roll variants: each corrected world-Y base preset now expands to +90 deg, -90 deg, and reference rolls generated by post-multiplying the preset rotation about local +Z/AB before converting back to Euler XYZ
+- Added FAR axial-roll diagnostics to preset/candidate/phase logs, including preset_axial_roll_variant_label, preset_axial_roll_about_ab_rad, AB_axis_world, far_low_side_prepare_B_world, and contact_point_B_world while preserving region thresholds, candidate gate, EE-frame compensation, and phase order
+- Lowered FAR low-side point-B geometry: DEFAULT_FAR_LOW_SIDE_CLEARANCE changed from 0.03 m to 0.002 m, added --far-low-side-gap-above-support default 0.002 m, and FAR contact B now uses object/table support Z plus that gap instead of the top-down object-top contact Z
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 1 --target-index 2 --log-suffix far_ab_roll_height_test
+- Runtime result: target_region=far, approach_family_order=[world_y_approach], preset_count=12, selected_orientation_preset_label=right_world_y_approach_pos_y_yaw_plus_quarter_ab_roll_minus_quarter_palm_down_test, selected axial roll=-1.5707963267948966 rad, and selected approach_axis_world/AB_axis_world remained approximately [0.0000069, 0.999999999, -0.0000527]
+- Candidate selection still passed after the roll/height patch; FAR B geometry was lowered from the old top-down reference contact_z_world approximately 1.08369 m to contact_point_B_world z approximately 1.01082 m, with far_low_side_prepare_B_world z approximately 1.01282 m
+- Runtime still failed at far_prepare_low_side_approach with final_error approximately 0.05639 m versus pregrasp_tolerance 0.045 m; this is improved from the previous far_world_y_correction_test pregrasp final_error approximately 0.07119 m, but GUI verification is still needed to confirm whether the selected -90 deg axial roll visually rotates the palm/fingers in the desired direction
+
+
+- Refined scripts/task1_dualarmik_phase_baseline.py FAR-only A/B contact geometry after GUI showed the world-Y side approach and palm roll were close but point B still stopped short while point A/wrist was too low
+- Added explicit FAR knobs: --far-point-b-forward-extension default 0.012 m extends the B contact target along the current horizontalized FAR reach axis; --far-point-a-extra-height-clearance default 0.018 m offsets the point-B proxy so point A sits higher while B stays low; --far-point-b-gap-above-support default 0.002 m keeps B targeted 2 mm above the support plane
+- Preserved region thresholds, far/mid policy split, world_y approach direction logic, EE-frame compensation, candidate gates, phase order, and MID z_approach behavior; logging now carries the adjusted point-B local offset, FAR reach axis, point-A clearance, point-B extension/gap, selected/contact point A/B targets, and pre-close point-B error
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 1 --target-index 2 --log-suffix far_ab_geometry_refine_test
+- Runtime result: target_region=far, selected_motion_policy=far_low_side_B_driven, selected_orientation_preset_label=right_world_y_approach_pos_y_yaw_plus_quarter_ab_roll_minus_quarter_palm_down_test, selected approach_axis_world remained approximately [0.0000069, 0.999999999, -0.0000527], candidate selection still passed, far_prepare_low_side_approach now passed with final_error approximately 0.04452 m, and execution reached close_gripper/micro_lift_probe before failing object_not_lifted
+- Runtime diagnostics showed contact_point_B_world z approximately 1.01082 m, object_support_z approximately 1.00882 m, point A target z approximately 1.02883 m, but actual_point_B_world_before_close remained approximately 0.05854 m from target; next FAR iteration should focus on why the servo/IK pose does not bring the physical B proxy fully to the target before close rather than changing region or approach-family logic
+
+
+- Refined scripts/task1_dualarmik_phase_baseline.py FAR posture after GUI showed the world-Y approach was basically correct but the wrist/point A needed to clear table clutter while point B stayed low near the support plane
+- Added --far-ab-downward-slant-deg default 25.0 and now derive the FAR point-A/point-B height separation from the requested slant using the base point-B horizontal span, while preserving --far-point-a-extra-height-clearance default 0.018 m as a lower bound; in the validation run the applied A/B height separation was approximately 0.07228 m and the logged AB downward slant was approximately 25.00 deg
+- Kept point B low with --far-point-b-gap-above-support default 0.002 m and kept the existing --far-point-b-forward-extension default 0.012 m; region thresholds, far/mid policy split, world_y approach presets, candidate gate, EE-frame compensation, phase order, and MID z_approach behavior were not changed
+- Added nearest-object-first target selection with --target-selection-policy nearest as the default and --target-selection-policy index as a compatibility override; nearest ranking uses the smallest robot-base forward_base, then abs(lateral_base), then Euclidean world distance, and logs all candidate object records plus the selected nearness metric/reason
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 1 --log-suffix far_slant_nearest_test
+- Runtime result: nearest policy selected /Replicator/Ref_Xform_02 at target_index=1 with forward_base approximately 0.53655, target_region=far, selected world_y approach_axis_world remained approximately [0.0000069, 0.999999999, -0.0000527], candidate selection passed, far_prepare_low_side_approach passed with final_error approximately 0.03155 m, and far_reach_B_to_object passed with final_error approximately 0.03431 m
+- Pre-close diagnostics on that run showed target point A z approximately 1.07442 m, target point B z approximately 1.00214 m, actual point B error before close approximately 0.03587 m, then close_gripper completed but micro_lift_probe failed with object_not_lifted; next work should stay focused on grasp capture/contact, not region selection or world-Y approach direction
+
+
+- Refined scripts/task1_dualarmik_phase_baseline.py FAR final contact sequence after GUI showed direct side-driven B contact could push the object before grasp: FAR now plans separate far_low_side_prepare_B_world, far_xy_align_B_world, and far_descend_B_world targets, executes far_prepare_low_side_approach -> far_align_B_over_object_xy -> far_lower_B_world_z, then closes and runs the existing micro_lift_probe/far_lift path
+- The FAR XY-align target keeps point B at object WORLD XY but above the object before lowering; --far-xy-align-clearance-above-object was added with default 0.035 m, while far_descend_B_world still targets support Z + --far-point-b-gap-above-support default 0.002 m
+- Added/preserved FAR contact-sequence logging for selected_far_contact_sequence_policy, selected_far_low_side_prepare_B_world, selected_far_xy_align_B_world, selected_far_descend_B_world, far_xy_align_clearance_above_object_m, actual_point_B_world_before_close, and point_B_error_before_close_m; region thresholds, far/mid policy split, world_y approach presets, candidate gate, EE-frame compensation, and MID behavior were not changed
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 1 --log-suffix far_xy_then_z_clearance35_test
+- Runtime result: nearest policy selected /Replicator/Ref_Xform_02 at target_index=1 with target_region=far, selected approach_axis_world stayed approximately [0.0000069, 0.999999999, -0.0000527], candidate selection passed, and the new far_prepare_low_side_approach, far_align_B_over_object_xy, and far_lower_B_world_z phases all met their servo gates before close_gripper
+- The run still failed at micro_lift_probe with object_not_lifted; log object_trace showed the selected object's center changed from approximately [0.81401, 0.33655, 1.02572] initially to [0.81438, 0.31574, 1.01644] by after_far_xy_align and then remained there, so the script now has the requested XY-then-Z structure but GUI/log verification still indicates object displacement before close
+
+
+- Refined scripts/task1_dualarmik_phase_baseline.py vertical z_approach close timing after GUI showed fingers closing before the mesh/contact proxy reached the object: vertical contact point B now targets object/table support Z + --vertical-point-b-gap-above-support, default 0.001 m, instead of the previous object-top plus descend-clearance contact height
+- Added --vertical-close-point-b-tolerance default 0.006 m and a vertical-only pre-close point-B gate; for MID/near-body z_approach the script now skips close_gripper and fails with vertical_contact_not_reached_before_close if actual point B is not within the gate of the contact mark
+- Fixed the vertical descend early-success path: the vertical descend phase now servos against the final contact pose directly with position tolerance min(--descend-tolerance, --vertical-close-point-b-tolerance), instead of using a one-step dynamic 2 mm lowering target that could report success before the final contact mark was reached
+- FAR geometry, region thresholds, world_y approach presets, candidate gates, EE-frame compensation, and nearest-target selection were not changed
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 342634456 --target-index 2 --log-suffix vertical_contact_mark_direct_test
+- Runtime result: target_region=mid, selected_motion_policy=mid_vertical_Z_descend, selected_orientation_preset_label=right_z_approach_straight, selected vertical contact mark B world [0.8166943, 0.1985759, 1.0217553], object support z approximately 1.0207553, and the requested B gap was 0.001 m
+- The run no longer closed the gripper early; it failed at mid_descend_world_z_keep_AB_vertical with descend_failed because final point B remained approximately [0.7702214, 0.2382643, 1.0915748], around 6.5 cm pose error / about 7 cm above the contact mark, so the next vertical iteration should address why the direct contact target is not reached rather than allowing close before contact
+
+- Refined scripts/task1_dualarmik_phase_baseline.py vertical z_approach XY tracking after GUI diagnosis showed wrist/sixforce projection introduces a small offset from the actual finger/mesh midpoint: the vertical branch now resolves --vertical-xy-reference-link, default pgc_base_link, and uses that reference's WORLD XY for object alignment while keeping point B/finger proxy Z at support + --vertical-point-b-gap-above-support before close
+- The pgc reference resolver first matches the active arm's dynamic-control body, then prefers the selected prim's USD bbox center as the mesh/reference position; it falls back to rigid-body pose only if bbox center is unavailable, and logs source, selected path, bbox center, body pose, local EE-frame offset, and whether vertical_xy_reference_active is true
+- Vertical planning now adjusts the commanded point-B XY so the pgc/reference XY lands on the object WORLD XY; the vertical pre-close gate now requires both point-B contact-mark error <= --vertical-close-point-b-tolerance and pgc/reference XY error <= --vertical-xy-reference-tolerance when the reference is active
+- FAR world-Y policy, region thresholds, candidate gate, EE-frame compensation, phase machine, nearest-target selection, and MID z_approach preset family were not changed
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 342634456 --target-index 2 --log-suffix vertical_pgc_bbox_xy_reference_test
+- Runtime result: target_region=mid, selected_motion_policy=mid_vertical_Z_descend, selected_orientation_preset_label=right_z_approach_straight, selected_vertical_xy_reference_active=true, and the resolver selected /Root/Ref_Xform/Ref/R_pgc_base_link/R_pgc_base_link using source=dynamic_control_body_usd_bbox_center
+- Runtime diagnostics showed the bbox-center reference produced a meaningful local offset [0.0000038, 0.0026389, 0.0666526] from the EE frame; the selected vertical contact mark B shifted from the raw object contact [0.8166943, 0.1985759, 1.0217553] to [0.8140555, 0.1985675, 1.0217553] so the pgc/reference XY, not the wrist/sixforce origin, aligns to the object XY
+- The run still failed at mid_descend_world_z_keep_AB_vertical before close_gripper, with final point B approximately [0.7510247, 0.2036018, 1.0955817] versus target [0.8140555, 0.1985675, 1.0217553]; this is a remaining vertical reach/servo convergence problem, not an early-close regression
+
+- Refined scripts/task1_dualarmik_phase_baseline.py vertical z_approach descend to continuously correct the commanded point-B target from the live pgc/reference mesh XY error during mid_descend_world_z_keep_AB_vertical, instead of only using the one-time pgc_base_link bbox offset from the planning step
+- The vertical descend target callback now reads the current EE pose every servo tick, reconstructs the current pgc/reference world point from vertical_xy_reference_offset_local, computes object_xy - current_reference_xy, and commands nominal_contact_B_xy plus that error while keeping point B at support Z + --vertical-point-b-gap-above-support; FAR behavior and policy selection were not changed
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 342634456 --target-index 2 --log-suffix vertical_nominal_pgc_xy_feedback_test
+- Runtime result: target_region=mid, selected_motion_policy=mid_vertical_Z_descend, selected_orientation_preset_label=right_z_approach_straight, selected_vertical_xy_reference_active=true, feedback samples were recorded, and the final pgc/reference XY error improved from approximately 0.0277 m in the prior one-time-offset run to approximately 0.0148 m with continuous feedback
+- The run still failed before close_gripper at mid_descend_world_z_keep_AB_vertical: final point B was approximately [0.7624315, 0.1955212, 1.0938252] versus target [0.8140555, 0.1985675, 1.0217553], with final pose error approximately 0.0585 m and final rotation error approximately 0.4448 rad; next vertical work should focus on IK/servo reachability or orientation tolerance rather than allowing early close
+
+- Refined scripts/task1_dualarmik_phase_baseline.py vertical XY reference from pgc_base_link to the active hand finger midpoint: default --vertical-xy-reference-link is now finger_midpoint, resolving R/L_finger1_link and R/L_finger2_link for the selected arm, using the midpoint of their USD bbox centers as the object-XY reference while retaining single-link override support through --vertical-xy-reference-link
+- Added live vertical-reference feedback for the descend phase: mid_descend_world_z_keep_AB_vertical now re-queries the current finger1/finger2 midpoint each servo tick when finger_midpoint mode is active, logs the live component positions, and falls back to the initial EE-frame offset only if the live query fails
+- Preserved FAR policy, region thresholds, candidate gates, EE-frame compensation, phase order, z_approach presets, point-B low contact Z, and the pre-close gate; the vertical gate now refers generically to the vertical XY reference rather than pgc
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 342634456 --target-index 2 --log-suffix vertical_finger_midpoint_xy_feedback_test
+- Runtime result: target_region=mid, selected_motion_policy=mid_vertical_Z_descend, selected_orientation_preset_label=right_z_approach_straight, selected_vertical_xy_reference_mode=finger1_finger2_midpoint, source=finger_link_pair_midpoint; the resolver selected /Root/Ref_Xform/Ref/R_finger1_link/R_finger1_link and /Root/Ref_Xform/Ref/R_finger2_link/R_finger2_link from USD bbox centers
+- Runtime diagnostics showed live feedback was active with runtime_source=live_vertical_xy_reference_query and no fallback; final point-B pose error improved slightly from the previous approximately 0.0585 m to approximately 0.0532 m, but final live finger-midpoint XY error was still large at approximately 0.0631 m, so the midpoint did not yet align to the object XY before the descend gate failed
+- The run still failed before close_gripper at mid_descend_world_z_keep_AB_vertical with descend_failed; next vertical iteration should focus on why the solver cannot move the live finger midpoint far enough in XY during the low vertical descend, not on gripper close timing
+
+
+- Implemented focused scripts/task1_dualarmik_phase_baseline.py execution-infrastructure refinements from the Walker S2 grasping diagnosis: servo phases can now refresh the coordinate transform from the live torso_link each tick, position convergence is logged and gated using the point-B world metric when the point-B proxy is available, and DualArmIK phase logs now report the effective IK parameters after per-phase overrides
+- Added FAR outboard waypoint steering before the low-side prepare phase: far_outboard_transition is inserted only for the FAR/world_y policy, with --far-outboard-transition-offset default 0.12 m and --far-outboard-transition-clearance default 0.08 m; the FAR sequence remains strictly branched as far_outboard_transition -> far_prepare_low_side_approach -> far_align_B_over_object_xy -> far_lower_B_world_z before close
+- Added FAR null-space/posture knobs without changing region thresholds or candidate gates: --far-null-weight default 0.08 applies only to FAR servo IK solves, --far-outboard-shoulder-roll-bias default 0.35 biases the neutral arm posture outward, and --far-ab-downward-slant-deg default is now 8.0 deg to keep the side approach shallower
+- Made the pre-close point-B gate mandatory for FAR with --pre-close-point-b-tolerance default 0.005 m; FAR now fails before gripper close if actual point B is not within 5 mm of the contact mark, preserving the existing vertical close gate behavior with default --vertical-close-point-b-tolerance now 0.005 m
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Vertical runtime command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 342634456 --target-index 2 --log-suffix vertical_pointB_live_torso_test; result remained target_region=mid and failed at mid_descend_world_z_keep_AB_vertical, with live torso transform refresh active/no failures and final point-B world error approximately 0.1153 m
+- FAR runtime command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 1 --log-suffix far_outboard_nullspace_live_torso_test2; result target_region=far, selected_motion_policy=far_low_side_B_driven, selected FAR world-Y preset unchanged, outboard/prepare/XY-align/Z-lower phases all met servo gates, effective DualArmIK null_weight logged as 0.08 for FAR phases, then mandatory pre-close gate correctly blocked close with point_B_error_before_close_m approximately 0.0882 m versus 0.005 m tolerance
+- Remaining runtime issue: the infrastructure now prevents unsafe closing, but FAR point B still does not physically reach the final contact mark before close, and MID vertical Point-B/finger-midpoint convergence remains unresolved
+
+
+- Implemented semi-closed-loop DualArmIK refresh cadence in scripts/task1_dualarmik_phase_baseline.py without changing scene building, target selection, region thresholds, candidate validation, EE-frame compensation, or the phase machine
+- The central _execute_dualarmik_servo_phase now solves DualArmIK into a cached q_goal, tracks that q_goal every simulation tick with the existing blend/step limiter, and only refreshes live target geometry / torso coordinate transform / IK solution at the configured cadence; disabling the mode restores the legacy solve-every-servo-tick behavior
+- Added CLI controls: --ik-refresh-enable/--no-ik-refresh-enable default enabled, --ik-refresh-period default 12 ticks, and --ik-refresh-drift-threshold default 0.0 m (disabled unless set positive); phase logs now include periodic_ik_refresh_active, ik_refresh_period_ticks, ik_refresh_drift_threshold_m, ik_refresh_count, ik_refresh_ticks, ik_refresh_reasons, ik_refresh_events, target_pose_evaluation_count, target_drift_check_count, and q_goal_update_count
+- Official baseline influence: Ubtech_sim/source/RobotArticulation.py solves DualArmIK from synced Isaac joint state and smooths the outgoing joint positions; this patch keeps the same official DualArmIK call path but reduces solve cadence and reuses the current servo blend/step limiter between q_goal refreshes
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 1 --ik-refresh-period 12 --ik-refresh-drift-threshold 0.0 --log-suffix ik_refresh_period12_test
+- Runtime result: target_region=far, selected_motion_policy=far_low_side_B_driven, selected_orientation_preset_label remained the corrected world-Y palm-down preset, and the run still stopped at the mandatory FAR pre-close gate rather than closing with point_B_error_before_close_m approximately 0.0877 m
+- Periodic refresh diagnostics from that run: far_outboard_transition refreshed IK at ticks [0, 12, 24] (3 solves over 26 executed ticks), far_prepare_low_side_approach at [0, 12] (2 solves over 25 ticks), far_align_B_over_object_xy at [0, 12] (2 solves over 11 executed ticks before success), and far_lower_B_world_z at [0] (1 solve over 6 ticks); all had zero live coordinate refresh failures
+- Remaining uncertainty: headless runtime confirms the solve cadence and gate behavior, but GUI observation is still needed to judge visible smoothness; the existing FAR Point-B contact miss remains a geometry/reach issue rather than an IK cadence issue
+
+- Added focused real grasp-center diagnostics to scripts/task1_dualarmik_phase_baseline.py for the current small grasp-center proxy bias diagnosis: pre-close now resolves the active hand's finger1_link/finger2_link midpoint as real_grasp_center_world, logs point_B_proxy_world, real_grasp_center_world, proxy_to_real_grasp_center_delta_world, proxy_to_real_grasp_center_delta_local, component finger positions, and close_critical_error_before_close_m
+- The mandatory FAR and vertical pre-close gates now use real_grasp_center_world as the close-critical metric when both finger links resolve, falling back to the existing point-B proxy only if the live finger midpoint cannot be resolved; motion policy, region thresholds, candidate gates, EE-frame compensation, and FAR/MID phase structure were not changed
+- Small nearby runtime fix: _command_gripper_phase now accepts the coord_transform_refresh_fn keyword already passed by close/release calls and logs the optional refresh result, avoiding a TypeError once a pre-close gate passes
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py and python scripts/task1_dualarmik_phase_baseline.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 1 --ik-refresh-period 12 --log-suffix real_grasp_center_bias_test
+- Runtime result: target_region=far, selected_motion_policy=far_low_side_B_driven, selected_orientation_preset_label=right_world_y_approach_pos_y_yaw_plus_quarter_ab_roll_minus_quarter_palm_down_test; run failed at far_contact_not_reached_before_close as intended by the mandatory gate, now using close_critical_metric=real_grasp_center_world
+- New diagnostics from that run: point_B_proxy_world=[0.8178210, 0.3098236, 1.0856105], real_grasp_center_world=[0.8208409, 0.3586808, 1.1071487], proxy_to_real_grasp_center_delta_world=[0.0030199, 0.0488571, 0.0215382], delta norm approximately 0.05348 m, proxy_to_real_grasp_center_delta_local=[-0.0217962, -0.0018732, 0.0488001], point_B_error_before_close_m approximately 0.08773, and real_grasp_center_error_before_close_m approximately 0.10754
+- Interpretation: this single run shows the proxy-to-real grasp-center offset is measurable and substantial, not yet proven stable across seeds/targets; collect several more logs before adding a calibrated offset path
+
+- Created no-gate diagnostic duplicate scripts/task1_dualarmik_phase_nogate.py from scripts/task1_dualarmik_phase_baseline.py, leaving the active baseline unchanged
+- In the duplicate only, SCRIPT_NAME/LOG_STEM now write to task1_dualarmik_phase_nogate logs, NO_GATE_MODE is enabled, and _fail bypasses all non-setup gate failures while preserving fatal scene/asset/target setup failures: scene_build_failed, no_target_parts_found, target_index_out_of_range
+- The duplicate forces pregrasp candidate continuation by selecting the best available candidate when strict candidate acceptance fails, logging selection_mode=nogate_best_available_candidate_forced_acceptance and no_gate_candidate_forced_acceptance=true
+- Motion/contact/result gates now log and continue through failed startup pose, gripper open, pregrasp/align/descend, pre-close, close, micro-lift, lift, carry, place, release, retreat, and final settle/scoring gates; bypassed failures are recorded in no_gate_bypassed_failures
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_nogate.py and python scripts/task1_dualarmik_phase_nogate.py --help
+
+- Added no-gate-only pre-close mesh touch probing to scripts/task1_dualarmik_phase_nogate.py: before closing the gripper, the duplicate now lowers the close-critical mesh metric, preferring the live finger1/finger2 midpoint real_grasp_center_world when available, toward the selected object's WORLD XY and support/table height
+- The no-gate touch probe stops on selected-object bbox overlap, selected-object motion, table/support height, or possible contact/IK stall; it checks DualArmIK on each step and runs a short same-Z XY position-fix phase before close if the close-critical metric is not within the configured XY tolerance
+- Added no-gate CLI knobs for the probe: --nogate-preclose-touch-enable/--no-nogate-preclose-touch-enable, --nogate-touch-max-ticks, --nogate-touch-fix-ticks, --nogate-touch-step-z, --nogate-touch-gap-above-table, --nogate-touch-xy-tolerance, --nogate-touch-object-expand, --nogate-touch-object-motion-threshold, and --nogate-touch-stall-tolerance
+- Added phase logging for nogate_preclose_mesh_touch_probe including touch_detected, touch_reason, ik_right_before_close, latest_ik_success, fix_position_attempts, final_close_metric_world, final_xy_error_to_target_m, final_z_gap_above_table_m, and trace samples; the post-probe pre-close gate is logged under nogate_preclose_touch_probe while no-gate still continues through failures
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_nogate.py and python scripts/task1_dualarmik_phase_nogate.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_nogate.py --seed 1 --ik-refresh-period 12 --log-suffix nogate_touch_probe_smoke
+- Runtime result: target_region=far, selected_motion_policy=far_low_side_B_driven, no-gate bypassed far_contact_not_reached_before_close/object_not_lifted/dropped_during_lift, and nogate_preclose_mesh_touch_probe reported touch_detected=true with touch_reason=possible_contact_or_ik_stall at tick 7; IK before close was true and no XY fix was needed
+- Important caveat from that run: final close-critical XY error improved to approximately 0.003 m, but final_z_gap_above_table_m was still approximately 0.102 m, so headless logs show the probe stopped on a possible contact/stall proxy rather than confirmed physical table/object touch; GUI/runtime follow-up should focus on why the descent stalls high
+
+- Tightened scripts/task1_dualarmik_phase_nogate.py no-gate pre-close behavior so the gripper no longer closes after an unconfirmed stall or selected-object motion alone: by default --nogate-require-table-touch-before-close is true, so safe_to_close now requires confirmed table touch, successful latest IK solve, and selected-object center projected between the active finger1_link/finger2_link segment
+- The no-gate touch probe now continues lowering through possible contact/IK stall instead of treating that stall as confirmed touch, uses a larger default table-touch budget (--nogate-touch-max-ticks 360 and --nogate-post-touch-reposition-ticks 120), and forces at least one post-touch IK reposition/check before any close decision
+- Added no-gate capture diagnostics for object_between_fingers_before_close, table_touch_confirmed, require_table_touch_before_close, touch_requirement_met, close_block_reason, finger segment projection fraction, object distance to the finger segment, and capture distance threshold; close_gripper is skipped with nogate_close_blocked_by_touch_probe=true when safe_to_close is false
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_nogate.py and python scripts/task1_dualarmik_phase_nogate.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_nogate.py --seed 1 --ik-refresh-period 12 --log-suffix nogate_require_table_before_close_check
+- Runtime result: target_region=far, the probe detected selected_target_object_motion_detected and the object-between-fingers estimate became true, but table_touch_confirmed=false with final_z_gap_above_table_m approximately 0.062 m; safe_to_close=false, close_block_reason=no_confirmed_table_touch, and close_gripper was skipped instead of closing the mesh
+- Remaining issue exposed by the stricter no-gate run: the hand still does not physically reach table height in headless execution before close; next work should focus on why the IK/servo descent stalls about 6 cm above the table, not on allowing the gripper to close earlier
+
+- Added scripts/task1_dualarmik_phase_nogate.py no-gate post-close slow-lift hold phase: after a non-skipped close_gripper, nogate_post_close_slow_lift_hold_grip solves an IK target a small distance upward in WORLD Z, moves with conservative joint step limits, reissues closed finger position targets every tick, and reapplies gripper_hold_effort every tick
+- Added CLI knobs for the phase: --nogate-post-close-slow-lift-enable/--no-nogate-post-close-slow-lift-enable, --nogate-post-close-slow-lift-height default 0.010 m, --nogate-post-close-slow-lift-ticks default 90, --nogate-post-close-slow-lift-blend default 0.12, --nogate-post-close-slow-lift-max-step-norm default 0.015, and --nogate-post-close-slow-lift-max-abs-joint-step default 0.008
+- The phase is skipped when close_gripper is skipped or blocked by the no-gate touch/capture safety rule; the default safe-close rule still requires confirmed table touch before close unless --no-nogate-require-table-touch-before-close is explicitly used for diagnostics
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_nogate.py and python scripts/task1_dualarmik_phase_nogate.py --help
+- Runtime validation command used the diagnostic override to exercise the new post-close phase: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_nogate.py --seed 1 --ik-refresh-period 12 --no-nogate-require-table-touch-before-close --log-suffix nogate_post_close_slow_lift_exec_check
+- Runtime result: close_gripper was not skipped, nogate_post_close_slow_lift_hold_grip ran, DualArmIK initial solve succeeded, closed targets were reissued each tick, gripper effort was applied each tick with R_finger1_joint/R_finger2_joint effort 100.0, the slow-lift target height was 0.010 m, and the phase met its loose lift tolerance after one tick with final_error_m approximately 0.0091
+- Remaining caveat: this validation used --no-nogate-require-table-touch-before-close only to exercise the new slow-lift path; with the default stricter no-gate rule, close still remains blocked until table touch is confirmed and the selected object is between finger1_link/finger2_link
+
+- Added a focused vertical-only lateral bias correction to scripts/task1_dualarmik_phase_baseline.py and scripts/task1_dualarmik_phase_nogate.py after GUI showed right-arm vertical grasps biased left and left-arm vertical grasps biased right: new --vertical-arm-lateral-bias-correction defaults to 0.04 m, applies -robot-base-Y for the right arm and +robot-base-Y for the left arm, and shifts the vertical finger-midpoint XY reference target before candidate evaluation, live descend feedback, and pre-close gating
+- The correction is logged as vertical_uncorrected_object_world_xy_target, vertical_xy_reference_target_xy_world, vertical_arm_lateral_bias_correction_m, vertical_arm_lateral_bias_correction_base_y_m, vertical_arm_lateral_bias_correction_world, and vertical_arm_lateral_bias_correction_rule; FAR/world_y behavior and region thresholds were not changed
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_baseline.py scripts/task1_dualarmik_phase_nogate.py, python scripts/task1_dualarmik_phase_baseline.py --help, and python scripts/task1_dualarmik_phase_nogate.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 342634456 --target-index 2 --ik-refresh-period 12 --log-suffix vertical_lateral_bias_correction_test
+- Runtime result: target_region=mid, selected_approach_family=z_approach, selected_orientation_preset_label=right_z_approach_straight, correction magnitude 0.04 m applied with base_y=-0.04 for the right arm; in that run robot-base -Y mapped to approximately world +X [0.0400, -0.0000003, 0.0], shifting selected_vertical_xy_reference_target_xy_world from uncorrected [0.8167, 0.1986] to corrected [0.8567, 0.1986]. The run still failed later at mid_descend_world_z_keep_AB_vertical, so GUI verification is still needed for grasp centering.
+
+- Applied no-gate-only vertical descent smoothing in scripts/task1_dualarmik_phase_nogate.py: mid/near vertical descend now uses a live target function that ramps point-B target Z downward by --nogate-vertical-descend-step-z, default 0.003 m per IK refresh, while keeping the live finger-midpoint XY reference locked to the corrected object XY target
+- Added no-gate vertical controls --nogate-vertical-continuous-ik-descend/--no-nogate-vertical-continuous-ik-descend and --nogate-vertical-descend-step-z; when enabled, the vertical descend phase forces IK refresh period to 1 tick via per-phase overrides and uses a tighter internal servo tolerance to avoid stopping early on an intermediate ramp target
+- Added phase diagnostics for nogate_vertical_continuous_ik_descend, nogate_vertical_descend_step_z_m, nogate_vertical_ik_refresh_period_ticks, vertical_descend_servo_tolerance_m, vertical_descend_state, commanded_target_z_world, z_remaining_to_contact_m, and world_z_only_descent_target in vertical_xy_reference_feedback_samples
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_nogate.py and python scripts/task1_dualarmik_phase_nogate.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_nogate.py --seed 342634456 --target-index 2 --ik-refresh-period 12 --log-suffix nogate_vertical_z_ramp_to_contact_test
+- Runtime result: target_region=mid, selected_approach_family=z_approach, vertical descend logged ik_refresh_period_ticks=1 with 361 IK refreshes / q_goal updates, and the commanded Z ramp reached the final contact Z exactly (final_z_reached_by_command=true, z_remaining_to_contact_m=0.0); actual final point-B error remained high at approximately 0.094 m in headless no-gate, so the commanded policy is now continuous/gradual but physical convergence still needs GUI inspection and likely IK/reach tuning.
+
+- Updated scripts/task1_dualarmik_phase_nogate.py no-gate vertical descent speed/cadence per the slow-down request: default --nogate-vertical-ik-refresh-period is now 10 ticks and default --nogate-vertical-descend-step-z is now 0.010 m per IK refresh, giving an effective commanded Z target rate of 0.001 m/frame
+- Added a servo-phase completion condition used by no-gate continuous vertical descend so the phase cannot stop after reaching the first intermediate ramp target; it now continues until the commanded Z ramp reaches the final vertical contact mark
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_nogate.py and python scripts/task1_dualarmik_phase_nogate.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_nogate.py --seed 342634456 --target-index 2 --ik-refresh-period 12 --log-suffix nogate_vertical_refresh10_slow_completion_test
+- Runtime result: target_region=mid, selected_motion_policy=mid_vertical_Z_descend, vertical descend logged ik_refresh_period_ticks=10 with refresh ticks [0, 10, 20, ..., 360], ik_refresh_count=37, q_goal_update_count=37, nogate_vertical_descend_step_z_m=0.01, and nogate_vertical_effective_z_step_per_frame_m=0.001; the commanded Z ramp reached the final contact Z, but physical final point-B error remained high at approximately 0.131 m, so the slower cadence is implemented while convergence still needs runtime/IK tuning
+
+- Added no-gate-only near-contact DLS handoff in scripts/task1_dualarmik_phase_nogate.py: during vertical descend, if the live close-critical gripper metric reaches within 0.04 m of the selected object's bbox surface, the DualArmIK descend stops early and nogate_near_contact_measured_dls_finish runs the measured finite-difference DLS position controller adapted from task1_single_target_random_scene_baseline
+- The adapted close DLS uses the active finger1/finger2 midpoint as the preferred close metric, falls back to point_B_proxy_world if needed, and targets the existing vertical contact mark; reduced stop-go defaults are settle_steps=1, hold_steps=0, max_step_norm=0.012, max_abs_joint_step=0.006, blend=0.45, max_iters=18, and stop_tolerance=0.004 m
+- Added CLI knobs --nogate-close-dls-enable, --nogate-close-dls-switch-distance, --nogate-close-dls-max-iters, --nogate-close-dls-eps, --nogate-close-dls-damping, --nogate-close-dls-max-step, --nogate-close-dls-max-abs-joint-step, --nogate-close-dls-blend, --nogate-close-dls-settle-steps, --nogate-close-dls-hold-steps, --nogate-close-dls-stop-tolerance, and --nogate-close-dls-posture-gain; main baseline remains unchanged
+- Static checks passed: python -m py_compile scripts/task1_dualarmik_phase_nogate.py and python scripts/task1_dualarmik_phase_nogate.py --help
+- Runtime validation command: /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_nogate.py --seed 342634456 --target-index 2 --ik-refresh-period 12 --log-suffix nogate_4cm_dls_bbox_handoff_test
+- Runtime result: target_region=mid, selected_motion_policy=mid_vertical_Z_descend, vertical descend early-stopped at tick 101 with close_dls_handoff_reason=gripper_metric_within_switch_distance_of_object_bbox, real_grasp_center_world distance to object bbox approximately 0.03976 m, and distance to contact mark approximately 0.04246 m; the measured DLS phase ran with settle_steps=1/hold_steps=0 and reduced the close metric from [0.8727, 0.2066, 1.0899] to [0.8726, 0.2037, 1.0669], ending at final_error_m approximately 0.0476 versus 0.004 tolerance
+- Remaining issue from that run: the following no-gate touch probe still failed safe-to-close because table_touch_confirmed=false with final_z_gap_above_table_m approximately 0.0411 m, although object_between_fingers=true; the handoff mechanism works, but DLS/contact descent still needs tuning to reach table/contact height reliably
+
+## 2026-04-18
+- Initialized plan-driven execution for the Task 1 hybrid geometric grasp project by creating `CURRENT_PLAN.md`.
+- Phase 0 source lock selected `scripts/task1_dualarmik_phase_baseline.py` as the source to fork from because it has the most current official Task 1 SceneBuilder setup, Walker S2 robot loading, official DualArmIK path, deterministic gated phase structure, and detailed logging.
+- Recorded in `CURRENT_PLAN.md` that Phase 0 is active, all later phases are pending, and the hybrid planner must not be implemented until the plan explicitly advances.
+- Updated `AGENTS.md` with persistent rules requiring future Codex tasks to read `AGENTS.md`, `PROJECT_CONTEXT.md`, `CURRENT_PLAN.md`, and `TASK_LOG.md` before planning or editing; treating `CURRENT_PLAN.md` as the active source of truth; limiting implementation to the current phase; and updating logs/context after implementation runs.
+- Updated `PROJECT_CONTEXT.md` to mention the new plan-driven workflow and the Phase 0 selected source.
+- Test result: documentation-only change; no Isaac runtime or lightweight code test was run.
+- Next step: after user authorizes Phase 1, copy the selected baseline into a new Task 1 hybrid script and add the minimal `scene_state`-only skeleton without Thinker.
+
+## 2026-04-19
+- Implemented Phase 1 only: minimal hybrid skeleton for Task 1 in `scripts/task1_hybrid_geometric_phase1.py`.
+- Source file used: `scripts/task1_dualarmik_phase_baseline.py`; the source file was copied and left unchanged.
+- New script keeps the baseline SceneBuilder scene setup, Walker S2 robot loading, articulation setup, official DualArmIK backend, phase-machine execution, gripper effort behavior, and object-centric scoring flow.
+- Added table-frame convention in the new script: origin is the near-left tabletop corner from the robot viewpoint, +x_table runs robot-left to robot-right along the near edge, +y_table runs from robot toward the far table side, and +z_table points upward.
+- Added table-unit convention: `TABLE_UNIT_M = 0.035`, so one table unit is 3.5 cm; object and candidate table coordinates are logged in meters and units.
+- Added Phase 1 helper functions: `build_or_resolve_table_frame(...)`, `world_to_table(...)`, `table_to_world(...)`, `get_object_info_in_table_frame(...)`, `generate_approach_candidates_for_object(...)`, `fast_score_candidate(...)`, `select_best_candidate(...)`, and extended `resolve_real_grasp_center_world(...)` fallback logging in the copied script.
+- Added `scene_state` object_info logging with object id, class name, world/table centers, table units, approximate size, bbox in world/table coordinates, yaw fallback, and `perception_source="scene_state"`.
+- Added minimal finite candidate generation, currently 4 candidates for a forced arm or 8 for auto arm, with deterministic arm/preset/yaw records, pregrasp table coordinates, object grasp center table coordinates, coarse workspace/width sanity, score terms, and selected candidate logging.
+- Existing motion backend is preserved: the selected Phase 1 candidate chooses the arm and logs the planned approach, then the copied baseline continues through existing pregrasp, descend, close, lift, place/release phases using DualArmIK.
+- Intentionally not implemented in this run: full geometric hardening, rich alignment/width/symmetry/clearance/asymmetry filters, robust local closed-loop final descent, retry with next candidate, Thinker integration, YOLO/provider abstraction, and broad architecture refactors.
+- Static checks passed: `python3 -m py_compile scripts/task1_hybrid_geometric_phase1.py` and `python3 scripts/task1_hybrid_geometric_phase1.py --help`.
+- Runtime limitation: no Isaac Sim run was executed in this edit pass; Linux runtime validation is still needed to confirm the new table-frame logs and candidate selection in simulation.
+- `CURRENT_PLAN.md` was not advanced because Phase 1 runtime exit criteria still need Linux validation that the new script runs without breaking baseline infrastructure.
+- Created Vietnamese controlled-translation versions of the two generated inventory reports:
+  `docs/baseline_full_inventory_vi.txt` and `docs/hrc2026_full_inventory_vi.txt`.
+- Translation scope: section titles, file-block labels, common generated explanations, and summary language were localized to Vietnamese while preserving paths, identifiers, imports, CLI flags, log keys, and technical snippets where exact wording matters for grep/debugging.
+- Validation result: the baseline Vietnamese report preserves 153 `FILE:` blocks and 153 relative-path blocks; the hrc2026 Vietnamese report preserves 3463 `FILE:` blocks and 3463 relative-path blocks.
+- Ran Phase 1 Isaac runtime validation only for `scripts/task1_hybrid_geometric_phase1.py`; no Phase 2 planner hardening, Thinker, YOLO, or broad refactor was implemented.
+- Static validation commands passed:
+  `python3 -m py_compile scripts/task1_hybrid_geometric_phase1.py`
+  and `python3 scripts/task1_hybrid_geometric_phase1.py --help`.
+- Isaac auto smoke command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase1.py --seed 1 --target-selection-policy index --target-index 2 --arm auto --log-suffix phase1_validate_auto_smoke`.
+- Auto smoke result: Isaac exited with code 0 and the script built the SceneBuilder table/parts/Walker S2 scene, generated object_info, selected a Phase 1 candidate, initialized the DualArmIK flow, then failed safely at the inherited mandatory gate `far_contact_not_reached_before_close`.
+- Auto smoke log:
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase1_20260418T180558Z_phase1_validate_auto_smoke.log`.
+- Table-frame runtime evidence from the auto smoke: `mapping_mode=axis_aligned_simplified`, `axis_aligned_with_world_xy=true`, `origin_world=[-0.04238909009209291, 0.011159473016877532, 1.000136132521064]`, `x_axis_world=[1, 0, 0]`, `y_axis_world=[0, 1, 0]`, and `z_axis_world=[0, 0, 1]`.
+- Table convention validation: with robot forward as world +Y and robot-left as world -X, the resolved origin is the near-left tabletop corner, +x_table is world +X left-to-right across the near edge, +y_table is world +Y away from the robot, and table coordinates are sign-correct.
+- Object table coordinate evidence: selected `/Replicator/Ref_Xform_03` had `center_world=[0.7058081623056034, 0.3744424401475328, 1.0437566159862197]`, `center_table_m=[0.7481972523976963, 0.3632829671306553, 0.04362048346515568]`, and `center_table_unit=[21.377064354219893, 10.37951334659015, 1.2462995275758764]`; values are positive and within the table extents.
+- Auto candidate evidence: Phase 1 generated 8 valid candidates, selected `phase1_world_y_approach_right_yaw_-10`, selected arm `right`, selected approach `world_y_approach`, `pregrasp_table_m=[0.7481972523976963, 0.24328296713065528, 0.27855454404230123]`, and `object_grasp_center_table_m=[0.7481972523976963, 0.3632829671306553, 0.04362048346515568]`.
+- Candidate scoring evidence: auto mode preferred right arm for this object, applied no arm-side penalty to right candidates, applied a 0.15 arm-side penalty to left candidates, and deterministically ranked `-10 deg` before `+10 deg` by candidate index tie-break.
+- Real grasp-center evidence: the helper resolved `source=finger_link_pair_midpoint` with no fallback in the auto run and logged `real_grasp_center_table_m=[1.0254210761025477, 0.3650220376384708, 0.35582203015259073]`.
+- Forced-right validation command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase1.py --seed 1 --target-selection-policy index --target-index 2 --arm right --servo-max-ticks 1 --servo-carry-ticks 1 --gripper-steps 1 --settle-steps 1 --log-suffix phase1_validate_forced_right_selection`.
+- Forced-right result: Isaac exited with code 0, generated exactly 4 valid right-arm Phase 1 candidates, selected `phase1_world_y_approach_right_yaw_-10`, and then failed at `far_outboard_transition_failed` because the servo tick budget was intentionally reduced to validate selection without tuning motion.
+- Forced-right log:
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase1_20260418T180715Z_phase1_validate_forced_right_selection.log`.
+- Forced-left validation command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase1.py --seed 1 --target-selection-policy index --target-index 2 --arm left --servo-max-ticks 1 --servo-carry-ticks 1 --gripper-steps 1 --settle-steps 1 --log-suffix phase1_validate_forced_left_selection`.
+- Forced-left result: Isaac exited with code 0, generated exactly 4 valid left-arm Phase 1 candidates, selected `phase1_world_y_approach_left_yaw_-10`, preserved the requested forced arm, and then failed at `far_outboard_transition_failed` due to the intentionally reduced servo tick budget.
+- Forced-left log:
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase1_20260418T180736Z_phase1_validate_forced_left_selection.log`.
+- Full pick/place attempt command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase1.py --seed 1 --target-selection-policy index --target-index 2 --arm auto --continue-after-lift --log-suffix phase1_validate_auto_full_attempt`.
+- Full attempt result: Isaac exited with code 0 but did not reach pick/place completion; it failed before close at `far_contact_not_reached_before_close`, so carry/place/release could not be validated in this run.
+- Full attempt log:
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase1_20260418T180802Z_phase1_validate_auto_full_attempt.log`.
+- Baseline comparison command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_dualarmik_phase_baseline.py --seed 1 --target-selection-policy index --target-index 2 --arm auto --log-suffix phase1_validate_baseline_compare`.
+- Baseline comparison result: original `scripts/task1_dualarmik_phase_baseline.py` also failed at `far_contact_not_reached_before_close` for the same seed/target, indicating the observed pick/place blocker is inherited DualArmIK/contact geometry behavior rather than a Phase 1 table-frame or candidate-selection regression.
+- Baseline comparison log:
+  `/home/edward/hrc-runtime/logs/task1_dualarmik_phase_baseline_20260418T180830Z_phase1_validate_baseline_compare.log`.
+- Observed Phase 1 issues: no direct evidence of x/y sign inversion, near-left origin error, left/right mirroring error in forced-arm candidate generation, incoherent candidate scoring, or real grasp-center fallback/logging failure.
+- Minimal fixes applied: none. Code was not modified because runtime evidence did not identify a Phase 1-specific bug.
+- Deferred intentionally: FAR contact reaching, robust descent/contact, retry with next candidate, richer geometric filters, and pick/place success tuning remain later-phase work and were not implemented in this validation pass.
+- Phase 1 exit criterion status: the narrow runtime infrastructure criterion is satisfied because the new script runs in Isaac through scene build, table-frame resolution, scene_state object_info, finite candidate selection, real grasp-center logging, and the inherited DualArmIK phase flow without breaking baseline infrastructure; however, full pick/place success is not validated, so `CURRENT_PLAN.md` was not advanced in this conservative validation run.
+
+- Implemented Phase 2 only in a new copied script: `scripts/task1_hybrid_geometric_phase2.py`.
+- Source file used: `scripts/task1_hybrid_geometric_phase1.py`; the validated Phase 1 script was copied and left unchanged.
+- Phase 2 purpose: address the inherited pre-close/contact blocker with contact/descent hardening while preserving the Phase 1 table frame, scene_state object_info, finite candidate generation, SceneBuilder setup, Walker S2 loading, DualArmIK backend, phase-machine structure, gripper effort behavior, and place/release flow.
+- Added object grasp-frame estimation via `estimate_object_grasp_frame(...)`, using the scene_state table-frame bbox to estimate grasp center, closing axis, lateral axis, vertical axis, object width on closing axis, nominal contact points, and bottom/top table clearance values.
+- Added fast vector geometric filtering with `predict_early_contact_asymmetry(...)`, `estimate_table_clearance_margin(...)`, `fast_geometric_grasp_filter(...)`, and `select_best_phase2_candidate(...)`.
+- Geometric filter metrics logged per candidate: alignment error, lateral symmetry error, predicted early-contact asymmetry, width compatibility, table clearance margin, mandatory pass flags, violation score, selected candidate, and explicit least-bad warning if no candidate passes every mandatory check.
+- Added Phase 2 local final descent with `final_descent_local_ik(...)`; it measures the real finger midpoint grasp center when available, falls back to point-B only if needed, locks the selected target frame, clamps XY/Z/yaw incremental steps, enforces monotonic downward Z commands, and continues using the existing DualArmIK servo infrastructure.
+- Added multi-condition close gate with `evaluate_close_gate(...)`; close now requires geometric mandatory pass, real grasp-center error, lateral symmetry, predicted contact asymmetry, table clearance, orientation error, and recent XY drift stability before gripper close.
+- Added gap-aware close helpers with `compute_target_gap(...)` and `execute_two_stage_close(...)`; Stage A moves toward a geometry-advised gap command and Stage B reissues the official close target with retention effort.
+- Added short lift verification via `verify_short_lift(...)`; after close the script performs a bounded short lift and verifies the object center follows before continuing to the full lift/carry/place flow.
+- Added deterministic recovery logging via `recover_and_retry(...)`; on Phase 2 close-gate, close, or short-lift failure the script reopens the gripper, records the current bad candidate, records remaining passed candidates if any, and logs the retry reason. The existing linear phase-machine is preserved, so full automatic re-entry into a second candidate remains a known limitation for runtime follow-up.
+- New exposed Phase 2 parameters include:
+  `--phase2-alignment-error-max`, `--phase2-symmetry-error-max`, `--phase2-contact-asymmetry-max`, `--phase2-table-clearance-min`, `--phase2-width-min`, `--phase2-width-max`, `--phase2-final-descent-enable`, `--phase2-final-descent-ticks`, `--phase2-descent-xy-step`, `--phase2-descent-z-step`, `--phase2-descent-yaw-step`, `--phase2-close-real-center-tolerance`, `--phase2-close-orientation-tolerance`, `--phase2-close-xy-drift-max`, `--phase2-min-target-gap`, `--phase2-target-gap-margin`, `--phase2-close-stage-a-fraction`, `--phase2-retention-steps`, `--phase2-short-lift-height`, `--phase2-short-lift-min-delta`, `--phase2-short-lift-ticks`, and `--phase2-max-retries`.
+- Default Phase 2 thresholds: alignment error max 0.75 rad, symmetry error max 0.030 m, predicted contact asymmetry max 0.030 m, table clearance min 0.002 m, width range 0.010-0.090 m, close real-center tolerance 0.030 m, close orientation tolerance 0.35 rad, close XY drift max 0.018 m, descent XY step 0.006 m, descent Z step 0.003 m, yaw step 0.04 rad, final descent ticks 120, retention steps 18, short-lift min delta 0.006 m.
+- Static checks passed:
+  `python3 -m py_compile scripts/task1_hybrid_geometric_phase2.py`
+  and `python3 scripts/task1_hybrid_geometric_phase2.py --help`.
+- Isaac runtime commands to run next on Linux:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 2 --arm auto --log-suffix phase2_auto_contact_hardening_smoke`
+  and, if that reaches close/lift,
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 2 --arm auto --continue-after-lift --log-suffix phase2_auto_full_attempt`.
+- Additional forced-arm validation commands to run next:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 2 --arm right --log-suffix phase2_forced_right_contact_hardening`
+  and
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 2 --arm left --log-suffix phase2_forced_left_contact_hardening`.
+- Known limitations: grasp frame is bbox/table-axis based, not true mesh OBB; close gap to finger joint mapping is logged as geometry-advisory because the official gripper command uses same-sign joint targets; recovery currently logs and prepares a next candidate but does not yet re-enter the entire pregrasp/descent phase loop; thresholds are first-pass conservative and require Isaac validation before marking Phase 2 complete.
+- Intentionally not implemented in this run: Thinker, YOLO/provider abstraction, heavy force-closure optimization, mesh contact modeling, broad architecture rewrite, or Phase 3+ changes.
+- `CURRENT_PLAN.md` was not advanced because Phase 2 has not yet been Isaac-runtime validated.
+- Added `scripts/watch_task1_phase2_gui.sh` as a minimal GUI launcher for `scripts/task1_hybrid_geometric_phase2.py`.
+- The launcher follows the existing GUI script pattern: it uses `ISAAC_SIM_PYTHON` or `ISAAC_SIM_ROOT`, avoids hardcoded local Isaac paths, defaults to seed 1 / target-index 2 / arm auto, passes `--gui`, keeps the GUI open by default, and accepts additional script flags through trailing CLI arguments.
+- GUI launcher overrides: `SEED`, `TARGET_SELECTION_POLICY`, `TARGET_INDEX`, `ARM`, `LOG_SUFFIX`, `CONTINUE_AFTER_LIFT=1`, and `NO_HOLD_OPEN=1`.
+- Static shell check passed: `bash -n scripts/watch_task1_phase2_gui.sh`.
+
+- Applied a focused Phase 2 contact-reference semantics fix in `scripts/task1_hybrid_geometric_phase2.py`; `scripts/task1_hybrid_geometric_phase1.py` was not changed.
+- Bug addressed: the close-critical `real_grasp_center_world` / vertical XY reference no longer silently means a palm-ish finger-link midpoint. The new preferred semantics are the midpoint between the two active fingertip-end references.
+- Added explicit fingertip-end resolution layers:
+  1. try actual fingertip/end/distal/contact frames or prims for each active finger using transform positions only,
+  2. if not present, derive calibrated fingertip-end proxies from each finger link bbox distal face, using the active palm/pgc reference to choose the distal direction,
+  3. only if both fingertip-end paths fail, fall back to the old finger-link midpoint path and mark the fallback in logs.
+- Distinct references now logged separately: `point_B_proxy_world`, `real_grasp_center_world`, `fingertip_midpoint_world`, `fingertip_component_positions_world`, `legacy_link_midpoint_world`, `legacy_link_midpoint_to_fingertip_midpoint_delta_world`, and `point_B_proxy_to_fingertip_midpoint_delta_world`.
+- Updated vertical reference semantics: `finger_midpoint` / `fingertip_midpoint` / related aliases now resolve through the fingertip-end midpoint path, not the old finger-link midpoint path.
+- Updated Phase 2 final descent semantics: `final_descent_local_ik(...)` now computes a `contact_control_offset_local` from the resolved close-critical fingertip midpoint at phase start and commands that reference during local IK descent. The old point-B offset is retained for diagnostics only unless fingertip resolution fails.
+- Updated point-B log wording so point-B is explicitly a legacy proxy, not the close-critical contact truth.
+- Static validation passed:
+  `python3 -m py_compile scripts/task1_hybrid_geometric_phase2.py`
+  and
+  `python3 scripts/task1_hybrid_geometric_phase2.py --help`.
+- Isaac vertical validation command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 342634456 --target-selection-policy index --target-index 1 --arm auto --log-suffix phase2_fingertip_vertical_target1_validate`.
+- Isaac vertical result: simulation exited normally with `status=fail`, `failure_reason=phase2_close_gate_failed`; this was a mid/vertical case with `selected_motion_policy=mid_vertical_Z_descend`, `selected_orientation_preset_label=right_z_approach_straight`, `selected_vertical_xy_reference_mode=fingertip_end_midpoint`, and `selected_vertical_xy_reference_source=calibrated_finger_link_tip_proxy_pair_midpoint`.
+- Vertical fingertip evidence: actual fingertip frames were not found (`actual_fingertip_frame_attempt.resolved=false`), so both fingers used `finger_link_bbox_distal_face_local_offset_proxy`; final-descent logs showed `contact_control_reference_source=calibrated_finger_link_tip_proxy_pair_midpoint`.
+- Vertical delta evidence: logged `legacy_link_midpoint_to_fingertip_midpoint_delta_norm_m` was about 0.0585 m at first final-descent sample and about 0.0490 m later; `point_B_proxy_to_fingertip_midpoint_delta_world_norm_m` was about 0.1098 m then about 0.0978 m, confirming the old proxy and link midpoint were materially different from the new close-critical fingertip midpoint.
+- Vertical behavior evidence: close gate used `close_critical_metric=real_grasp_center_world`, not point-B; it failed safely with `real_grasp_center_error_m≈0.3381` and `orientation_error_rad≈0.5495`, so this run did not close based on a palm-centered proxy. Headless logs cannot fully prove GUI visual improvement, but they confirm the close-critical reference semantics changed as intended.
+- Isaac far/horizontal validation command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 2 --arm auto --log-suffix phase2_fingertip_far_validate`.
+- Isaac far/horizontal result: simulation exited normally with `status=fail`, `failure_reason=phase2_close_gate_failed`; this was a far case with `selected_motion_policy=far_low_side_B_driven` and `selected_orientation_preset_label=right_world_y_approach_pos_y_yaw_plus_quarter_ab_roll_minus_quarter_palm_down_test`.
+- Far/horizontal behavior evidence: the run reached `phase2_far_final_descent_local_ik` after FarXYAlignB and logged `contact_control_reference_source=calibrated_finger_link_tip_proxy_pair_midpoint`; it did not stop at FarXYAlignB as if the palm/point-B proxy were already final contact. It still failed the Phase 2 close gate with `real_grasp_center_error_m≈0.1817` and `geometric_filter_mandatory_pass=false`.
+- Far/horizontal delta evidence: final-descent logs showed `legacy_link_midpoint_to_fingertip_midpoint_delta_norm_m≈0.0441` and `point_B_proxy_to_fingertip_midpoint_delta_world_norm_m≈0.0955`.
+- Additional diagnostic command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 342634456 --target-selection-policy index --target-index 2 --arm auto --log-suffix phase2_fingertip_vertical_validate`.
+- Diagnostic result: this target-index was actually `target_region=far` in the current Phase 2 scene and failed earlier at `pregrasp_failed` / `far_prepare_low_side_approach`, so it was not used as the vertical validation case.
+- Logs produced:
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T190809Z_phase2_fingertip_vertical_target1_validate.log`,
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T190702Z_phase2_fingertip_far_validate.log`,
+  and
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T190630Z_phase2_fingertip_vertical_validate.log`.
+- Remaining unresolved: true fingertip USD/articulation frames were not present under the searched names, so the current reliable reference is a calibrated distal bbox-face proxy. The robot still does not complete the pick/place flow; remaining failures are Phase 2 IK/contact convergence and candidate/filter tuning, not the original palm-centered contact-reference semantics bug.
+- `CURRENT_PLAN.md` was not advanced; this was a local Phase 2 bugfix/validation run, not a phase transition.
+
+- Applied a minimal Phase 2 vertical close-trigger fix in `scripts/task1_hybrid_geometric_phase2.py`; `scripts/task1_hybrid_geometric_phase1.py` and other planner phases were not changed.
+- Added `evaluate_vertical_support_or_stall_close_fallback(...)` as a secondary close gate only for non-far vertical policies. The existing `evaluate_close_gate(...)` remains the primary gate and is evaluated first.
+- Added final-descent support/stall logging to `final_descent_local_ik(...)`: per-sample `measured_support_gap_m` / `commanded_support_gap_m`, plus `latest_measured_support_gap_m`, `min_measured_support_gap_m`, `recent_z_progress_m`, `recent_z_motion_abs_m`, `stalled_in_z`, `z_stall_window_sample_count`, and `recent_xy_drift_m`.
+- Added pre-close support-gap fields for `vertical_actual_close_critical_gap_above_support_m`, `vertical_actual_real_grasp_center_gap_above_support_m`, and `vertical_actual_point_B_gap_above_support_m`.
+- Final close decision is now logged as `phase2_final_close_decision` and allows close only if the primary Phase 2 gate passes or the vertical fallback passes. Fallback use is explicitly logged with `allowed_by=vertical_support_or_stall_fallback`.
+- New fallback thresholds/CLI knobs:
+  `--phase2-vertical-fallback-close-enable` default true,
+  `--phase2-vertical-fallback-support-gap-max` default 0.004 m,
+  `--phase2-vertical-fallback-support-gap-min` default -0.020 m,
+  `--phase2-vertical-fallback-recent-z-progress-max` default 0.0015 m,
+  `--phase2-vertical-fallback-min-descent-samples` default 2,
+  and `--phase2-vertical-fallback-orientation-tolerance` default 0.65 rad. The primary close orientation tolerance remains 0.35 rad.
+- Static checks passed:
+  `python3 -m py_compile scripts/task1_hybrid_geometric_phase2.py`
+  and
+  `python3 scripts/task1_hybrid_geometric_phase2.py --help`.
+- Initial vertical validation command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 342634456 --target-selection-policy index --target-index 1 --arm auto --log-suffix phase2_vertical_support_fallback_validate`.
+- Initial vertical result: the fallback was evaluated but failed conservatively because `stalled_in_z_pass=false` and `orientation_error_pass=false`; logs showed support gap was already small but stall semantics used absolute Z motion rather than downward-progress only.
+- Corrected the stall semantics so `stalled_in_z` uses lack of downward support-gap progress (`recent_z_progress_m`) rather than absolute Z motion. This handles upward bounce/settling at support as "no meaningful downward progress" while still requiring small support gap, XY stability, and orientation sanity.
+- Revalidation command after stall fix:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 342634456 --target-selection-policy index --target-index 1 --arm auto --log-suffix phase2_vertical_support_fallback_validate_v2`.
+- Revalidation result after stall fix: fallback still failed because only `orientation_error_pass=false`; the run logged `support_gap_small_pass=true`, `stalled_in_z_pass=true`, `recent_xy_drift_stable_pass=true`, `recent_z_progress_m=0.0`, and `selected_support_gap_m≈-0.00353`.
+- Added fallback-local orientation sanity tolerance so the fallback does not reuse the stricter primary exact-pose tolerance. This keeps the primary gate unchanged but lets the fallback act as a support/stall close trigger when orientation is broadly sane.
+- Final vertical validation command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 342634456 --target-selection-policy index --target-index 1 --arm auto --log-suffix phase2_vertical_support_fallback_validate_v3`.
+- Final vertical result: close gate no longer blocked the vertical case. Primary gate still failed with `real_grasp_center_error_pass=false` and primary `orientation_error_pass=false`, but fallback passed with `support_gap_small_pass=true`, `stalled_in_z_pass=true`, `recent_xy_drift_stable_pass=true`, `orientation_error_pass=true`, `selected_support_gap_m≈-0.00353`, `recent_z_progress_m=0.0`, `orientation_error_rad≈0.5495`, and fallback orientation tolerance 0.65 rad. `phase2_final_close_decision.allowed_by=vertical_support_or_stall_fallback`.
+- Final vertical run proceeded through `execute_two_stage_close(...)`; two-stage close reported `condition_met=true`, `stage_a_ok=true`, `stage_b_ok=true`, and `retention_status=ok`.
+- Final vertical run still failed later at `object_not_lifted` because the selected object did not follow during `verify_short_lift(...)`. This is outside the requested close-trigger fix and remains a Phase 2 grasp/retention or candidate-quality issue.
+- Final vertical log:
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T192545Z_phase2_vertical_support_fallback_validate_v3.log`.
+- Far guard validation command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 2 --arm auto --log-suffix phase2_vertical_support_fallback_far_guard_validate_v2`.
+- Far guard result: fallback remained blocked for `selected_motion_policy=far_low_side_B_driven` with `vertical_motion_policy=false`, `support_gap_small_pass=false`, `z_stall_sample_count_pass=false`, and `stalled_in_z_pass=false`; final close decision did not use the fallback.
+- Far guard log:
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T192705Z_phase2_vertical_support_fallback_far_guard_validate_v2.log`.
+- False-close risk observed in these headless runs: no evidence of a broad unconditional table-touch close. The fallback only fired in the vertical case when support gap was small, downward progress was stalled, XY drift was within tolerance, and fallback orientation sanity passed; it stayed disabled for far/horizontal approach.
+- `CURRENT_PLAN.md` was not advanced; this was a local Phase 2 bugfix and validation run, not a phase transition.
+
+- Applied the requested strict vertical-only close rule in `scripts/task1_hybrid_geometric_phase2.py`; Phase 1 and far/horizontal planner behavior were not intentionally changed.
+- Added `PHASE2_VERTICAL_TIP_TABLE_Z_CLOSE_THRESHOLD_M = 0.0005` and CLI flag `--phase2-vertical-tip-table-z-close-threshold`.
+- Added `ServoEarlyStop` and a `per_tick_monitor_fn` hook in `_execute_dualarmik_servo_phase(...)` so vertical descent can stop immediately before the next joint command when a close-critical monitor fires.
+- Added vertical-only fingertip table-frame monitoring in `final_descent_local_ik(...)`: it resolves the active close-critical fingertip midpoint, converts it through `world_to_table(...)`, logs `current_vertical_tip_world`, `current_vertical_tip_table`, `current_vertical_tip_table_z_m`, `vertical_tip_stop_rule_triggered`, `vertical_tip_stop_rule_threshold_m`, and `vertical_tip_stop_rule_source`, and sets `vertical_tip_reached_table_z0` / `vertical_tip_close_stop_reason` when the threshold is reached.
+- The monitored fingertip reference source is the existing active Phase 2 close-critical source priority: actual fingertip frames if available, calibrated finger-link distal tip proxy midpoint if actual frames are missing, and legacy finger-link midpoint only as fallback.
+- Updated final close decision routing: when a non-far vertical descent reports `vertical_tip_reached_table_z0=true`, the script skips `evaluate_close_gate(...)` and `evaluate_vertical_support_or_stall_close_fallback(...)` as decisive blockers, calls `execute_two_stage_close(...)`, and logs `phase2_final_close_decision.allowed_by=vertical_tip_table_z_leq_zero_rule`.
+- Static checks passed:
+  `python3 -m py_compile scripts/task1_hybrid_geometric_phase2.py`
+  and
+  `python3 scripts/task1_hybrid_geometric_phase2.py --help`.
+- Initial seed 376 validation command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 376 --log-suffix phase2_vertical_tip_z0_seed376_validate`.
+- Initial seed 376 result: vertical case `selected_motion_policy=mid_vertical_Z_descend`, but the monitor only sampled on target refresh before the per-tick hook was added; it did not close, with minimum observed `current_vertical_tip_table_z_m≈0.00459` and final close decision still blocked by the old gates.
+- Per-tick seed 376 validation command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 376 --log-suffix phase2_vertical_tip_z0_seed376_validate_v2`.
+- Per-tick seed 376 result: monitor was active with 38 samples, including 34 `per_tick_monitor` samples and 4 `target_pose_fn` samples; reference source was `calibrated_finger_link_tip_proxy_pair_midpoint`, threshold was `0.0005`, but the monitored table-frame z never reached the threshold (`min≈0.00459`, last≈0.01663), so `vertical_tip_reached_table_z0=false`, no early stop occurred, and the run still failed at `phase2_close_gate_failed`.
+- Exact GUI-default seed 376 target-2 validation command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 376 --target-selection-policy index --target-index 2 --arm auto --log-suffix phase2_vertical_tip_z0_seed376_target2_validate`.
+- Exact GUI-default seed 376 target-2 result: same vertical policy and same outcome; 38 monitor samples, source `calibrated_finger_link_tip_proxy_pair_midpoint`, threshold `0.0005`, `min current_vertical_tip_table_z_m≈0.00459`, `vertical_tip_stop_rule_triggered=false`, `vertical_tip_reached_table_z0=false`, and no close at `tip_table_z≈0` because the tip never reached table-frame z zero in headless runtime.
+- Far/horizontal guard command:
+  `/usr/bin/timeout 900 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 2 --arm auto --log-suffix phase2_vertical_tip_z0_far_guard`.
+- Far/horizontal guard result: `selected_motion_policy=far_low_side_B_driven`; `vertical_tip_stop_rule_active=false`, `vertical_tip_stop_rule_samples=[]`, `per_tick_monitor_active=false` in `phase2_far_final_descent_local_ik`, and final close decision did not use the vertical tip rule.
+- Logs produced:
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T193913Z_phase2_vertical_tip_z0_seed376_validate.log`,
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T194239Z_phase2_vertical_tip_z0_seed376_validate_v2.log`,
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T194352Z_phase2_vertical_tip_z0_seed376_target2_validate.log`,
+  and
+  `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T194451Z_phase2_vertical_tip_z0_far_guard.log`.
+- Important validation conclusion: the strict rule is implemented and logged, but seed 376 did not close at `tip_table_z≈0` because the monitored fingertip proxy never reached table-frame z <= 0.0005 in headless validation. This run intentionally did not tune descent, thresholds, support/stall fallback, candidate filtering, or any Phase 3+ behavior.
+- `CURRENT_PLAN.md` was not advanced; this was a local Phase 2 bugfix/validation run, and the observed remaining blocker is vertical descent/contact convergence rather than the new close-decision rule.
+
+- Added a visual debug marker for the legacy proxy midpoint in `scripts/task1_hybrid_geometric_phase2.py` (script already contained this implementation from earlier patch set; no behavior logic changed).
+- Marker details (Phase 2 debug only, no grasp/close logic change):
+  - path: `/World/DebugProxyMiddlePoint`
+  - helper: `_upsert_debug_marker(...)`
+  - radius: `DEBUG_PROXY_MIDDLE_POINT_MARKER_RADIUS_M = 0.012`
+  - color: `DEBUG_PROXY_MIDDLE_POINT_MARKER_COLOR = (1.0, 0.12, 0.00)` (strong red)
+- Runtime initialization flow keeps marker definition tied to:
+  - resolved arm + articulation acquired
+  - `_resolve_finger_midpoint_reference_position(...)` with token `"phase2_debug_legacy_finger_link_midpoint"`
+  - marker creation/update to that first resolved midpoint.
+- Runtime update flow:
+  - `_update_proxy_middle_point_debug_marker(...)` is called from `final_descent_local_ik(...)` (during descent sampling / target pose updates).
+- Logging added/verified:
+  - `proxy_middle_point_marker_path`, `proxy_middle_point_source`, `proxy_middle_point_component_positions_world`, `proxy_middle_point_world`, `proxy_middle_point_fallback_used`.
+- Validation run:
+  - `/usr/bin/timeout 300 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 2 --arm auto --log-suffix marker_debug_test`
+  - log: `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T195658Z_marker_debug_test.log`
+  - marker observed at `/World/DebugProxyMiddlePoint` with `proxy_middle_point_source=finger_link_pair_midpoint`.
+- Verified example position logged:
+  - `proxy_middle_point_world = [0.734590160154168, 0.4212117902863426, 1.1625832078637426]`
+  - component positions:
+    - finger1 `[0.7683838032242821, 0.4209245932531235, 1.1631722203462789]`
+    - finger2 `[0.700796517084054, 0.4214989873195617, 1.1619941953812063]`
+  - update count reported as `proxy_middle_point_marker_update_count = 1`.
+- No grasp logic, close gate, or geometric filtering behavior was modified in this visual-marker pass.
+
+- Added phase visibility fixes for `scripts/task1_hybrid_geometric_phase2.py` (debug markers before deeper execution) so marker creation no longer depends on later phase success:
+  - Added/ensured immediate creation of `/World/DebugObjectGraspCenter` right after `estimate_object_grasp_frame(...)` using `object_grasp_center_world` from the selected object grasp frame.
+  - Added pregrasp target marker path `/World/DebugPregraspTarget` using the selected candidate `pregrasp_world` immediately after candidate selection (before pregrasp/descend execution).
+  - Added explicit IK failure observability around pregrasp phase execution:
+    - logs include `ik_target_position_world`, `ik_target_rpy`, `ik_success`, `position_error_norm`, `orientation_error_rad` in `pregrasp_result` payload;
+    - prints/flags `IK_PREGRASP_FAIL` on failed primary IK, and attempts one fallback IK with `yaw=0` (logged as `fallback_attempt`).
+- CLI and logging behavior changes for visibility:
+  - `execute_pregrasp(...)` now returns `fallback_attempt` payload and `ik_*` diagnostics.
+  - Main pregrasp logging includes `pregrasp_result` and `fallback_attempt`.
+  - Marker logs include `selected_pregrasp_target_debug_marker` with marker path/source.
+- Debug payload fields added/confirmed in logs:
+  - `proxy_middle_point_marker_path`
+  - `proxy_middle_point_source`
+  - `proxy_middle_point_component_positions_world`
+  - `selected_pregrasp_target_debug_marker`
+  - `pregrasp_result` with IK metrics/fallback.
+- GUI validation commands run:
+  - `/usr/bin/timeout 300 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 2 --arm auto --gui --log-suffix marker_debug_pregrasp_fail_check`
+  - `/usr/bin/timeout 300 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 1 --arm auto --gui --log-suffix marker_debug_visibility_test2 --servo-max-ticks 1 --pregrasp-tolerance 1e-6 --rot-tolerance 1e-6`
+  - `/usr/bin/timeout 300 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 1 --target-selection-policy index --target-index 0 --arm auto --gui --log-suffix marker_debug_pregrasp_fail_check3`
+  - `/usr/bin/timeout 300 /home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_hybrid_geometric_phase2.py --seed 376 --target-selection-policy index --target-index 2 --arm auto --gui --log-suffix marker_debug_pregrasp_fail_check4 --pregrasp-tolerance 1e-6 --servo-max-ticks 1 --rot-tolerance 1e-6`
+- Logs produced:
+  - `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T201206Z_marker_debug_visibility_test3.log`
+  - `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T201144Z_marker_debug_visibility_test2.log`
+  - `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T201330Z_marker_debug_pregrasp_fail_check3.log`
+  - `/home/edward/hrc-runtime/logs/task1_hybrid_geometric_phase2_20260418T201404Z_marker_debug_pregrasp_fail_check4.log`
+- Validation conclusion:
+  - Both `/World/DebugObjectGraspCenter` and `/World/DebugPregraspTarget` are logged and present in runtime payloads even when execution fails before main motion phases.
+  - Latest runs failed at `pregrasp_candidate_failed` or `phase2_close_gate_failed` in the tested seeds; no run in this batch reached a primary pregrasp IK failure path to demonstrate `IK_PREGRASP_FAIL` fallback outcome.
+  - This change is debug-only: no planner selection, geometry filters, grasp strategy, or IK solver internals were refactored.
+
+- Phase 2 close-decision hardening fix for "good-enough commit" semantics in `scripts/task1_hybrid_geometric_phase2.py`:
+  - Changed `evaluate_close_gate(...)` to a runtime-dominant commit gate:
+    - hard blockers are now:
+      - `close_commit_zone_pass` (runtime grasp-center/fingertip proximity, using `phase2_close_real_center_tolerance`)
+      - `table_clearance_pass`
+      - `width_compatibility_pass`
+      - `orientation_error_pass`
+    - soft warnings (logged but not decisive) are now:
+      - `alignment_pass`
+      - `lateral_symmetry_pass`
+      - `predicted_contact_asymmetry_pass`
+      - `recent_xy_drift_stable_pass`
+  - Old strict all-pass rule was replaced with `condition_met = all(hard_blockers.values())`.
+  - Added explicit logging fields in the close-gate payload:
+    - `hard_blockers`, `soft_warning_flags`
+    - `hard_fail_reasons`, `soft_warning_reasons`
+    - `soft_warning_present`, `hard_condition_passed`
+    - `commit_zone_error_m`, `close_commit_zone_tolerance_m`, `close_commit_zone_source`
+    - `alignment_error_rad`, `width_compatibility_m`, `width_compatibility_pass`
+  - Kept fallback (`evaluate_vertical_support_or_stall_close_fallback`) in place as secondary path for vertical support-stall recovery.
+  - No phase machine changes; two-stage close and recovery flow remain unchanged.
+- Commands run in this fix:
+  - `python3 -m py_compile scripts/task1_hybrid_geometric_phase2.py`
+  - `python3 scripts/task1_hybrid_geometric_phase2.py --help`
+- Current runtime note:
+  - This is a logic-logic adjustment only; runtime seed revalidation not run in this step.
+
+## 2026-04-19
+- Focused-only diagnostics for fingertip proxy correctness in `scripts/task1_hybrid_geometric_phase2.py` without changing close logic, close gate thresholds, planner selection, or phase transitions.
+- Added a temporary diagnostic bypass mode:
+  - new CLI flag `--phase2-diagnostic-finger-link-midpoint-bypass` (BooleanOptionalAction, default False).
+  - `_resolve_real_grasp_center_world(...)` now accepts `diagnostic_finger_link_midpoint_bypass` and `include_diagnostic_comparison` and forwards them internally.
+  - Public wrapper `resolve_real_grasp_center_world(...)` now exposes these diagnostic controls so call sites can enable them.
+  - Main phase path passes these flags into object grasp-center resolution (`--phase2-diagnostic-finger-link-midpoint-bypass`).
+- Added explicit fingertip-proxy diagnostics in close-critical pathways (log-only):
+  - `_pre_close_gate(...)` now logs:
+    - `tip1_world`, `tip2_world`,
+    - `distance_tip_mid_to_object_m`,
+    - `fingertip_reference_source_used`,
+    - `diagnostic_finger_link_midpoint_bypass_requested`,
+    - `diagnostic_finger_link_midpoint_bypass_compare_enabled`,
+    - plus existing legacy-vs-fingertip delta fields.
+  - `final_descent_local_ik(...)` now recomputes/debug-logs per sample:
+    - tip component positions,
+    - `tip1_world`, `tip2_world`,
+    - `distance_tip_mid_to_object_m`,
+    - measured/fallback fingertip semantics and component-based deltas.
+- Added/strengthened comparison metadata from `_resolve_real_grasp_center_world(...)`:
+  - `diagnostic_standard_midpoint_world`,
+  - `diagnostic_midpoint_delta_world`,
+  - `diagnostic_midpoint_delta_norm_m`,
+  - `diagnostic_compare_standard_midpoint_enabled`.
+- Fixed one runtime-safe code-order bug introduced in this diagnostic path (ensured `fingertip_midpoint_world` is defined before use in distance computation).
+- No close-gate behavior was modified in this change set.
+- Checks run:
+  - `python -m py_compile scripts/task1_hybrid_geometric_phase2.py`
+  - `python3 scripts/task1_hybrid_geometric_phase2.py --help`
+- Next step: run a focused runtime seed with `--phase2-diagnostic-finger-link-midpoint-bypass` on Linux GUI/headless to compare
+  - real fingertip midpoint path vs direct finger-link midpoint
+  - and distinguish incorrect proxy geometry from motion-targeting mismatch.
