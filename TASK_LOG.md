@@ -1010,3 +1010,105 @@
 - Geometry change: horizontal contact target receives a bounded closing-axis expansion before final descent, using `clamp(object_width * 0.3, 0.01, 0.03)`.
 - Logging added/extended: `descent_triggered`, `xy_error`, `xy_error_at_descent_trigger`, `horizontal_descent_trigger_tolerance_used`, table-clearance pass fields, `control_reference_source`, and `measured_world_source_for_descent`.
 - Test plan: run the contact-centric script in Isaac Sim with GUI/hold-open and inspect logs for horizontal descent start, tip-mid movement toward the object, reduced runtime tip-mid error, and eventual close-gate or runtime fallback pass.
+
+## 2026-04-19 — Phase 2 Task 1 hybrid grasp-center fallback priority fix
+
+- Active file patched: `scripts/task1_hybrid_geometric_phase2.py`.
+- Issue fixed: real grasp-center resolution could allow the finger-link midpoint diagnostic/fallback path to dominate before calibrated distal fingertip proxy semantics, even though finger link origins are low-accuracy palm/joint-side references.
+- Fallback priority now recorded as actual fingertip frames, calibrated distal fingertip proxy from bbox face, stable finger-link midpoint, explicit fallback proxy.
+- Diagnostic bypass behavior is now comparison-only for actual/calibrated success paths; link midpoint no longer overrides actual or calibrated fingertip references.
+- Added logs: `fingertip_source`, `calibrated_vs_link_midpoint_offset_m`, `calibrated_vs_link_midpoint_warning`, and diagnostic-bypass effect fields.
+- Tests run: none. Linux Isaac Sim runtime remains the validation source of truth.
+
+## 2026-04-19 — Phase 2 Task 1 contact-centric grasp-center fallback priority fix
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Critical bug fixed: `_resolve_real_grasp_center_world(...)` returned stable finger-link midpoint before calibrated distal fingertip proxy, even though finger-link origins are low-accuracy base/joint references rather than fingertip contact references.
+- Correct fallback order is now actual fingertip frames, calibrated distal fingertip proxy from bbox face, stable finger-link midpoint, explicit fallback proxy.
+- Diagnostic finger-link midpoint bypass no longer overrides actual or calibrated fingertip references; it is recorded as comparison-only on successful actual/calibrated paths.
+- Added diagnostics: `fingertip_source`, `calibrated_vs_link_midpoint_offset_m`, `calibrated_vs_link_midpoint_warning`, and diagnostic-bypass effect fields.
+- No IK, descent, planner, candidate-generation, or phase-machine logic was changed.
+- Tests run: none. Linux Isaac Sim runtime remains the validation source of truth.
+
+## 2026-04-19 — Phase 2 Task 1 contact-centric close safety and pose-builder cleanup
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Fixed `_pose_for_contact_reference_world(...)` so it builds through `_pose_for_point_b_world(...)` with `pose_log` instead of referencing undefined `log`.
+- Updated pose-construction metadata to state that contact references are converted through a local compatibility offset and that `point_B` is not final truth.
+- Added explicit fingertip-centric runtime-truth comment in `_compute_runtime_two_finger_metrics(...)`.
+- Added contact/control subject logs before far and vertical `final_descent_local_ik(...)` calls.
+- Added hard close refusal before `execute_two_stage_close(...)` when `close_critical_uses_real_grasp_center` is not true, preventing explicit proxy-only close authorization.
+- Removed vertical tip table-z auto-pass behavior; the rule is now an auxiliary diagnostic condition and final close still depends on primary, vertical fallback, or generic runtime commit gates.
+- No IK backend, planner, candidate generation, phase order, or perception logic was changed.
+- Tests run: none. Linux Isaac Sim runtime remains the validation source of truth.
+
+## 2026-04-19 — Phase 2 Task 1 contact-centric servo metric parameter binding fix
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Fixed `_execute_dualarmik_servo_phase(...)` parameter binding bug by moving `position_metric_offset_local` and `position_metric_label` into the real function signature before `extra_details`.
+- Removed the two pseudo-parameter annotation lines from the function body so the metric-stop logic no longer reads unbound locals.
+- Kept the existing metric-stop logic that prefers `position_metric_offset_local`, then falls back to point_B, then EE pose.
+- Fixed the `final_descent_local_ik(...)` call site so `_execute_dualarmik_servo_phase(...)` receives the actual nested `_pose_for_contact_reference_world` callback instead of an undefined `target_pose_fn` name.
+- No IK backend, planner, candidate generation, phase order, or control-law changes were made.
+- Tests run: none. Linux Isaac Sim runtime remains the validation source of truth.
+
+## 2026-04-19 — Phase 2 Task 1 contact-centric callback shadow fix
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Runtime bug fixed: `final_descent_local_ik(...)` defined a nested callback named `_pose_for_contact_reference_world`, shadowing the global pose-builder helper and causing Python to treat that name as an unbound local before the nested callback was defined.
+- Renamed the zero-argument nested callback to `contact_target_pose_fn` and passed that callback into `_execute_dualarmik_servo_phase(...)`.
+- Moved nominal contact-reference pose construction until after `contact_control_offset` is computed, so `_pose_for_contact_reference_world(...)` is called with a valid offset.
+- Added the nominal contact-reference pose conversion log into the final descent `target_lock_frame` payload.
+- No IK backend, planner, candidate generation, phase order, or control-law changes were made.
+- Checks passed: `python3 -m py_compile scripts/task1_phase2_contact_centric_patch.py` and `python3 scripts/task1_phase2_contact_centric_patch.py --help`.
+- Runtime limitation: no Linux Isaac Sim run was executed in this patch; Linux remains the runtime source of truth.
+
+## 2026-04-19 — Phase 2 Task 1 contact-centric close-truth priority fix
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Issue addressed: close gate could treat the calibrated distal fingertip proxy as close-critical truth when actual fingertip frames were unavailable, even when runtime evidence suggested that proxy could be far above and away from the visual pinch area.
+- Restored the close-truth priority required by `CURRENT_PLAN.md`: actual fingertip frame pair, then stable finger-link midpoint, then calibrated distal proxy as diagnostic-only, then explicit fallback proxy.
+- Calibrated distal proxy returns now set `close_critical_reference=false` with `close_critical_rejected_reason=calibrated_distal_proxy_pair_not_runtime_validated`; it can still be logged and drawn but cannot authorize close or drive contact-centric descent.
+- `_compute_runtime_two_finger_metrics(...)`, `evaluate_close_gate(...)`, and `evaluate_runtime_commit_fallback(...)` now only use runtime tip-mid error as decisive close truth when `primary_runtime_truth=true`, which requires a trusted close-critical reference.
+- `_pre_close_gate(...)` now distinguishes a present diagnostic `real_grasp_center_world` from a trusted close-critical grasp center; `close_critical_uses_real_grasp_center` is true only when the resolved reference is trusted.
+- Final descent now ignores untrusted calibrated-proxy midpoint for the control reference and falls back to point_B compatibility until actual or stable midpoint truth is available.
+- `_pose_for_contact_reference_world(...)` now overrides inherited helper metadata with `target_semantics=contact_reference_world_driven` while preserving the legacy helper's old semantics under `legacy_pose_builder_target_semantics`.
+- Added close-reference debug markers for runtime comparison:
+  `/World/DebugRealGraspCenter`, `/World/DebugContactPointWorld`, and `/World/DebugContactPointBWorld`, alongside the existing `DebugTip1World`, `DebugTip2World`, and `DebugTipMidWorld` markers.
+- No gate thresholds were relaxed in this patch; the existing catastrophic table-clearance blocker remains intact.
+- Checks passed: `python3 -m py_compile scripts/task1_phase2_contact_centric_patch.py`, `python3 scripts/task1_phase2_contact_centric_patch.py --help`, and `git diff --check -- scripts/task1_phase2_contact_centric_patch.py`.
+- Runtime limitation: no Linux Isaac Sim run was executed in this patch; the next Linux run should verify marker alignment and whether close failure now reports an untrusted calibrated proxy instead of a false high-altitude close truth.
+
+## 2026-04-19 — Phase 2 Task 1 contact-centric near-table commit gate tuning
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Issue addressed: near-table close could remain blocked when the candidate/contact geometry had a small negative table-clearance margin and the descent was already making tiny Z progress near contact.
+- Relaxed default `PHASE2_TABLE_CLEARANCE_MIN_M` from `0.002` to `-0.010`, so mild tabletop penetration/surface-contact estimates no longer fail the nominal table-clearance pass.
+- Relaxed default `PHASE2_CATASTROPHIC_TABLE_CLEARANCE_MIN_M` from `-0.002` to `-0.010`, so only deeper estimated penetration is treated as catastrophic.
+- Relaxed both Z-stall commit thresholds from `0.0015` to `0.010`:
+  `PHASE2_RUNTIME_COMMIT_FALLBACK_RECENT_Z_PROGRESS_MAX_M` and `PHASE2_VERTICAL_FALLBACK_RECENT_Z_PROGRESS_MAX_M`.
+- Updated CLI validation so `--phase2-table-clearance-min` may be negative as long as it remains at least as strict as `--catastrophic-table-clearance-min-m`.
+- Added explicit final-descent Z debug fields in trace samples:
+  `current_z_world_m`, `target_z_world_m`, `delta_z_world_m`, `commanded_z_world_m`, and `commanded_delta_z_world_m`.
+- Added log wording clarifying that Z-stall near contact is a commit condition, not a descent failure, and that table clearance now allows mild tabletop penetration but still blocks beyond the catastrophic threshold.
+- Did not add a default force-descend/no-gate override; forcing descent without gate checks remains too broad for the current contact-centric patch.
+- Checks passed:
+  `python3 -m py_compile scripts/task1_phase2_contact_centric_patch.py`,
+  `python3 scripts/task1_phase2_contact_centric_patch.py --help`,
+  and `python3 scripts/task1_phase2_contact_centric_patch.py --phase2-table-clearance-min -0.01 --catastrophic-table-clearance-min-m -0.01 --help`.
+- Runtime limitation: no Linux Isaac Sim run was executed in this patch; next Linux run should confirm whether the previous `table_clearance_margin_m≈-0.002` and small-Z-progress case now reaches close commit or a more specific remaining blocker.
+
+## 2026-04-19 — Phase 2 Task 1 candidate and stalled-Z fallback hardening
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Disabled least-bad candidate selection by default with `PHASE2_ALLOW_LEAST_BAD_CANDIDATE=false`; when no candidate passes all Phase 2 mandatory geometric checks, selection now fails early with `no_phase2_candidate_passed_mandatory_geometric_filter` instead of descending with an alignment/table-clearance failure.
+- Kept the CLI override `--phase2-allow-least-bad-candidate` for explicit diagnostics, but the default runtime path no longer continues after `geometric_pass_candidate_count == 0`.
+- Reworked vertical XY reference resolution so `finger_midpoint`/`fingertip_midpoint` uses actual fingertip pair if available, otherwise stable finger-link midpoint; calibrated distal proxy is not used as vertical XY truth.
+- Allowed the support-gap/Z-stall close fallback to apply to far motion policy when `--phase2-vertical-fallback-allow-far-policy` is enabled, while still requiring small support gap, Z stall, bounded XY drift, and orientation sanity.
+- Removed the final-decision `(not far_motion_policy)` block around `vertical_support_or_stall_fallback`, so a passing far stalled-Z fallback can actually authorize close.
+- Checks passed:
+  `python3 -m py_compile scripts/task1_phase2_contact_centric_patch.py`,
+  `python3 scripts/task1_phase2_contact_centric_patch.py --help`,
+  and `git diff --check -- scripts/task1_phase2_contact_centric_patch.py`.
+- Current runtime status from user feedback: still not solved; robot still has not completed the intended descend/close/grasp behavior.
+- Runtime limitation: no Linux Isaac Sim run was executed in this patch; next Linux run should verify that bad-orientation least-bad candidates fail before descent and that far hover cases can use stalled-Z fallback only when the logged support/XY/orientation gates pass.

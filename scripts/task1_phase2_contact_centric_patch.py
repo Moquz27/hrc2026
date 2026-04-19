@@ -66,28 +66,30 @@ HYBRID_PHASE1_BASIC_SYMMETRY_TOL_M = 0.040
 PHASE2_ALIGNMENT_ERROR_MAX_RAD = 0.75
 PHASE2_SYMMETRY_ERROR_MAX_M = 0.030
 PHASE2_CONTACT_ASYMMETRY_MAX_M = 0.030
-PHASE2_TABLE_CLEARANCE_MIN_M = 0.002
+PHASE2_TABLE_CLEARANCE_MIN_M = -0.010
 PHASE2_HORIZONTAL_TABLE_CLEARANCE_MIN_M = -0.005
 PHASE2_WIDTH_MIN_M = HYBRID_PHASE1_BASIC_WIDTH_MIN_M
 PHASE2_WIDTH_MAX_M = HYBRID_PHASE1_BASIC_WIDTH_MAX_M
 PHASE2_GEOMETRIC_VIOLATION_WEIGHT = 100.0
+PHASE2_ALLOW_LEAST_BAD_CANDIDATE = False
 PHASE2_CLOSE_REAL_CENTER_TOLERANCE_M = 0.030
 PHASE2_CLOSE_ORIENTATION_TOLERANCE_RAD = 0.35
 PHASE2_CATASTROPHIC_ORIENTATION_ERROR_MAX_RAD = 0.85
 PHASE2_SOFT_ORIENTATION_WARNING_MAX_RAD = PHASE2_CLOSE_ORIENTATION_TOLERANCE_RAD
 PHASE2_CLOSE_XY_DRIFT_MAX_M = 0.018
 PHASE2_RUNTIME_COMMIT_FALLBACK_TIP_MID_ERROR_MAX_M = 0.08
-PHASE2_RUNTIME_COMMIT_FALLBACK_RECENT_Z_PROGRESS_MAX_M = 0.0015
+PHASE2_RUNTIME_COMMIT_FALLBACK_RECENT_Z_PROGRESS_MAX_M = 0.010
 PHASE2_RUNTIME_COMMIT_FALLBACK_RECENT_XY_DRIFT_MAX_M = PHASE2_CLOSE_XY_DRIFT_MAX_M
 PHASE2_RUNTIME_COMMIT_FALLBACK_MIN_SAMPLES = 3
-PHASE2_CATASTROPHIC_TABLE_CLEARANCE_MIN_M = -0.002
+PHASE2_CATASTROPHIC_TABLE_CLEARANCE_MIN_M = -0.010
 PHASE2_VERTICAL_FALLBACK_SUPPORT_GAP_MAX_M = 0.004
 PHASE2_VERTICAL_FALLBACK_SUPPORT_GAP_MIN_M = -0.020
-PHASE2_VERTICAL_FALLBACK_RECENT_Z_PROGRESS_MAX_M = 0.0015
+PHASE2_VERTICAL_FALLBACK_RECENT_Z_PROGRESS_MAX_M = 0.010
 PHASE2_VERTICAL_FALLBACK_MIN_DESCENT_SAMPLES = 2
 PHASE2_VERTICAL_FALLBACK_ORIENTATION_TOLERANCE_RAD = 0.65
+PHASE2_VERTICAL_FALLBACK_ALLOW_FAR_POLICY = True
 PHASE2_VERTICAL_TIP_TABLE_Z_CLOSE_THRESHOLD_M = 0.0005
-PHASE2_DESCENT_XY_STEP_M = 0.006
+PHASE2_DESCENT_XY_STEP_M = 0.01
 PHASE2_DESCENT_Z_STEP_M = 0.003
 PHASE2_DESCENT_YAW_STEP_RAD = 0.04
 PHASE2_DESCENT_MAX_TICKS = 120
@@ -122,12 +124,18 @@ DEBUG_TIP2_MARKER_PATH = "/World/DebugTip2World"
 DEBUG_TIP_MID_MARKER_PATH = "/World/DebugTipMidWorld"
 DEBUG_OBJECT_CENTER_MARKER_PATH = "/World/DebugObjectCenter"
 DEBUG_RUNTIME_OBJECT_GRASP_CENTER_MARKER_PATH = "/World/DebugRuntimeObjectGraspCenter"
+DEBUG_REAL_GRASP_CENTER_MARKER_PATH = "/World/DebugRealGraspCenter"
+DEBUG_CONTACT_POINT_MARKER_PATH = "/World/DebugContactPointWorld"
+DEBUG_CONTACT_POINT_B_MARKER_PATH = "/World/DebugContactPointBWorld"
 DEBUG_TIP_MARKER_RADIUS_M = 0.010
 DEBUG_TIP1_MARKER_COLOR = (0.0, 0.45, 1.0)
 DEBUG_TIP2_MARKER_COLOR = (0.0, 0.95, 1.0)
 DEBUG_TIP_MID_MARKER_COLOR = (1.0, 0.85, 0.0)
 DEBUG_OBJECT_CENTER_MARKER_COLOR = (1.0, 1.0, 1.0)
 DEBUG_RUNTIME_OBJECT_GRASP_CENTER_MARKER_COLOR = (0.1, 1.0, 0.25)
+DEBUG_REAL_GRASP_CENTER_MARKER_COLOR = (1.0, 0.15, 0.15)
+DEBUG_CONTACT_POINT_MARKER_COLOR = (0.8, 0.2, 1.0)
+DEBUG_CONTACT_POINT_B_MARKER_COLOR = (1.0, 0.55, 0.05)
 
 TCP_OFFSET_FALLBACK_X = 0.155
 TCP_OFFSET_EPS = 1.0e-4
@@ -1907,6 +1915,8 @@ def _compute_runtime_two_finger_metrics(
     fallback_midpoint_world: np.ndarray | list[float] | None = None,
     fallback_source: str | None = None,
 ) -> dict[str, Any]:
+    # Runtime truth is fingertip-centric.
+    # point_B is compatibility-only and must not be treated as final grasp truth.
     reference_log = reference_log if isinstance(reference_log, dict) else {}
     object_grasp_frame = object_grasp_frame if isinstance(object_grasp_frame, dict) else {}
     component_positions = reference_log.get(
@@ -2001,10 +2011,16 @@ def _compute_runtime_two_finger_metrics(
     if two_tip_geometry_available:
         tip_z_asymmetry = float(abs(float(tip1_world[2]) - float(tip2_world[2])))
 
-    primary_truth_available = bool(two_tip_geometry_available and tip_mid_world is not None)
+    close_critical_reference_trusted = bool(reference_log.get("close_critical_reference", False))
+    primary_truth_available = bool(
+        two_tip_geometry_available
+        and tip_mid_world is not None
+        and close_critical_reference_trusted
+    )
     return {
         "metric_schema": "contact_centric_two_finger_runtime_metrics_v1",
         "primary_runtime_truth": primary_truth_available,
+        "close_critical_reference_trusted": close_critical_reference_trusted,
         "two_tip_geometry_available": two_tip_geometry_available,
         "tip1_world": None if tip1_world is None else tip1_world.tolist(),
         "tip2_world": None if tip2_world is None else tip2_world.tolist(),
@@ -2044,20 +2060,92 @@ def _pose_for_contact_reference_world(
     rpy_base: np.ndarray | list[float],
     contact_reference_offset_local: np.ndarray | list[float],
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    pose, log = _pose_for_point_b_world(
+    pose, pose_log = _pose_for_point_b_world(
         contact_reference_world,
         coord_transform,
         rpy_base,
         contact_reference_offset_local,
     )
     log = {
-        **log,
-        "pose_construction_semantics": "contact_reference_first_point_B_compatibility_conversion_second",
+        **pose_log,
+        "legacy_pose_builder_target_semantics": pose_log.get("target_semantics"),
+        "target_semantics": "contact_reference_world_driven",
+        "pose_construction_semantics": "contact_reference_converted_through_local_compatibility_offset",
         "contact_reference_world": np.array(contact_reference_world, dtype=float).tolist(),
         "contact_reference_offset_local": np.array(contact_reference_offset_local, dtype=float).tolist(),
+        "point_b_target_world_is_contact_reference_alias": True,
         "point_B_final_truth_source": False,
+        "compatibility_conversion_only": True,
     }
     return pose, log
+
+
+def _resolve_vertical_finger_midpoint_reference_position(
+    *,
+    stage: Any,
+    dc: Any,
+    articulation: Any,
+    robot_root_path: str,
+    arm_side: str,
+    requested_name_token: str,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    actual_world, actual_log = _resolve_actual_fingertip_pair_midpoint_reference_position(
+        stage=stage,
+        dc=dc,
+        articulation=articulation,
+        robot_root_path=robot_root_path,
+        arm_side=arm_side,
+        requested_name_token=f"{requested_name_token}_actual_fingertip_pair",
+    )
+    link_world, link_log = _resolve_finger_midpoint_reference_position(
+        stage=stage,
+        dc=dc,
+        articulation=articulation,
+        robot_root_path=robot_root_path,
+        arm_side=arm_side,
+        requested_name_token=f"{requested_name_token}_stable_link_pair",
+    )
+    if actual_world is not None:
+        return np.array(actual_world, dtype=float), {
+            **actual_log,
+            "requested_name_token": requested_name_token,
+            "source": "actual_fingertip_frame_pair_midpoint",
+            "reference_mode": "vertical_actual_fingertip_or_stable_link_midpoint",
+            "vertical_xy_reference_truth_source": "actual_fingertip_frame_pair_midpoint",
+            "vertical_xy_reference_proxy_policy": "point_B_compatibility_only_calibrated_distal_proxy_not_used",
+            "stable_link_midpoint_attempt": link_log,
+            "close_critical_reference": True,
+            "fallback_used": False,
+        }
+    if link_world is not None:
+        return np.array(link_world, dtype=float), {
+            **link_log,
+            "requested_name_token": requested_name_token,
+            "source": "stable_finger_link_pair_midpoint",
+            "fingertip_reference_source": "stable_finger_link_pair_midpoint",
+            "fingertip_reference_source_used": "stable_finger_link_pair_midpoint",
+            "reference_mode": "vertical_actual_fingertip_or_stable_link_midpoint",
+            "vertical_xy_reference_truth_source": "stable_finger_link_pair_midpoint",
+            "vertical_xy_reference_proxy_policy": "point_B_compatibility_only_calibrated_distal_proxy_not_used",
+            "actual_fingertip_pair_attempt": actual_log,
+            "close_critical_reference": True,
+            "fallback_used": True,
+            "fallback_source": "stable_finger_link_pair_midpoint",
+            "fallback_status": "actual_fingertip_pair_missing_used_stable_finger_link_pair_midpoint",
+        }
+    return None, {
+        "enabled": True,
+        "resolved": False,
+        "source": None,
+        "requested_name_token": requested_name_token,
+        "reference_mode": "vertical_actual_fingertip_or_stable_link_midpoint",
+        "arm_side": arm_side,
+        "actual_fingertip_pair_attempt": actual_log,
+        "stable_link_midpoint_attempt": link_log,
+        "vertical_xy_reference_proxy_policy": "calibrated_distal_proxy_is_diagnostic_only_not_vertical_xy_truth",
+        "reason": "vertical_xy_reference_requires_actual_fingertip_pair_or_stable_finger_link_pair_midpoint",
+        "fallback": "point_B XY compatibility remains active",
+    }
 
 
 def _upsert_two_finger_runtime_debug_markers(
@@ -2112,9 +2200,10 @@ def _reference_comparison_payload(
         "truth_order": [
             "actual_fingertip_frame_pair",
             "stable_finger_link_pair_midpoint",
-            "calibrated_distal_proxy_pair",
+            "calibrated_distal_proxy_pair_diagnostic_only",
             "explicit_fallback_proxy",
         ],
+        "calibrated_proxy_close_authority": "diagnostic_only_unless_promoted_after_runtime_validation",
         "bad_proxy_must_not_silently_dominate": True,
     }
 
@@ -2212,61 +2301,6 @@ def _resolve_real_grasp_center_world(
             "diagnostic_midpoint_delta_norm_m": float(np.linalg.norm(delta)),
         }
 
-    if diagnostic_finger_link_midpoint_bypass:
-        link_midpoint_world, link_midpoint_log = _resolve_finger_link_midpoint_diagnostic_world(
-            stage=stage,
-            dc=dc,
-            articulation=articulation,
-            robot_root_path=robot_root_path,
-            arm_side=arm_side,
-        )
-        if link_midpoint_world is not None:
-            actual_diag_world, actual_diag_log = _resolve_actual_fingertip_pair_midpoint_reference_position(
-                stage=stage,
-                dc=dc,
-                articulation=articulation,
-                robot_root_path=robot_root_path,
-                arm_side=arm_side,
-                requested_name_token="diagnostic_actual_fingertip_pair_compare",
-            )
-            calibrated_diag_world, calibrated_diag_log = _resolve_calibrated_distal_proxy_pair_midpoint_reference_position(
-                stage=stage,
-                dc=dc,
-                articulation=articulation,
-                robot_root_path=robot_root_path,
-                arm_side=arm_side,
-                requested_name_token="diagnostic_calibrated_distal_proxy_pair_compare",
-            )
-            diagnostic_comparison_payload = _reference_comparison_payload(
-                actual_log=actual_diag_log,
-                link_log=link_midpoint_log,
-                calibrated_log=calibrated_diag_log,
-            )
-            comparison_log = _compare_with_diagnostic_link_midpoint(
-                primary_world=link_midpoint_world,
-                primary_log=link_midpoint_log,
-            )
-            return link_midpoint_world, {
-                **link_midpoint_log,
-                "grasp_center_definition": "diagnostic bypass using direct finger-link midpoint",
-                "resolution_priority": [
-                    "diagnostic_finger1_link_and_finger2_link_midpoint",
-                    "actual_fingertip_frames_if_diagnostic_bypass_unresolved",
-                    "stable_finger_link_pair_midpoint",
-                    "calibrated_finger_link_tip_proxy",
-                    "explicit_fallback_proxy",
-                ],
-                "fallback_used": False,
-                "diagnostic_finger_link_midpoint_bypass": True,
-                "close_critical_reference": True,
-                "diagnostic_two_finger_reference_comparison": diagnostic_comparison_payload,
-                "diagnostic_actual_fingertip_pair_world": None if actual_diag_world is None else np.array(actual_diag_world, dtype=float).tolist(),
-                "diagnostic_calibrated_distal_proxy_pair_world": None
-                if calibrated_diag_world is None
-                else np.array(calibrated_diag_world, dtype=float).tolist(),
-                **comparison_log,
-            }
-
     actual_center_world, actual_log = _resolve_actual_fingertip_pair_midpoint_reference_position(
         stage=stage,
         dc=dc,
@@ -2296,6 +2330,15 @@ def _resolve_real_grasp_center_world(
         link_log=link_midpoint_log,
         calibrated_log=calibrated_log,
     )
+    calibrated_vs_link_midpoint_offset_m = None
+    calibrated_vs_link_midpoint_warning = None
+    if calibrated_center_world is not None and link_midpoint_world is not None:
+        calibrated_arr = np.array(calibrated_center_world, dtype=float)
+        link_arr = np.array(link_midpoint_world, dtype=float)
+        if np.isfinite(calibrated_arr).all() and np.isfinite(link_arr).all():
+            calibrated_vs_link_midpoint_offset_m = float(np.linalg.norm(calibrated_arr - link_arr))
+            if calibrated_vs_link_midpoint_offset_m < 0.02:
+                calibrated_vs_link_midpoint_warning = "Calibrated fingertip proxy offset too small - likely incorrect proxy geometry"
 
     if actual_center_world is not None:
         comparison_log = _compare_with_diagnostic_link_midpoint(
@@ -2308,10 +2351,20 @@ def _resolve_real_grasp_center_world(
             "resolution_priority": [
                 "actual_fingertip_frames_if_available",
                 "stable_finger_link_pair_midpoint",
-                "calibrated_finger_link_tip_proxy_from_distal_bbox_face",
+                "calibrated_finger_link_tip_proxy_from_distal_bbox_face_diagnostic_only",
                 "explicit_fallback_proxy",
             ],
+            "fingertip_source": "actual",
+            "calibrated_proxy_close_authority": "diagnostic_only",
+            "calibrated_vs_link_midpoint_offset_m": calibrated_vs_link_midpoint_offset_m,
+            "calibrated_vs_link_midpoint_warning": calibrated_vs_link_midpoint_warning,
             "fallback_used": False,
+            "diagnostic_finger_link_midpoint_bypass": bool(diagnostic_finger_link_midpoint_bypass),
+            "diagnostic_finger_link_midpoint_bypass_effect": (
+                "comparison_only_link_midpoint_no_override"
+                if diagnostic_finger_link_midpoint_bypass
+                else "inactive"
+            ),
             "close_critical_reference": True,
             "diagnostic_two_finger_reference_comparison": comparison_payload,
             **comparison_log,
@@ -2329,15 +2382,21 @@ def _resolve_real_grasp_center_world(
             "source": "stable_finger_link_pair_midpoint",
             "fingertip_reference_source": "stable_finger_link_pair_midpoint",
             "fingertip_reference_source_used": "stable_finger_link_pair_midpoint",
-            "grasp_center_definition": "stable midpoint between finger link references after actual fingertip frames failed",
+            "fingertip_source": "stable_link_midpoint",
+            "grasp_center_definition": "stable midpoint between finger link references after actual fingertip frames failed; calibrated distal proxy remains diagnostic only",
             "resolution_priority": [
                 "actual_fingertip_frames_if_available",
                 "stable_finger_link_pair_midpoint",
-                "calibrated_finger_link_tip_proxy_from_distal_bbox_face",
+                "calibrated_finger_link_tip_proxy_from_distal_bbox_face_diagnostic_only",
                 "explicit_fallback_proxy",
             ],
+            "calibrated_proxy_close_authority": "diagnostic_only",
+            "calibrated_vs_link_midpoint_offset_m": calibrated_vs_link_midpoint_offset_m,
+            "calibrated_vs_link_midpoint_warning": calibrated_vs_link_midpoint_warning,
             "fallback_used": True,
             "fallback_source": "stable_finger_link_pair_midpoint",
+            "diagnostic_finger_link_midpoint_bypass": bool(diagnostic_finger_link_midpoint_bypass),
+            "diagnostic_finger_link_midpoint_bypass_effect": "comparison_only_no_override",
             "close_critical_reference": True,
             "diagnostic_two_finger_reference_comparison": comparison_payload,
             **fallback_comparison,
@@ -2352,16 +2411,23 @@ def _resolve_real_grasp_center_world(
             **calibrated_log,
             "actual_fingertip_pair_resolution_log": actual_log,
             "stable_finger_link_midpoint_resolution_log": link_midpoint_log,
-            "grasp_center_definition": "midpoint_between_calibrated_distal_fingertip_proxies_after_actual_and_stable_link_midpoint_failed",
+            "grasp_center_definition": "diagnostic midpoint between calibrated distal fingertip proxies after actual and stable link midpoint failed",
             "resolution_priority": [
                 "actual_fingertip_frames_if_available",
                 "stable_finger_link_pair_midpoint",
-                "calibrated_finger_link_tip_proxy_from_distal_bbox_face",
+                "calibrated_finger_link_tip_proxy_from_distal_bbox_face_diagnostic_only",
                 "explicit_fallback_proxy",
             ],
+            "fingertip_source": "calibrated_proxy_diagnostic_only",
+            "calibrated_proxy_close_authority": "diagnostic_only",
+            "calibrated_vs_link_midpoint_offset_m": calibrated_vs_link_midpoint_offset_m,
+            "calibrated_vs_link_midpoint_warning": calibrated_vs_link_midpoint_warning,
             "fallback_used": True,
-            "fallback_source": "calibrated_distal_proxy_pair",
-            "close_critical_reference": True,
+            "fallback_source": "calibrated_distal_proxy_pair_diagnostic_only",
+            "diagnostic_finger_link_midpoint_bypass": bool(diagnostic_finger_link_midpoint_bypass),
+            "diagnostic_finger_link_midpoint_bypass_effect": "comparison_only_no_override",
+            "close_critical_reference": False,
+            "close_critical_rejected_reason": "calibrated_distal_proxy_pair_not_runtime_validated",
             "diagnostic_two_finger_reference_comparison": comparison_payload,
             **comparison_log,
         }
@@ -2385,9 +2451,13 @@ def _resolve_real_grasp_center_world(
                 "resolution_priority": [
                     "actual_fingertip_frames_if_available",
                     "stable_finger_link_pair_midpoint",
-                    "calibrated_finger_link_tip_proxy_from_distal_bbox_face",
+                    "calibrated_finger_link_tip_proxy_from_distal_bbox_face_diagnostic_only",
                     "explicit_fallback_proxy",
                 ],
+                "fingertip_source": "explicit_fallback_proxy",
+                "calibrated_proxy_close_authority": "diagnostic_only",
+                "calibrated_vs_link_midpoint_offset_m": calibrated_vs_link_midpoint_offset_m,
+                "calibrated_vs_link_midpoint_warning": calibrated_vs_link_midpoint_warning,
                 "close_critical_reference": False,
                 "diagnostic_two_finger_reference_comparison": comparison_payload,
                 **fallback_comparison,
@@ -2402,11 +2472,16 @@ def _resolve_real_grasp_center_world(
         "resolution_priority": [
             "actual_fingertip_frames_if_available",
             "stable_finger_link_pair_midpoint",
-            "calibrated_finger_link_tip_proxy_from_distal_bbox_face",
+            "calibrated_finger_link_tip_proxy_from_distal_bbox_face_diagnostic_only",
             "explicit_fallback_proxy",
         ],
+        "fingertip_source": None,
+        "calibrated_proxy_close_authority": "diagnostic_only",
+        "calibrated_vs_link_midpoint_offset_m": calibrated_vs_link_midpoint_offset_m,
+        "calibrated_vs_link_midpoint_warning": calibrated_vs_link_midpoint_warning,
         "fallback_used": False,
         "diagnostic_finger_link_midpoint_bypass": bool(diagnostic_finger_link_midpoint_bypass),
+        "diagnostic_finger_link_midpoint_bypass_effect": "comparison_only_no_override",
         "close_critical_reference": bool(center_world is not None),
         "fallback": None if center_world is not None else "close-critical evaluation falls back to point_B proxy",
         "diagnostic_two_finger_reference_comparison": comparison_payload,
@@ -2454,7 +2529,7 @@ def _resolve_current_vertical_xy_reference_world(
     log = reference_log or {}
     requested_reference = str(log.get("requested_name_token") or DEFAULT_VERTICAL_XY_REFERENCE_LINK)
     if _is_finger_midpoint_vertical_reference(requested_reference):
-        live_world, live_log = _resolve_fingertip_midpoint_reference_position(
+        live_world, live_log = _resolve_vertical_finger_midpoint_reference_position(
             stage=stage,
             dc=dc,
             articulation=articulation,
@@ -2501,7 +2576,7 @@ def _resolve_vertical_xy_reference_offset(
 ) -> tuple[np.ndarray | None, dict[str, Any]]:
     requested_reference = str(args.vertical_xy_reference_link)
     if _is_finger_midpoint_vertical_reference(requested_reference):
-        reference_world, reference_log = _resolve_fingertip_midpoint_reference_position(
+        reference_world, reference_log = _resolve_vertical_finger_midpoint_reference_position(
             stage=stage,
             dc=dc,
             articulation=articulation,
@@ -3459,7 +3534,8 @@ def select_best_phase2_candidate(
     passing = [candidate for candidate in filtered_ranked if bool(candidate.get("valid", False)) and bool(candidate.get("phase2_filter_pass", False))]
     selected = passing[0] if passing else None
     selection_warning = None
-    if selected is None and bool(getattr(args, "phase2_allow_least_bad_candidate", True)) and filtered_ranked:
+    allow_least_bad = bool(getattr(args, "phase2_allow_least_bad_candidate", PHASE2_ALLOW_LEAST_BAD_CANDIDATE))
+    if selected is None and allow_least_bad and filtered_ranked:
         valid_or_all = [candidate for candidate in filtered_ranked if bool(candidate.get("valid", False))] or filtered_ranked
         selected = min(
             valid_or_all,
@@ -3471,8 +3547,11 @@ def select_best_phase2_candidate(
         )
         selection_warning = "no_candidate_passed_all_phase2_mandatory_checks_least_bad_selected"
         selected["phase2_filter_warning"] = selection_warning
+    if selected is None and filtered_ranked and not allow_least_bad:
+        selection_warning = "no_candidate_passed_all_phase2_mandatory_checks_least_bad_disabled"
     return selected, {
-        "selection_policy": "phase2_score_sort_then_fast_geometric_filter_first_pass",
+        "selection_policy": "phase2_score_sort_then_fast_geometric_filter_first_pass_no_least_bad_by_default",
+        "least_bad_candidate_allowed": allow_least_bad,
         "phase1_selection": phase1_selection,
         "phase1_selected_candidate": phase1_selected,
         "candidate_scores": phase1_selection["candidate_scores"],
@@ -3483,7 +3562,13 @@ def select_best_phase2_candidate(
         "ranked_candidate_ids": [candidate.get("preset_id") for candidate in filtered_ranked],
         "selected_candidate": selected,
         "selection_warning": selection_warning,
-        "failure_reason": None if selected is not None else "no_valid_phase2_candidate",
+        "failure_reason": None
+        if selected is not None
+        else (
+            "no_phase2_candidate_passed_mandatory_geometric_filter"
+            if filtered_ranked
+            else "no_valid_phase2_candidate"
+        ),
     }
 
 
@@ -5257,7 +5342,7 @@ def _execute_dualarmik_servo_phase(
     gripper_dofs: list[tuple[int, Any, str]],
     sim_app: Any,
     args: argparse.Namespace,
-    counter: dict[str, int],
+    counter: dict[str, Any],
     phase_log: list[dict[str, Any]],
     end_effector_name: str,
     end_effector_path: str,
@@ -5266,6 +5351,8 @@ def _execute_dualarmik_servo_phase(
     per_tick_monitor_fn: Callable[[], None] | None = None,
     coord_transform_refresh_fn: Callable[[], dict[str, Any]] | None = None,
     ik_overrides: dict[str, Any] | None = None,
+    position_metric_offset_local: np.ndarray | None = None,
+    position_metric_label: str | None = None,
     extra_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     start_step = counter["step"]
@@ -5275,7 +5362,19 @@ def _execute_dualarmik_servo_phase(
     coord_refresh_samples: list[dict[str, Any]] = []
     coord_refresh_failures = 0
     target_pose_eval_count = 0
+    point_b_offset_for_log = getattr(args, "point_b_offset_local_resolved", None)
+    point_b_offset_for_log = None if point_b_offset_for_log is None else np.array(point_b_offset_for_log, dtype=float)
 
+    metric_offset_for_stop = None
+    if position_metric_offset_local is not None:
+        metric_offset_for_stop = np.array(position_metric_offset_local, dtype=float)
+    elif point_b_offset_for_log is not None:
+        metric_offset_for_stop = point_b_offset_for_log.copy()
+
+    metric_label = position_metric_label or (
+        "contact_reference_world" if position_metric_offset_local is not None
+        else ("point_B_world" if point_b_offset_for_log is not None else "ee_pose_base")
+    )
     ik_refresh_active = bool(getattr(args, "ik_refresh_enable", DEFAULT_IK_REFRESH_ENABLE))
     ik_refresh_period = max(1, int(getattr(args, "ik_refresh_period", DEFAULT_IK_REFRESH_PERIOD)))
     ik_refresh_drift_threshold = float(getattr(args, "ik_refresh_drift_threshold", DEFAULT_IK_REFRESH_DRIFT_THRESHOLD))
@@ -5320,14 +5419,14 @@ def _execute_dualarmik_servo_phase(
         if force_sample or tick == 0 or tick == 1 or tick % int(args.trace_interval) == 0:
             coord_refresh_samples.append({"tick": tick, "reason": reason, **refresh_log})
 
-    def position_metric_errors(current_pose_base: np.ndarray, target_pose_base: np.ndarray) -> tuple[float, float, float | None]:
+    def position_metric_errors(current_pose_base, target_pose_base):
         ee_pos_err, _ = _pose_error(ik_solver, current_pose_base, target_pose_base)
-        if point_b_offset_for_log is None:
+        if metric_offset_for_stop is None:
             return ee_pos_err, ee_pos_err, None
-        current_b = _point_b_world_from_pose(coord_transform, current_pose_base, point_b_offset_for_log)
-        target_b = _point_b_world_from_pose(coord_transform, target_pose_base, point_b_offset_for_log)
-        point_b_err = float(np.linalg.norm(current_b - target_b))
-        return point_b_err, ee_pos_err, point_b_err
+        current_metric_world = _point_world_from_pose(coord_transform, current_pose_base, metric_offset_for_stop)
+        target_metric_world = _point_world_from_pose(coord_transform, target_pose_base, metric_offset_for_stop)
+        metric_err = float(np.linalg.norm(current_metric_world - target_metric_world))
+        return metric_err, ee_pos_err, metric_err
 
     def target_pose_drift(reference_pose_base: np.ndarray, live_pose_base: np.ndarray) -> dict[str, Any]:
         _, rot_drift = _pose_error(ik_solver, reference_pose_base, live_pose_base)
@@ -5531,7 +5630,7 @@ def _execute_dualarmik_servo_phase(
                 "target_ee_origin_world": _pose_position_world(coord_transform, target_pose).tolist(),
                 "ee_origin_world": _pose_position_world(coord_transform, updated_pose).tolist(),
                 "position_error_m": updated_pos_err,
-                "position_error_metric": "point_B_world" if point_b_metric_active else "ee_pose_base",
+                "position_error_metric": metric_label,
                 "ee_position_error_base_m": updated_ee_pos_err,
                 "point_B_position_error_world_m": updated_point_b_err,
                 "rotation_error_rad": updated_rot_err,
@@ -5802,7 +5901,11 @@ def _pre_close_gate(
     close_critical_world = point_b_world
     close_critical_error = point_b_error
     close_critical_metric = "point_B_proxy_world_fallback"
-    if real_grasp_center_world is not None:
+    close_critical_uses_real_grasp_center = bool(
+        real_grasp_center_world is not None
+        and real_grasp_center_log.get("close_critical_reference", False)
+    )
+    if close_critical_uses_real_grasp_center:
         real_grasp_center_world = np.array(real_grasp_center_world, dtype=float)
         proxy_to_real_delta_world = real_grasp_center_world - point_b_world
         proxy_to_real_delta_norm = float(np.linalg.norm(proxy_to_real_delta_world))
@@ -5811,6 +5914,8 @@ def _pre_close_gate(
         close_critical_world = real_grasp_center_world
         close_critical_error = real_grasp_center_error
         close_critical_metric = "real_grasp_center_world"
+    elif real_grasp_center_world is not None:
+        real_grasp_center_world = np.array(real_grasp_center_world, dtype=float)
     fingertip_reference_source_used = real_grasp_center_log.get(
         "fingertip_reference_source_used",
         real_grasp_center_log.get("fingertip_reference_source", real_grasp_center_log.get("source")),
@@ -5856,7 +5961,7 @@ def _pre_close_gate(
         reference_log=real_grasp_center_log,
         object_grasp_frame=runtime_object_grasp_frame,
         object_center_world=object_center_world,
-        fallback_midpoint_world=real_grasp_center_world if real_grasp_center_world is not None else point_b_world,
+        fallback_midpoint_world=real_grasp_center_world if close_critical_uses_real_grasp_center else point_b_world,
         fallback_source=close_critical_metric,
     )
     two_finger_marker_log = _upsert_two_finger_runtime_debug_markers(
@@ -5864,6 +5969,60 @@ def _pre_close_gate(
         metrics=close_runtime_metrics,
         enabled=bool(getattr(args, "diagnostic_two_finger_marker_enable", True)),
     )
+    close_reference_debug_markers: dict[str, Any] = {
+        "enabled": bool(getattr(args, "diagnostic_two_finger_marker_enable", True)),
+        "marker_schema": "contact_centric_close_reference_markers_v1",
+        "markers": {},
+    }
+    if close_reference_debug_markers["enabled"]:
+        close_marker_specs = [
+            (
+                "real_grasp_center_world",
+                DEBUG_REAL_GRASP_CENTER_MARKER_PATH,
+                real_grasp_center_world,
+                DEBUG_REAL_GRASP_CENTER_MARKER_COLOR,
+            ),
+            (
+                "contact_point_world",
+                DEBUG_CONTACT_POINT_MARKER_PATH,
+                geometry.get("contact_point_world"),
+                DEBUG_CONTACT_POINT_MARKER_COLOR,
+            ),
+            (
+                "contact_point_B_world",
+                DEBUG_CONTACT_POINT_B_MARKER_PATH,
+                target_point_b_world,
+                DEBUG_CONTACT_POINT_B_MARKER_COLOR,
+            ),
+        ]
+        for marker_key, marker_path, marker_position, marker_color in close_marker_specs:
+            marker_pos = _finite_world_vector_or_none(marker_position)
+            if marker_pos is None:
+                close_reference_debug_markers["markers"][marker_key] = {
+                    "path": marker_path,
+                    "updated": False,
+                    "reason": "position_unavailable",
+                }
+                continue
+            try:
+                _upsert_debug_marker(
+                    stage=stage,
+                    path=marker_path,
+                    position=marker_pos,
+                    radius=DEBUG_TIP_MARKER_RADIUS_M,
+                    color=marker_color,
+                )
+                close_reference_debug_markers["markers"][marker_key] = {
+                    "path": marker_path,
+                    "updated": True,
+                    "world_position": marker_pos.tolist(),
+                }
+            except Exception as exc:
+                close_reference_debug_markers["markers"][marker_key] = {
+                    "path": marker_path,
+                    "updated": False,
+                    "error": repr(exc),
+                }
     legacy_to_tip_delta_world = real_grasp_center_log.get(
         "legacy_link_midpoint_to_fingertip_midpoint_delta_world",
         real_grasp_center_log.get("legacy_link_midpoint_to_fingertip_delta_world"),
@@ -5923,6 +6082,8 @@ def _pre_close_gate(
         "real_grasp_center_world": None if real_grasp_center_world is None else real_grasp_center_world.tolist(),
         "real_grasp_center_log": real_grasp_center_log,
         "real_grasp_center_source": real_grasp_center_log.get("source"),
+        "real_grasp_center_close_critical_reference": bool(real_grasp_center_log.get("close_critical_reference", False)),
+        "real_grasp_center_close_critical_rejected_reason": real_grasp_center_log.get("close_critical_rejected_reason"),
         "fingertip_reference_source_used": fingertip_reference_source_used,
         "fingertip_reference_fallback_used": bool(real_grasp_center_log.get("fallback_used", False)),
         "fingertip_component_positions_world": fingertip_component_positions,
@@ -5943,6 +6104,7 @@ def _pre_close_gate(
         "close_runtime_metrics": close_runtime_metrics,
         "runtime_two_finger_geometry_primary": bool(close_runtime_metrics.get("primary_runtime_truth", False)),
         "two_finger_runtime_debug_markers": two_finger_marker_log,
+        "close_reference_debug_markers": close_reference_debug_markers,
         "distance_tip_mid_to_object_m": distance_tip_mid_to_object,
         "diagnostic_finger_link_midpoint_bypass_requested": diagnostic_bypass,
         "diagnostic_finger_link_midpoint_bypass_compare_enabled": bool(diagnostic_bypass),
@@ -5961,7 +6123,7 @@ def _pre_close_gate(
         "close_critical_eval_world": close_critical_world.tolist(),
         "close_critical_target_world": target_point_b_world.tolist(),
         "close_critical_error_before_close_m": close_critical_error,
-        "close_critical_uses_real_grasp_center": bool(real_grasp_center_world is not None),
+        "close_critical_uses_real_grasp_center": close_critical_uses_real_grasp_center,
         "far_low_side_prepare_B_world": geometry.get("far_low_side_prepare_B_world"),
         "far_xy_align_B_world": geometry.get("far_xy_align_B_world"),
         "far_descend_B_world": geometry.get("far_descend_B_world"),
@@ -6136,7 +6298,6 @@ def final_descent_local_ik(
     locked_target = np.array(locked_target_world, dtype=float)
     locked_rpy_arr = np.array(locked_rpy, dtype=float)
     point_b_offset = np.array(point_b_offset_local, dtype=float)
-    nominal_target_pose_base = np.array(locked_target_pose_base, dtype=float)
     diagnostic_bypass = bool(getattr(args, "phase2_diagnostic_finger_link_midpoint_bypass", False))
     object_center_candidate = geometry.get("object_center_world")
     if isinstance(object_center_candidate, (list, tuple)) and len(object_center_candidate) >= 3:
@@ -6201,6 +6362,12 @@ def final_descent_local_ik(
         contact_control_offset = point_b_offset.copy()
         contact_control_reference_source = "point_B_proxy_fallback"
     point_b_to_contact_control_delta = contact_control_world - initial_point_b_world
+    nominal_target_pose_base, nominal_target_pose_log = _pose_for_contact_reference_world(
+        locked_target,
+        coord_transform,
+        locked_rpy_arr,
+        contact_control_offset,
+    )
 
     def _update_proxy_middle_point_debug_marker(
         *,
@@ -6382,7 +6549,7 @@ def final_descent_local_ik(
             )
         return vertical_tip_log
 
-    def target_pose_fn() -> np.ndarray:
+    def contact_target_pose_fn() -> np.ndarray:
         nonlocal call_count, previous_commanded_world, last_yaw
         nonlocal vertical_tip_stop_rule_last_sample, vertical_tip_reached_table_z0, vertical_tip_close_stop_reason
         call_count += 1
@@ -6397,8 +6564,16 @@ def final_descent_local_ik(
             include_diagnostic_comparison=diagnostic_bypass,
         )
         current_point_b_world = _point_b_world_from_pose(coord_transform, current_pose, point_b_offset)
-        tip_mid_world_for_descent = _finite_world_vector_or_none(real_center_log.get("fingertip_midpoint_world"))
-        if tip_mid_world_for_descent is None:
+        trusted_real_center_for_descent = bool(
+            real_center_world is not None
+            and real_center_log.get("close_critical_reference", False)
+        )
+        tip_mid_world_for_descent = (
+            _finite_world_vector_or_none(real_center_log.get("fingertip_midpoint_world"))
+            if trusted_real_center_for_descent
+            else None
+        )
+        if trusted_real_center_for_descent and tip_mid_world_for_descent is None:
             tip_components_for_descent = real_center_log.get(
                 "fingertip_component_positions_world",
                 real_center_log.get("component_positions_world"),
@@ -6413,7 +6588,11 @@ def final_descent_local_ik(
             control_reference_source = "tip_mid"
         else:
             measured_world = current_point_b_world
-            control_reference_source = "point_B_fallback"
+            control_reference_source = (
+                "point_B_fallback_untrusted_real_grasp_center"
+                if real_center_world is not None
+                else "point_B_fallback"
+            )
         measured_world_source_for_descent = control_reference_source
         descent_object_grasp_frame = dict(object_grasp_frame or {})
         if "object_grasp_center_world" not in descent_object_grasp_frame:
@@ -6564,6 +6743,11 @@ def final_descent_local_ik(
                     else bool(trace_sample_proxy_marker_log.get("marker_fallback_used", False)),
                     "measured_support_gap_m": support_gap_m(measured_world),
                     "delta_to_locked_target_m": delta.tolist(),
+                    "current_z_world_m": float(measured_world[2]),
+                    "target_z_world_m": float(locked_target[2]),
+                    "delta_z_world_m": float(delta[2]),
+                    "commanded_z_world_m": float(commanded_world[2]),
+                    "commanded_delta_z_world_m": float(commanded_delta_to_target[2]),
                     "measured_tip_mid_world": measured_world.tolist(),
                     "commanded_tip_mid_world": commanded_world.tolist(),
                     "measured_tip_mid_to_target_delta_world": delta.tolist(),
@@ -6615,7 +6799,9 @@ def final_descent_local_ik(
         end_effector_name=end_effector_name,
         end_effector_path=end_effector_path,
         end_effector_policy=end_effector_policy,
-        target_pose_fn=target_pose_fn,
+        target_pose_fn=contact_target_pose_fn,
+        position_metric_offset_local=contact_control_offset,
+        position_metric_label="contact_reference_world",
         per_tick_monitor_fn=(lambda: monitor_vertical_tip_stop_rule(context="per_tick_monitor"))
         if vertical_tip_stop_rule_active
         else None,
@@ -6627,6 +6813,7 @@ def final_descent_local_ik(
                 "locked_target_grasp_center_world": locked_target.tolist(),
                 "locked_rpy": locked_rpy_arr.tolist(),
                 "locked_target_pose_base": nominal_target_pose_base.tolist(),
+                "nominal_contact_reference_pose_conversion": nominal_target_pose_log,
                 "point_b_offset_local": point_b_offset.tolist(),
                 "point_B_proxy_world_at_phase_start": initial_point_b_world.tolist(),
                 "contact_control_offset_local": contact_control_offset.tolist(),
@@ -6716,6 +6903,7 @@ def final_descent_local_ik(
         "z_stall_recent_progress_threshold_m": float(
             getattr(args, "phase2_vertical_fallback_recent_z_progress_max", PHASE2_VERTICAL_FALLBACK_RECENT_Z_PROGRESS_MAX_M)
         ),
+        "z_progress_stall_policy": "near-contact commit treats <= threshold downward support-gap progress as stalled, not as a descent failure",
         "object_support_z_world": object_support_z,
         "monotonic_z_policy": "commanded target z never increases during local descent",
     }
@@ -6747,7 +6935,8 @@ def evaluate_close_gate(
     close_runtime_metrics = pre_close_gate.get("close_runtime_metrics", {})
     close_runtime_metrics = close_runtime_metrics if isinstance(close_runtime_metrics, dict) else {}
     runtime_tip_mid_error = _finite_float_or_none(close_runtime_metrics.get("tip_mid_error_to_object_grasp_center_m"))
-    if runtime_tip_mid_error is not None:
+    runtime_tip_mid_is_trusted = bool(close_runtime_metrics.get("primary_runtime_truth", False))
+    if runtime_tip_mid_error is not None and runtime_tip_mid_is_trusted:
         close_error = runtime_tip_mid_error
     orientation_error = float(descent_result.get("final_rotation_error_rad", descent_result.get("best_rotation_error_rad", math.inf)))
     geometric_filter = selected_candidate_filter or {}
@@ -6781,7 +6970,7 @@ def evaluate_close_gate(
     close_commit_zone_pass = bool(math.isfinite(close_error) and close_error <= close_commit_zone_tolerance)
     close_commit_zone_source = (
         "runtime_two_finger_tip_mid_to_object_grasp_center"
-        if runtime_tip_mid_error is not None
+        if runtime_tip_mid_error is not None and runtime_tip_mid_is_trusted
         else pre_close_gate.get("close_critical_metric")
     )
     catastrophic_orientation_tolerance = float(
@@ -6840,6 +7029,7 @@ def evaluate_close_gate(
         "close_commit_zone_source": close_commit_zone_source,
         "close_runtime_metrics": close_runtime_metrics,
         "tip_mid_error_to_object_grasp_center_m": runtime_tip_mid_error,
+        "runtime_tip_mid_error_trusted_for_close": runtime_tip_mid_is_trusted,
         "tip_mid_xy_error_m": close_runtime_metrics.get("tip_mid_xy_error_m"),
         "tip_mid_z_error_m": close_runtime_metrics.get("tip_mid_z_error_m"),
         "tip_axis_alignment_error_rad": close_runtime_metrics.get("tip_axis_alignment_error_rad"),
@@ -6962,13 +7152,20 @@ def evaluate_vertical_support_or_stall_close_fallback(
     )
     z_sample_count_pass = bool(z_stall_window_sample_count >= min_samples)
     stalled_in_z = bool(local_descent.get("stalled_in_z", False) and z_sample_count_pass)
-    vertical_motion_policy = not str(motion_policy).lower().startswith("far")
+    motion_policy_token = str(motion_policy).lower()
+    far_motion_policy = motion_policy_token.startswith("far")
+    far_stalled_fallback_allowed = bool(
+        far_motion_policy
+        and getattr(args, "phase2_vertical_fallback_allow_far_policy", PHASE2_VERTICAL_FALLBACK_ALLOW_FAR_POLICY)
+    )
+    vertical_motion_policy = bool((not far_motion_policy) or far_stalled_fallback_allowed)
     orientation_tolerance = float(
         getattr(args, "phase2_vertical_fallback_orientation_tolerance", PHASE2_VERTICAL_FALLBACK_ORIENTATION_TOLERANCE_RAD)
     )
     conditions = {
         "fallback_enabled": bool(getattr(args, "phase2_vertical_fallback_close_enable", True)),
         "vertical_motion_policy": bool(vertical_motion_policy),
+        "far_stalled_fallback_policy_pass": bool((not far_motion_policy) or far_stalled_fallback_allowed),
         "support_gap_small_pass": bool(len(support_gap_pass_sources) > 0),
         "z_stall_sample_count_pass": z_sample_count_pass,
         "stalled_in_z_pass": stalled_in_z,
@@ -6982,6 +7179,8 @@ def evaluate_vertical_support_or_stall_close_fallback(
         "pass_flags": conditions,
         "fail_reasons": fail_reasons,
         "motion_policy": motion_policy,
+        "far_motion_policy": bool(far_motion_policy),
+        "far_stalled_fallback_allowed": bool(far_stalled_fallback_allowed),
         "support_gap_sources": support_gap_sources,
         "support_gap_pass_sources": support_gap_pass_sources,
         "selected_support_gap_source": None if selected_support_gap is None else selected_support_gap.get("source"),
@@ -7000,7 +7199,7 @@ def evaluate_vertical_support_or_stall_close_fallback(
         "orientation_error_rad": orientation_error,
         "orientation_error_tolerance_rad": orientation_tolerance,
         "primary_close_orientation_tolerance_rad": float(args.phase2_close_orientation_tolerance),
-        "close_policy": "fallback only bypasses close-critical distance for vertical support/stall; XY drift and fallback-local orientation sanity gates remain active",
+        "close_policy": "fallback only bypasses close-critical distance for support/stall hover; far policy may use it when support gap is small, Z is stalled, XY drift is bounded, and fallback-local orientation sanity passes",
     }
 
 
@@ -7024,7 +7223,8 @@ def evaluate_runtime_commit_fallback(
         table_clearance_margin = math.inf
 
     tip_mid_error = _finite_float_or_none(close_runtime_metrics.get("tip_mid_error_to_object_grasp_center_m"))
-    if tip_mid_error is None:
+    runtime_tip_mid_is_trusted = bool(close_runtime_metrics.get("primary_runtime_truth", False))
+    if tip_mid_error is None or not runtime_tip_mid_is_trusted:
         tip_mid_error = _finite_float_or_none(pre_close_gate.get("close_critical_error_before_close_m"))
     recent_xy_drift = _finite_float_or_none(local_descent.get("recent_xy_drift_m"))
     if recent_xy_drift is None and samples:
@@ -7067,6 +7267,7 @@ def evaluate_runtime_commit_fallback(
         "pass_flags": pass_flags,
         "fail_reasons": fail_reasons,
         "tip_mid_error_to_object_grasp_center_m": tip_mid_error,
+        "runtime_tip_mid_error_trusted_for_fallback": runtime_tip_mid_is_trusted,
         "tip_mid_error_threshold_m": tip_threshold,
         "recent_xy_drift_m": recent_xy_drift,
         "recent_xy_drift_threshold_m": xy_threshold,
@@ -7076,6 +7277,7 @@ def evaluate_runtime_commit_fallback(
         "min_samples": min_samples,
         "table_clearance_margin_m": table_clearance_margin,
         "catastrophic_table_clearance_min_m": catastrophic_table_clearance_min,
+        "table_clearance_policy": "allow mild tabletop penetration during close commit; only penetration beyond catastrophic threshold blocks",
         "width_compatibility": width_compatibility,
         "close_policy": "commit when runtime two-finger contact geometry is near enough, XY drift is bounded, and Z progress has stalled without catastrophic impossibility",
     }
@@ -7437,7 +7639,11 @@ def main() -> int:
     parser.add_argument("--phase2-table-clearance-min", type=float, default=PHASE2_TABLE_CLEARANCE_MIN_M)
     parser.add_argument("--phase2-width-min", type=float, default=PHASE2_WIDTH_MIN_M)
     parser.add_argument("--phase2-width-max", type=float, default=PHASE2_WIDTH_MAX_M)
-    parser.add_argument("--phase2-allow-least-bad-candidate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--phase2-allow-least-bad-candidate",
+        action=argparse.BooleanOptionalAction,
+        default=PHASE2_ALLOW_LEAST_BAD_CANDIDATE,
+    )
     parser.add_argument("--phase2-final-descent-enable", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--phase2-final-descent-ticks", type=int, default=PHASE2_DESCENT_MAX_TICKS)
     parser.add_argument("--phase2-descent-xy-step", type=float, default=PHASE2_DESCENT_XY_STEP_M)
@@ -7462,6 +7668,11 @@ def main() -> int:
     parser.add_argument("--phase2-vertical-fallback-recent-z-progress-max", type=float, default=PHASE2_VERTICAL_FALLBACK_RECENT_Z_PROGRESS_MAX_M)
     parser.add_argument("--phase2-vertical-fallback-min-descent-samples", type=int, default=PHASE2_VERTICAL_FALLBACK_MIN_DESCENT_SAMPLES)
     parser.add_argument("--phase2-vertical-fallback-orientation-tolerance", type=float, default=PHASE2_VERTICAL_FALLBACK_ORIENTATION_TOLERANCE_RAD)
+    parser.add_argument(
+        "--phase2-vertical-fallback-allow-far-policy",
+        action=argparse.BooleanOptionalAction,
+        default=PHASE2_VERTICAL_FALLBACK_ALLOW_FAR_POLICY,
+    )
     parser.add_argument(
         "--phase2-diagnostic-finger-link-midpoint-bypass",
         action=argparse.BooleanOptionalAction,
@@ -7582,8 +7793,10 @@ def main() -> int:
     for name, value in phase2_positive_values.items():
         if not math.isfinite(float(value)) or float(value) <= 0.0:
             raise RuntimeError(f"--{name.replace('_', '-')} must be finite and positive")
-    if not math.isfinite(float(args.phase2_table_clearance_min)) or float(args.phase2_table_clearance_min) < 0.0:
-        raise RuntimeError("--phase2-table-clearance-min must be finite and non-negative")
+    if not math.isfinite(float(args.phase2_table_clearance_min)):
+        raise RuntimeError("--phase2-table-clearance-min must be finite")
+    if float(args.phase2_table_clearance_min) < float(args.catastrophic_table_clearance_min_m):
+        raise RuntimeError("--phase2-table-clearance-min must be >= --catastrophic-table-clearance-min-m")
     if float(args.phase2_width_min) > float(args.phase2_width_max):
         raise RuntimeError("--phase2-width-min must be <= --phase2-width-max")
     if not (0.0 < float(args.phase2_close_stage_a_fraction) <= 1.0):
@@ -8931,6 +9144,13 @@ def main() -> int:
             payload["object_trace"]["after_far_world_z_lower"] = _bbox_state(stage, target_path)
             contact_gate_phase_index = -1
             if bool(args.phase2_final_descent_enable):
+                contact_centric_control_subject_log = {
+                    "control_subject": "runtime_tip_mid_or_contact_reference",
+                    "compatibility_pose_builder": "point_B_offset_conversion_only",
+                    "close_subject": "runtime_close_critical_grasp_center",
+                }
+                geometry["contact_centric_control_subject"] = contact_centric_control_subject_log
+                payload["hybrid_phase2"]["contact_centric_control_subject"] = contact_centric_control_subject_log
                 phase2_descent_result = final_descent_local_ik(
                     phase_name="phase2_far_final_descent_local_ik",
                     stage=stage,
@@ -8951,7 +9171,7 @@ def main() -> int:
                     end_effector_name=end_effector_name,
                     end_effector_path=end_effector_path,
                     end_effector_policy=end_effector_policy,
-                    locked_target_world=geometry["contact_point_B_world"],
+                    locked_target_world=np.array(object_grasp_frame["grasp_center_world"], dtype=float),
                     locked_rpy=far_descend_locked_rpy,
                     locked_target_pose_base=geometry["contact_pose_base"],
                     point_b_offset_local=selected_point_b_offset,
@@ -9107,6 +9327,13 @@ def main() -> int:
             payload["object_trace"]["after_descend"] = after_descend
             contact_gate_phase_index = -1
             if bool(args.phase2_final_descent_enable):
+                contact_centric_control_subject_log = {
+                    "control_subject": "runtime_tip_mid_or_contact_reference",
+                    "compatibility_pose_builder": "point_B_offset_conversion_only",
+                    "close_subject": "runtime_close_critical_grasp_center",
+                }
+                geometry["contact_centric_control_subject"] = contact_centric_control_subject_log
+                payload["hybrid_phase2"]["contact_centric_control_subject"] = contact_centric_control_subject_log
                 phase2_descent_result = final_descent_local_ik(
                     phase_name="phase2_vertical_final_descent_local_ik",
                     stage=stage,
@@ -9244,116 +9471,78 @@ def main() -> int:
             and isinstance(phase2_descent_result, dict)
             and phase2_descent_result.get("vertical_tip_reached_table_z0", False)
         )
-        if vertical_tip_rule_close_allowed:
-            vertical_tip_rule_log = {
-                "rule_name": "vertical_tip_table_z_leq_zero_rule",
-                "condition_met": True,
-                "vertical_tip_reached_table_z0": True,
-                "vertical_tip_close_stop_reason": phase2_descent_result.get("vertical_tip_close_stop_reason"),
-                "vertical_tip_stop_rule_threshold_m": phase2_descent_result.get("vertical_tip_stop_rule_threshold_m"),
-                "vertical_tip_stop_rule_source": phase2_descent_result.get("vertical_tip_stop_rule_source"),
-                "vertical_tip_stop_rule_last_sample": phase2_descent_result.get("vertical_tip_stop_rule_last_sample"),
-                "decisive_for_vertical_close": True,
-                "table_frame_is_source_of_truth": True,
-            }
-            phase2_close_gate = {
-                "gate_name": "phase2_multi_condition_close_gate",
-                "condition_met": None,
-                "skipped": True,
-                "skip_reason": "vertical_tip_table_z_leq_zero_rule",
-                "decisive_blocker": False,
-                "vertical_tip_table_z_close_rule": vertical_tip_rule_log,
-            }
-            vertical_support_or_stall_fallback_gate = {
-                "gate_name": "vertical_support_or_stall_close_fallback",
-                "condition_met": None,
-                "skipped": True,
-                "skip_reason": "vertical_tip_table_z_leq_zero_rule",
-                "decisive_blocker": False,
-                "vertical_tip_table_z_close_rule": vertical_tip_rule_log,
-            }
-            generic_runtime_commit_fallback_gate = {
-                "gate_name": "generic_runtime_commit_fallback",
-                "condition_met": None,
-                "skipped": True,
-                "skip_reason": "vertical_tip_table_z_leq_zero_rule",
-                "decisive_blocker": False,
-                "vertical_tip_table_z_close_rule": vertical_tip_rule_log,
-            }
-            close_allowed_by_primary = False
-            close_allowed_by_fallback = False
-            close_allowed_by_generic_runtime_fallback = False
-            final_close_decision = {
-                "condition_met": True,
-                "allowed_by": "vertical_tip_table_z_leq_zero_rule",
-                "primary_gate_pass": False,
-                "primary_gate_skipped": True,
-                "fallback_gate_pass": False,
-                "fallback_gate_used": False,
-                "fallback_gate_skipped": True,
-                "generic_runtime_commit_fallback_pass": False,
-                "generic_runtime_commit_fallback_used": False,
-                "generic_runtime_commit_fallback_skipped": True,
-                "vertical_tip_rule_pass": True,
-                "vertical_tip_table_z_close_rule": vertical_tip_rule_log,
-                "motion_policy": motion_policy,
-                "far_motion_policy": bool(far_motion_policy),
-                "primary_fail_reasons": [],
-                "fallback_fail_reasons": [],
-            }
-        else:
-            phase2_close_gate = evaluate_close_gate(
-                pre_close_gate=pre_close_gate,
-                object_grasp_frame=object_grasp_frame,
-                selected_candidate_filter=selected_hybrid_candidate.get("geometric_filter", {}),
-                descent_result=phase2_descent_result or descend_result,
-                motion_policy=motion_policy,
-                args=args,
-            )
-            vertical_support_or_stall_fallback_gate = evaluate_vertical_support_or_stall_close_fallback(
-                pre_close_gate=pre_close_gate,
-                descent_result=phase2_descent_result or descend_result,
-                motion_policy=motion_policy,
-                args=args,
-            )
-            generic_runtime_commit_fallback_gate = evaluate_runtime_commit_fallback(
-                pre_close_gate=pre_close_gate,
-                descent_result=phase2_descent_result or descend_result,
-                selected_candidate_filter=selected_hybrid_candidate.get("geometric_filter", {}),
-                args=args,
-            )
-            close_allowed_by_primary = bool(phase2_close_gate["condition_met"])
-            close_allowed_by_fallback = bool(
-                (not far_motion_policy)
-                and (not close_allowed_by_primary)
-                and vertical_support_or_stall_fallback_gate["condition_met"]
-            )
-            close_allowed_by_generic_runtime_fallback = bool(
-                (not close_allowed_by_primary)
-                and (not close_allowed_by_fallback)
-                and generic_runtime_commit_fallback_gate["condition_met"]
-            )
-            final_close_decision = {
-                "condition_met": bool(close_allowed_by_primary or close_allowed_by_fallback or close_allowed_by_generic_runtime_fallback),
-                "allowed_by": "primary_phase2_close_gate"
-                if close_allowed_by_primary
-                else (
-                    "vertical_support_or_stall_fallback"
-                    if close_allowed_by_fallback
-                    else ("generic_runtime_commit_fallback" if close_allowed_by_generic_runtime_fallback else None)
-                ),
-                "primary_gate_pass": close_allowed_by_primary,
-                "fallback_gate_pass": bool(vertical_support_or_stall_fallback_gate["condition_met"]),
-                "fallback_gate_used": close_allowed_by_fallback,
-                "generic_runtime_commit_fallback_pass": bool(generic_runtime_commit_fallback_gate["condition_met"]),
-                "generic_runtime_commit_fallback_used": close_allowed_by_generic_runtime_fallback,
-                "vertical_tip_rule_pass": False,
-                "motion_policy": motion_policy,
-                "far_motion_policy": bool(far_motion_policy),
-                "primary_fail_reasons": phase2_close_gate.get("fail_reasons", []),
-                "fallback_fail_reasons": vertical_support_or_stall_fallback_gate.get("fail_reasons", []),
-                "generic_runtime_commit_fallback_fail_reasons": generic_runtime_commit_fallback_gate.get("fail_reasons", []),
-            }
+        vertical_tip_rule_log = {
+            "rule_name": "vertical_tip_table_z_leq_zero_rule",
+            "condition_met": vertical_tip_rule_close_allowed,
+            "vertical_tip_reached_table_z0": bool(vertical_tip_rule_close_allowed),
+            "vertical_tip_close_stop_reason": phase2_descent_result.get("vertical_tip_close_stop_reason")
+            if isinstance(phase2_descent_result, dict)
+            else None,
+            "vertical_tip_stop_rule_threshold_m": phase2_descent_result.get("vertical_tip_stop_rule_threshold_m")
+            if isinstance(phase2_descent_result, dict)
+            else None,
+            "vertical_tip_stop_rule_source": phase2_descent_result.get("vertical_tip_stop_rule_source")
+            if isinstance(phase2_descent_result, dict)
+            else None,
+            "vertical_tip_stop_rule_last_sample": phase2_descent_result.get("vertical_tip_stop_rule_last_sample")
+            if isinstance(phase2_descent_result, dict)
+            else None,
+            "decisive_for_vertical_close": False,
+            "table_frame_is_source_of_truth": True,
+            "rule_scope": "diagnostic_auxiliary_condition_only_no_gate_bypass",
+        }
+        phase2_close_gate = evaluate_close_gate(
+            pre_close_gate=pre_close_gate,
+            object_grasp_frame=object_grasp_frame,
+            selected_candidate_filter=selected_hybrid_candidate.get("geometric_filter", {}),
+            descent_result=phase2_descent_result or descend_result,
+            motion_policy=motion_policy,
+            args=args,
+        )
+        vertical_support_or_stall_fallback_gate = evaluate_vertical_support_or_stall_close_fallback(
+            pre_close_gate=pre_close_gate,
+            descent_result=phase2_descent_result or descend_result,
+            motion_policy=motion_policy,
+            args=args,
+        )
+        generic_runtime_commit_fallback_gate = evaluate_runtime_commit_fallback(
+            pre_close_gate=pre_close_gate,
+            descent_result=phase2_descent_result or descend_result,
+            selected_candidate_filter=selected_hybrid_candidate.get("geometric_filter", {}),
+            args=args,
+        )
+        close_allowed_by_primary = bool(phase2_close_gate["condition_met"])
+        close_allowed_by_fallback = bool(
+            (not close_allowed_by_primary)
+            and vertical_support_or_stall_fallback_gate["condition_met"]
+        )
+        close_allowed_by_generic_runtime_fallback = bool(
+            (not close_allowed_by_primary)
+            and (not close_allowed_by_fallback)
+            and generic_runtime_commit_fallback_gate["condition_met"]
+        )
+        final_close_decision = {
+            "condition_met": bool(close_allowed_by_primary or close_allowed_by_fallback or close_allowed_by_generic_runtime_fallback),
+            "allowed_by": "primary_phase2_close_gate"
+            if close_allowed_by_primary
+            else (
+                "vertical_support_or_stall_fallback"
+                if close_allowed_by_fallback
+                else ("generic_runtime_commit_fallback" if close_allowed_by_generic_runtime_fallback else None)
+            ),
+            "primary_gate_pass": close_allowed_by_primary,
+            "fallback_gate_pass": bool(vertical_support_or_stall_fallback_gate["condition_met"]),
+            "fallback_gate_used": close_allowed_by_fallback,
+            "generic_runtime_commit_fallback_pass": bool(generic_runtime_commit_fallback_gate["condition_met"]),
+            "generic_runtime_commit_fallback_used": close_allowed_by_generic_runtime_fallback,
+            "vertical_tip_rule_pass": vertical_tip_rule_close_allowed,
+            "vertical_tip_table_z_close_rule": vertical_tip_rule_log,
+            "motion_policy": motion_policy,
+            "far_motion_policy": bool(far_motion_policy),
+            "primary_fail_reasons": phase2_close_gate.get("fail_reasons", []),
+            "fallback_fail_reasons": vertical_support_or_stall_fallback_gate.get("fail_reasons", []),
+            "generic_runtime_commit_fallback_fail_reasons": generic_runtime_commit_fallback_gate.get("fail_reasons", []),
+        }
         pre_close_gate["phase2_multi_condition_close_gate"] = phase2_close_gate
         pre_close_gate["vertical_support_or_stall_close_fallback_gate"] = vertical_support_or_stall_fallback_gate
         pre_close_gate["generic_runtime_commit_fallback_gate"] = generic_runtime_commit_fallback_gate
@@ -9399,6 +9588,24 @@ def main() -> int:
                 "phase2_close_gate_failed",
                 "Phase 2 close decision failed before gripper close: " + close_gate_reason,
             )
+
+        if pre_close_gate.get("close_critical_uses_real_grasp_center") is not True:
+            close_critical_reference_gate = {
+                "gate_name": "close_critical_real_grasp_center_required",
+                "condition_met": False,
+                "reason": "No valid close-critical fingertip grasp center; refuse close",
+                "close_critical_uses_real_grasp_center": pre_close_gate.get("close_critical_uses_real_grasp_center"),
+                "close_critical_metric": pre_close_gate.get("close_critical_metric"),
+                "real_grasp_center_world": pre_close_gate.get("real_grasp_center_world"),
+                "point_B_proxy_world": pre_close_gate.get("point_B_proxy_world"),
+                "explicit_proxy_may_not_authorize_close": True,
+            }
+            pre_close_gate["close_critical_real_grasp_center_required_gate"] = close_critical_reference_gate
+            final_close_decision["close_critical_real_grasp_center_required_gate"] = close_critical_reference_gate
+            payload["hybrid_phase2"]["close_critical_real_grasp_center_required_gate"] = close_critical_reference_gate
+            if phase_log and -len(phase_log) <= contact_gate_phase_index < len(phase_log):
+                phase_log[contact_gate_phase_index]["details"]["pre_close_gate"] = pre_close_gate
+            _fail("close_gate_failed", "No valid close-critical fingertip grasp center; refuse close")
 
         close_result = execute_two_stage_close(
             dc=dc,
