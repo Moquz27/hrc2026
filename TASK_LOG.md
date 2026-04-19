@@ -844,3 +844,169 @@
 - Next step: run a focused runtime seed with `--phase2-diagnostic-finger-link-midpoint-bypass` on Linux GUI/headless to compare
   - real fingertip midpoint path vs direct finger-link midpoint
   - and distinguish incorrect proxy geometry from motion-targeting mismatch.
+
+- Started PHASE 2 - TASK 1 reference-aligned grasp implementation.
+- Source file chosen: `scripts/task1_hybrid_geometric_phase2.py`.
+- New file created: `scripts/task1_phase2_reference_aligned_grasp.py`.
+- Reason external references were consulted: improve final grasp reliability by adopting proven frame/phase/contact-geometry ideas without changing the repository architecture.
+- Runtime reference area created outside the repo:
+  - `$HRC_ROOT/reference/task1_phase2_external_refs/`
+  - `$HRC_ROOT/reference/task1_phase2_external_refs/REFERENCE_NOTES.md`
+  - `$HRC_ROOT/reference/task1_phase2_external_refs/comparison_notes/task1_phase2_vs_external_refs.md`
+  - `$HRC_ROOT/reference/task1_phase2_external_refs/comparison_notes/CONSTRAINED_IMPLEMENTATION_NOTE.md`
+- External repositories cloned shallowly under `$HRC_ROOT/reference/task1_phase2_external_refs/external_repos/`:
+  - IsaacSim at commit `aa503a9bbf92405bbbcfe5361e1c4a74fe10d689`
+  - moveit2 at commit `c154f941c0b029e3037b049b5515b68e8a9b3100`
+  - moveit_task_constructor at commit `e217ddfad77fa957944994ec00bbb571bf9748b0`
+  - graspnet-baseline at commit `280c215129f759ed8649cb4e89fc5dfee55f4f80`
+- Ideas adopted:
+  - IsaacSim-style explicit staged pick/place phase separation and simulator-friendly frame logging
+  - MoveIt-style separation of grasp pose, pregrasp approach, close posture, and retreat semantics
+  - MoveIt Task Constructor-style grasp/IK frame distinction and clean phase boundaries
+  - GraspNet-style width/contact-aware candidate reasoning while keeping scoring/filtering early
+  - runtime two-finger geometry as final close-critical truth
+- Ideas rejected:
+  - MoveIt/MTC framework rewrite
+  - ROS planning-scene/action architecture
+  - IsaacSim example controller architecture
+  - GraspNet neural inference, datasets, checkpoints, Open3D collision stack, and learned scoring
+- Functions added in `scripts/task1_phase2_reference_aligned_grasp.py`:
+  - `_resolve_actual_fingertip_pair_midpoint_reference_position(...)`
+  - `_finite_world_vector_or_none(...)`
+  - `_first_finite_vector_from_mapping(...)`
+  - `_compute_runtime_two_finger_metrics(...)`
+  - `_reference_aligned_frame_summary(...)`
+- Functions changed in `scripts/task1_phase2_reference_aligned_grasp.py`:
+  - `_resolve_real_grasp_center_world(...)`: fallback ladder now prefers actual fingertip frames, stable finger-link midpoint, calibrated distal proxy, then explicit proxy.
+  - `_pre_close_gate(...)`: logs `tip_mid_world`, `tip_axis_world`, `tip_mid_error_to_object_grasp_center_m`, `tip_axis_alignment_error_rad`, `tip_symmetry_error_m`, `tip_z_asymmetry_m`, and `close_runtime_metrics`.
+  - `final_descent_local_ik(...)`: logs close-runtime two-finger metrics per sampled local descent step and records a reference-aligned frame summary.
+  - `evaluate_close_gate(...)`: close commit-zone error now prefers runtime `tip_mid_error_to_object_grasp_center_m` when available; candidate-stage imperfections remain warning-oriented.
+- Existing behavior intentionally preserved:
+  - original `scripts/task1_hybrid_geometric_phase2.py` untouched
+  - existing phase machine
+  - DualArmIK/local servo backend
+  - candidate generation and early filtering
+  - two-stage close
+  - short-lift verification
+  - deterministic recovery and retry
+- Test plan for the new script:
+  - first lightweight check: `python -m py_compile scripts/task1_phase2_reference_aligned_grasp.py`
+  - first runtime smoke on Linux Isaac Sim: run one known failing seed/target with a unique log suffix and inspect `close_runtime_metrics`
+  - focused comparison: run the same seed against `scripts/task1_hybrid_geometric_phase2.py` and `scripts/task1_phase2_reference_aligned_grasp.py`
+  - verify logs contain `tip1_world`, `tip2_world`, `tip_mid_world`, `tip_axis_world`, `tip_mid_error_to_object_grasp_center_m`, `tip_axis_alignment_error_rad`, `tip_symmetry_error_m`, and `tip_z_asymmetry_m`
+  - evaluate whether close failures are now caused by hard blockers only: severe clearance, impossible width, catastrophic orientation mismatch, or runtime tip-midpoint still too far
+- Tests run in this implementation pass: none. Linux runtime validation remains the source of truth and was not requested for this step.
+
+- Started PHASE 2 - TASK 1 contact-centric correction patch on top of the current Phase 2 backend.
+- Source file copied: `scripts/task1_hybrid_geometric_phase2.py`.
+- New file created: `scripts/task1_phase2_contact_centric_patch.py`.
+- Why this patch exists:
+  - final descent still relied too much on `point_B` pose semantics
+  - close gate treated orientation too strictly as a hard blocker
+  - no generic near-enough stalled commit fallback existed outside the vertical-specific path
+  - runtime fingertip diagnostics needed XY/Z split, per-tip distances, and easier close-decision traceability
+  - GUI markers needed to show true two-finger runtime geometry, not only a proxy midpoint
+- What `point_B` still does:
+  - remains a compatibility input for existing pose-construction helpers and legacy debug logs
+  - remains useful for comparing old proxy behavior against contact-centric runtime truth
+- Why `point_B` is no longer final truth:
+  - new command comments/logs route final descent through runtime contact reference first, then convert to an EE pose for DualArmIK compatibility
+  - close gate now prefers runtime `tip_mid_error_to_object_grasp_center_m` when available
+  - close-debug summary explicitly records `point_B_is_final_truth=false`
+- Functions added in `scripts/task1_phase2_contact_centric_patch.py`:
+  - `_resolve_actual_fingertip_pair_midpoint_reference_position(...)`
+  - `_resolve_calibrated_distal_proxy_pair_midpoint_reference_position(...)`
+  - `_finite_world_vector_or_none(...)`
+  - `_first_finite_vector_from_mapping(...)`
+  - `_compute_runtime_two_finger_metrics(...)`
+  - `_pose_for_contact_reference_world(...)`
+  - `_upsert_two_finger_runtime_debug_markers(...)`
+  - `_reference_comparison_payload(...)`
+  - `evaluate_runtime_commit_fallback(...)`
+  - `build_close_debug_summary(...)`
+- Functions changed in `scripts/task1_phase2_contact_centric_patch.py`:
+  - `_resolve_real_grasp_center_world(...)`: truth order is actual fingertip pair, stable finger-link midpoint, calibrated distal proxy pair, explicit fallback proxy.
+  - `_pre_close_gate(...)`: logs split two-finger runtime metrics, close runtime metrics, and two-finger markers.
+  - `final_descent_local_ik(...)`: command path is documented/logged as contact-reference first and point_B compatibility second; trace now splits measured vs commanded tip-mid error.
+  - `evaluate_close_gate(...)`: catastrophic orientation remains hard, moderate orientation becomes a warning; commit-zone error prefers runtime tip-mid error.
+  - main close-decision path: final close decision is now primary close gate OR vertical support/stall fallback OR generic runtime commit fallback.
+  - vertical tip table-z monitor: logs tip1/tip2/tip-mid table-z and support/object-top gaps.
+  - vertical XY descend feedback: logs reference at phase start, reference at current tick, and delta from phase start.
+- New thresholds / knobs:
+  - `--catastrophic-orientation-error-max-rad`
+  - `--soft-orientation-warning-max-rad`
+  - `--catastrophic-table-clearance-min-m`
+  - `--runtime-commit-fallback-enable` / `--no-runtime-commit-fallback-enable`
+  - `--runtime-commit-fallback-tip-mid-error-max-m`
+  - `--runtime-commit-fallback-recent-z-progress-max-m`
+  - `--runtime-commit-fallback-recent-xy-drift-max-m`
+  - `--runtime-commit-fallback-min-samples`
+  - `--close-debug-summary-enable` / `--no-close-debug-summary-enable`
+  - `--diagnostic-two-finger-marker-enable` / `--no-diagnostic-two-finger-marker-enable`
+- New logs / markers:
+  - `close_debug_summary`
+  - `generic_runtime_commit_fallback_gate`
+  - `tip_mid_xy_error_m`
+  - `tip_mid_z_error_m`
+  - `tip1_to_object_grasp_center_distance_m`
+  - `tip2_to_object_grasp_center_distance_m`
+  - `tip1_to_object_center_distance_m`
+  - `tip2_to_object_center_distance_m`
+  - `measured_tip_mid_world`
+  - `commanded_tip_mid_world`
+  - `measured_tip_mid_to_target_delta_world`
+  - `commanded_tip_mid_to_target_delta_world`
+  - `/World/DebugTip1World`
+  - `/World/DebugTip2World`
+  - `/World/DebugTipMidWorld`
+  - `/World/DebugObjectCenter`
+  - `/World/DebugRuntimeObjectGraspCenter`
+- Existing behavior intentionally preserved:
+  - original `scripts/task1_hybrid_geometric_phase2.py` untouched
+  - scene setup
+  - scene-state object extraction
+  - table-frame builder
+  - candidate generation
+  - fast scoring
+  - fast geometric filter
+  - DualArmIK backend
+  - phase machine order
+  - two-stage close
+  - short-lift verification
+  - deterministic retry/recovery
+- Tests run in this implementation pass: none. Linux Isaac Sim remains the runtime source of truth.
+- Required next test plan:
+  - compare actual fingertip pair vs finger-link midpoint vs calibrated proxy stability
+  - compare measured vs commanded tip-mid trajectory during final descent
+  - compare old strict close gate against new practical close gate
+  - create/identify a near-object stalled case and verify generic runtime commit fallback
+  - verify vertical tip table-z rule fires only when tip midpoint is actually near table z reference
+- Fixed a syntax error in `scripts/task1_phase2_contact_centric_patch.py` reported by runtime:
+  - error: `IndentationError: unexpected indent` near line 6303
+  - cause: over-indented unresolved-fingertip `else` branch inside the vertical tip table-z monitor
+  - fix: aligned `current_vertical_tip_table_z`, `vertical_tip_stop_rule_triggered`, `vertical_tip_error`, and `tip_source` assignments with the rest of the `else` block
+  - original `scripts/task1_hybrid_geometric_phase2.py` remains untouched
+- Applied minimal horizontal/far approach stagnation fix in `scripts/task1_phase2_contact_centric_patch.py`:
+  - lowered far/horizontal XY align height to `object_top_z + far_xy_align_clearance_above_object`
+  - added `--horizontal-descent-xy-trigger-tolerance` with default `0.07`
+  - replaced strict full-pose align failure before descent with a loose XY descent trigger
+  - logs now include `align_height`, `object_top_z`, `align_clearance`, `descent_triggered`, and `xy_error_at_descent`
+  - existing phase structure and DualArmIK backend remain unchanged
+- Applied requested minimal critical horizontal grasp execution fix directly in `scripts/task1_hybrid_geometric_phase2.py`:
+  - relaxed horizontal `far_low_side_B_driven` table clearance threshold to `-0.005`
+  - allowed descent from far XY align when `xy_error < 0.06` instead of requiring perfect full-pose alignment
+  - forced final descent runtime measurement to prefer `tip_mid` and use `point_B_fallback` only when tip midpoint is unavailable
+  - expanded horizontal final grasp target along `closing_axis_world` by `min(max(object_width * 0.3, 0.01), 0.03)`
+  - added `PHASE2_RUNTIME_COMMIT_FALLBACK_TIP_MID_ERROR_MAX_M = 0.08` and uses it as the far/horizontal close commit tolerance floor
+  - added debug logs for `descent_triggered`, `xy_error`, `table_clearance_margin`, and `control_reference_source`
+  - planner, candidate generation, phase structure, and DualArmIK backend were not refactored
+
+## 2026-04-19 — Phase 2 Task 1 contact-centric horizontal descent correction
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Issue fixed: horizontal `far_low_side_B_driven` approach could stop at XY align height because table clearance, XY trigger strictness, and point_B compatibility control prevented descent from becoming contact-centric.
+- Thresholds changed: generic runtime commit fallback tip-mid error max relaxed from `0.045 m` to `0.08 m`; horizontal descent trigger default set to `0.06 m`; horizontal table-clearance pass threshold added at `-0.005 m` while retaining separate catastrophic table-clearance blocking.
+- Control change: final descent now uses runtime `tip_mid` as the primary measured/control reference when available, with `point_B_fallback` only when tip-mid geometry is unavailable.
+- Geometry change: horizontal contact target receives a bounded closing-axis expansion before final descent, using `clamp(object_width * 0.3, 0.01, 0.03)`.
+- Logging added/extended: `descent_triggered`, `xy_error`, `xy_error_at_descent_trigger`, `horizontal_descent_trigger_tolerance_used`, table-clearance pass fields, `control_reference_source`, and `measured_world_source_for_descent`.
+- Test plan: run the contact-centric script in Isaac Sim with GUI/hold-open and inspect logs for horizontal descent start, tip-mid movement toward the object, reduced runtime tip-mid error, and eventual close-gate or runtime fallback pass.
