@@ -1,5 +1,12 @@
 # Task Log
 
+## 2026-04-20
+- Updated `scripts/task1_phase2_contact_centric_patch.py` for the contact-centric Phase 2 approach tuning pass.
+- Horizontal/far approach now plans a safe off-object point-B XY, checks it against all current part bboxes, lowers point B in world Z there, then slides at contact height into the final XY target; logs include the safe Z-lower waypoint and clearance check.
+- Vertical approach now defaults to neutral lateral bias, uses a slower dedicated vertical Z step, enforces runtime point-B Z completion before close, and extends the vertical point-B proxy along its distal local direction so it sits closer to the fingertip.
+- Added CLI knobs for `--far-safe-descent-xy-clearance`, `--vertical-descent-z-step`, and `--vertical-point-b-distal-extension`.
+- Check result: `python3 -m py_compile scripts/task1_phase2_contact_centric_patch.py` passed locally.
+
 ## 2026-04-13
 - Created initial repo structure
 - Created folders: src, scripts, configs, tests, docs

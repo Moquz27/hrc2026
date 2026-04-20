@@ -244,6 +244,7 @@ DEFAULT_HORIZONTAL_DESCENT_XY_TRIGGER_TOLERANCE = PHASE2_HORIZONTAL_DESCENT_XY_T
 DEFAULT_FAR_POINT_B_FORWARD_EXTENSION = 0.012
 DEFAULT_FAR_POINT_A_EXTRA_HEIGHT_CLEARANCE = 0.018
 DEFAULT_FAR_AB_DOWNWARD_SLANT_DEG = 8.0
+DEFAULT_FAR_SAFE_DESCENT_XY_CLEARANCE = 0.020
 DEFAULT_FAR_OUTBOARD_TRANSITION_OFFSET = 0.12
 DEFAULT_FAR_OUTBOARD_TRANSITION_CLEARANCE = 0.08
 DEFAULT_FAR_NULL_WEIGHT = 0.08
@@ -256,7 +257,9 @@ DEFAULT_VERTICAL_POINT_B_GAP_ABOVE_SUPPORT = 0.001
 DEFAULT_VERTICAL_CLOSE_POINT_B_TOLERANCE = 0.005
 DEFAULT_VERTICAL_XY_REFERENCE_LINK = "finger_midpoint"
 DEFAULT_VERTICAL_XY_REFERENCE_TOLERANCE = 0.008
-DEFAULT_VERTICAL_ARM_LATERAL_BIAS_CORRECTION = 0.015
+DEFAULT_VERTICAL_ARM_LATERAL_BIAS_CORRECTION = 0.0
+DEFAULT_VERTICAL_DESCENT_Z_STEP_M = 0.0015
+DEFAULT_VERTICAL_POINT_B_DISTAL_EXTENSION_M = 0.020
 VERTICAL_FINGER_MIDPOINT_REFERENCE_ALIASES = {
     "finger_midpoint",
     "fingertip_midpoint",
@@ -358,8 +361,8 @@ PHASE_ORDER = [
     "servo_descend",
     "far_outboard_transition",
     "far_prepare_low_side_approach",
-    "far_align_B_over_object_xy",
     "far_lower_B_world_z",
+    "far_align_B_over_object_xy",
     "phase2_far_final_descent_local_ik",
     "mid_align_AB_vertical_over_object",
     "mid_pre_descend_AB_vertical",
@@ -4458,6 +4461,17 @@ def _compute_contact_z_world(
     )
 
 
+def _xy_inside_bbox_margin(point_world: np.ndarray, bbox: dict[str, Any], margin_m: float) -> bool:
+    point = np.array(point_world, dtype=float)
+    min_v = np.array(bbox.get("min", [math.inf, math.inf, math.inf]), dtype=float)
+    max_v = np.array(bbox.get("max", [-math.inf, -math.inf, -math.inf]), dtype=float)
+    margin = float(margin_m)
+    return bool(
+        min_v[0] - margin <= point[0] <= max_v[0] + margin
+        and min_v[1] - margin <= point[1] <= max_v[1] + margin
+    )
+
+
 def _plan_grasp_geometry(
     *,
     object_state: dict[str, Any],
@@ -4491,6 +4505,23 @@ def _plan_grasp_geometry(
     rpy = np.array(downward_rpy_by_arm["by_arm"][arm_side]["rpy"], dtype=float)
     base_point_b_offset = np.array(point_b_offset_local if point_b_offset_local is not None else tcp_offset_local, dtype=float)
     point_b_offset = base_point_b_offset.copy()
+    vertical_point_b_offset_local_adjustment = np.zeros(3, dtype=float)
+    vertical_point_b_distal_extension_m = 0.0
+    vertical_point_b_distal_extension_applied = False
+    vertical_point_b_distal_extension_reason = "not_vertical_motion_family"
+    if motion_family != "world_y_approach":
+        requested_vertical_extension = float(args.vertical_point_b_distal_extension)
+        if args.point_b_offset_local is not None:
+            vertical_point_b_distal_extension_reason = "cli_point_b_offset_local_provided"
+        elif requested_vertical_extension > 0.0:
+            point_b_direction = _normalize(point_b_offset, np.array([0.0, 0.0, 1.0], dtype=float))
+            vertical_point_b_offset_local_adjustment = point_b_direction * requested_vertical_extension
+            point_b_offset = point_b_offset + vertical_point_b_offset_local_adjustment
+            vertical_point_b_distal_extension_m = requested_vertical_extension
+            vertical_point_b_distal_extension_applied = True
+            vertical_point_b_distal_extension_reason = "default_vertical_proxy_extended_toward_fingertip"
+        else:
+            vertical_point_b_distal_extension_reason = "vertical_point_b_distal_extension_zero"
     rot = _euler_xyz_to_rot(float(rpy[0]), float(rpy[1]), float(rpy[2]))
     x_axis_base = rot[:, 0]
     y_axis_base = rot[:, 1]
@@ -4525,6 +4556,7 @@ def _plan_grasp_geometry(
     far_point_b_forward_extension = 0.0
     far_reach_axis_world = None
     far_xy_align_b_world = None
+    far_safe_z_lower_b_world = None
     legacy_side_contact_b_world = None
     far_outboard_transition_b_world = None
     far_outboard_axis_world = None
@@ -4539,14 +4571,34 @@ def _plan_grasp_geometry(
         far_point_b_forward_extension = float(args.far_point_b_forward_extension)
         object_top_z_world = float(bbox["max"][2])
         far_xy_align_clearance = float(args.far_xy_align_clearance_above_object)
-        far_xy_align_z_world = object_top_z_world + far_xy_align_clearance
-        far_xy_align_b_world = np.array(contact_world, dtype=float).copy()
-        far_xy_align_b_world[2] = far_xy_align_z_world
-        contact_b_world = far_xy_align_b_world.copy()
+        far_high_clearance_z_world = object_top_z_world + far_xy_align_clearance
+        contact_b_world = np.array(contact_world, dtype=float).copy()
         contact_b_world[2] = far_contact_z_world
+        far_xy_align_b_world = contact_b_world.copy()
         legacy_side_contact_b_world = contact_b_world + far_reach_axis_world * far_point_b_forward_extension
         low_side_prepare_b_world = legacy_side_contact_b_world - far_reach_axis_world * float(args.pregrasp_standoff)
-        low_side_prepare_b_world[2] = far_xy_align_b_world[2]
+        low_side_prepare_b_world[2] = far_high_clearance_z_world
+        far_safe_descent_xy_clearance = float(args.far_safe_descent_xy_clearance)
+        far_safe_descent_adjusted = False
+        far_safe_descent_initial_xy_inside_target_bbox = _xy_inside_bbox_margin(
+            low_side_prepare_b_world,
+            bbox,
+            far_safe_descent_xy_clearance,
+        )
+        far_safe_descent_adjustment_m = 0.0
+        if far_safe_descent_initial_xy_inside_target_bbox:
+            bbox_size_xy = np.abs(np.array(bbox["max"][:2], dtype=float) - np.array(bbox["min"][:2], dtype=float))
+            safe_standoff = max(
+                float(args.pregrasp_standoff),
+                0.5 * float(np.linalg.norm(bbox_size_xy)) + far_safe_descent_xy_clearance,
+            )
+            safe_prepare_b_world = contact_b_world - far_reach_axis_world * safe_standoff
+            safe_prepare_b_world[2] = far_high_clearance_z_world
+            far_safe_descent_adjustment_m = float(np.linalg.norm(safe_prepare_b_world[:2] - low_side_prepare_b_world[:2]))
+            low_side_prepare_b_world = safe_prepare_b_world
+            far_safe_descent_adjusted = True
+        far_safe_z_lower_b_world = low_side_prepare_b_world.copy()
+        far_safe_z_lower_b_world[2] = far_contact_z_world
         side_sign = -1.0 if arm_side == "right" else 1.0
         far_outboard_axis_world = _normalize(
             np.array(coord_transform.robot_world_R, dtype=float) @ np.array([0.0, side_sign, 0.0], dtype=float),
@@ -4560,12 +4612,23 @@ def _plan_grasp_geometry(
         pregrasp_b_world = low_side_prepare_b_world.copy()
         align_b_world = far_xy_align_b_world.copy()
         policy_details = {
-            "far_contact_sequence_policy": "outboard_transition_then_low_side_prepare_then_xy_align_then_world_z_descend",
+            "far_contact_sequence_policy": "outboard_transition_then_low_side_prepare_then_world_z_descend_at_safe_xy_then_low_xy_slide_to_contact",
             "far_outboard_transition_B_world": far_outboard_transition_b_world.tolist(),
             "far_outboard_axis_world": far_outboard_axis_world.tolist(),
             "far_outboard_transition_offset_m": float(args.far_outboard_transition_offset),
             "far_outboard_transition_clearance_m": float(args.far_outboard_transition_clearance),
             "far_low_side_prepare_B_world": low_side_prepare_b_world.tolist(),
+            "far_safe_z_lower_B_world": far_safe_z_lower_b_world.tolist(),
+            "far_safe_descent_xy_clearance_m": far_safe_descent_xy_clearance,
+            "far_safe_descent_xy_checked_against_target_bbox": True,
+            "far_safe_descent_initial_xy_inside_target_bbox": bool(far_safe_descent_initial_xy_inside_target_bbox),
+            "far_safe_descent_adjusted": bool(far_safe_descent_adjusted),
+            "far_safe_descent_adjustment_m": far_safe_descent_adjustment_m,
+            "far_safe_descent_target_bbox_xy": {
+                "min": np.array(bbox["min"][:2], dtype=float).tolist(),
+                "max": np.array(bbox["max"][:2], dtype=float).tolist(),
+                "margin_m": far_safe_descent_xy_clearance,
+            },
             "far_xy_align_B_world": far_xy_align_b_world.tolist(),
             "far_descend_B_world": contact_b_world.tolist(),
             "far_B_target_world": contact_b_world.tolist(),
@@ -4588,6 +4651,7 @@ def _plan_grasp_geometry(
             "align_clearance_m": far_xy_align_clearance,
             "align_height": float(far_xy_align_b_world[2]),
             "far_xy_align_clearance_reference": "object_top_z + far_xy_align_clearance_above_object",
+            "far_high_clearance_z_world": float(far_high_clearance_z_world),
             "far_xy_align_z_world": float(far_xy_align_b_world[2]),
             "far_descend_z_world": float(far_contact_z_world),
             "far_low_side_contact_z_world": float(far_contact_z_world),
@@ -4596,7 +4660,7 @@ def _plan_grasp_geometry(
             "AB_parallel_to_table_score_abs_dot_z": abs(float(np.dot(ab_axis_world, world_up))),
             "AB_perpendicular_to_robot_belly_abs_dot": abs(float(np.dot(ab_axis_world, robot_belly_forward_world))),
             "strict_AB_parallel_during_final_reach": False,
-            "side_push_avoidance": "point_B aligns over object world XY at prepare height before final world-Z descent",
+            "side_push_avoidance": "point_B descends in world Z at a safe off-object XY, then slides horizontally into final contact XY",
         }
     else:
         motion_policy = "mid_vertical_Z_descend" if target_region == "mid" else "near_body_vertical_Z_descend"
@@ -4631,7 +4695,12 @@ def _plan_grasp_geometry(
             "vertical_arm_lateral_bias_correction_base_y_m": float(vertical_lateral_correction_base_y),
             "vertical_arm_lateral_bias_correction_base_vector": vertical_lateral_correction_base.tolist(),
             "vertical_arm_lateral_bias_correction_world": vertical_lateral_correction_world.tolist(),
-            "vertical_arm_lateral_bias_correction_rule": "right arm shifts +baseY; left arm shifts -baseY, opposing observed outward vertical grasp bias",
+            "vertical_arm_lateral_bias_correction_rule": "right arm shifts +baseY and left arm shifts -baseY only when nonzero; default neutral after observed inward bias",
+            "vertical_point_b_distal_extension_m": float(vertical_point_b_distal_extension_m),
+            "vertical_point_b_distal_extension_applied": bool(vertical_point_b_distal_extension_applied),
+            "vertical_point_b_distal_extension_reason": vertical_point_b_distal_extension_reason,
+            "vertical_point_b_offset_local_adjustment": vertical_point_b_offset_local_adjustment.tolist(),
+            "vertical_point_b_proxy_policy": "vertical-only inferred point_B is extended along its local distal direction so the proxy is closer to the fingertip",
             "vertical_raw_point_B_contact_mark_before_xy_reference": raw_contact_b_world.tolist(),
             "vertical_contact_mark_B_world": contact_b_world.tolist(),
             "vertical_descend_target_B_world": contact_b_world.tolist(),
@@ -4654,6 +4723,15 @@ def _plan_grasp_geometry(
     pregrasp_pose, pregrasp_details = _pose_for_point_b_world(pregrasp_b_world, coord_transform, rpy, point_b_offset)
     align_pose, align_details = _pose_for_point_b_world(align_b_world, coord_transform, rpy, point_b_offset)
     contact_pose, contact_details = _pose_for_point_b_world(contact_b_world, coord_transform, rpy, point_b_offset)
+    far_safe_z_lower_pose = None
+    far_safe_z_lower_details = None
+    if far_safe_z_lower_b_world is not None:
+        far_safe_z_lower_pose, far_safe_z_lower_details = _pose_for_point_b_world(
+            far_safe_z_lower_b_world,
+            coord_transform,
+            rpy,
+            point_b_offset,
+        )
     far_outboard_transition_pose = None
     far_outboard_transition_details = None
     if far_outboard_transition_b_world is not None:
@@ -4702,6 +4780,10 @@ def _plan_grasp_geometry(
         "base_point_b_offset_local": base_point_b_offset.tolist(),
         "point_b_offset_local": point_b_offset.tolist(),
         "far_point_b_offset_local_adjustment": far_point_b_offset_local_adjustment.tolist(),
+        "vertical_point_b_offset_local_adjustment": vertical_point_b_offset_local_adjustment.tolist(),
+        "vertical_point_b_distal_extension_m": float(vertical_point_b_distal_extension_m) if motion_family != "world_y_approach" else None,
+        "vertical_point_b_distal_extension_applied": bool(vertical_point_b_distal_extension_applied) if motion_family != "world_y_approach" else None,
+        "vertical_point_b_distal_extension_reason": vertical_point_b_distal_extension_reason if motion_family != "world_y_approach" else None,
         "far_point_a_extra_height_clearance_m": float(far_point_a_extra_height_clearance),
         "far_point_a_min_extra_height_clearance_m": float(far_point_a_min_extra_height_clearance),
         "far_ab_requested_downward_slant_deg": far_ab_requested_downward_slant_deg,
@@ -4710,13 +4792,21 @@ def _plan_grasp_geometry(
         "far_ab_base_horizontal_span_m": float(far_ab_base_horizontal_span_m),
         "far_point_b_forward_extension_m": float(far_point_b_forward_extension),
         "far_reach_axis_world": None if far_reach_axis_world is None else far_reach_axis_world.tolist(),
-        "far_contact_sequence_policy": "outboard_transition_then_low_side_prepare_then_xy_align_then_world_z_descend" if motion_family == "world_y_approach" else None,
+        "far_contact_sequence_policy": "outboard_transition_then_low_side_prepare_then_world_z_descend_at_safe_xy_then_low_xy_slide_to_contact" if motion_family == "world_y_approach" else None,
         "far_outboard_transition_B_world": None if far_outboard_transition_b_world is None else far_outboard_transition_b_world.tolist(),
         "far_outboard_transition_pose_base": None if far_outboard_transition_pose is None else far_outboard_transition_pose.tolist(),
         "far_outboard_transition_details": far_outboard_transition_details,
         "far_outboard_axis_world": None if far_outboard_axis_world is None else far_outboard_axis_world.tolist(),
         "far_outboard_transition_offset_m": float(args.far_outboard_transition_offset) if motion_family == "world_y_approach" else None,
         "far_outboard_transition_clearance_m": float(args.far_outboard_transition_clearance) if motion_family == "world_y_approach" else None,
+        "far_safe_z_lower_B_world": None if far_safe_z_lower_b_world is None else far_safe_z_lower_b_world.tolist(),
+        "far_safe_z_lower_pose_base": None if far_safe_z_lower_pose is None else far_safe_z_lower_pose.tolist(),
+        "far_safe_z_lower_details": far_safe_z_lower_details,
+        "far_safe_descent_xy_clearance_m": policy_details.get("far_safe_descent_xy_clearance_m") if motion_family == "world_y_approach" else None,
+        "far_safe_descent_initial_xy_inside_target_bbox": policy_details.get("far_safe_descent_initial_xy_inside_target_bbox") if motion_family == "world_y_approach" else None,
+        "far_safe_descent_adjusted": policy_details.get("far_safe_descent_adjusted") if motion_family == "world_y_approach" else None,
+        "far_safe_descent_adjustment_m": policy_details.get("far_safe_descent_adjustment_m") if motion_family == "world_y_approach" else None,
+        "far_safe_descent_target_bbox_xy": policy_details.get("far_safe_descent_target_bbox_xy") if motion_family == "world_y_approach" else None,
         "far_xy_align_B_world": None if far_xy_align_b_world is None else far_xy_align_b_world.tolist(),
         "far_descend_B_world": contact_b_world.tolist() if motion_family == "world_y_approach" else None,
         "far_legacy_side_contact_B_world": None if legacy_side_contact_b_world is None else legacy_side_contact_b_world.tolist(),
@@ -4729,7 +4819,8 @@ def _plan_grasp_geometry(
         "vertical_arm_lateral_bias_correction_base_y_m": float(vertical_lateral_correction_base_y) if motion_family != "world_y_approach" else None,
         "vertical_arm_lateral_bias_correction_base_vector": vertical_lateral_correction_base.tolist() if motion_family != "world_y_approach" else None,
         "vertical_arm_lateral_bias_correction_world": vertical_lateral_correction_world.tolist() if motion_family != "world_y_approach" else None,
-        "vertical_arm_lateral_bias_correction_rule": "right arm shifts +baseY; left arm shifts -baseY, opposing observed outward vertical grasp bias" if motion_family != "world_y_approach" else None,
+        "vertical_arm_lateral_bias_correction_rule": "right arm shifts +baseY and left arm shifts -baseY only when nonzero; default neutral after observed inward bias" if motion_family != "world_y_approach" else None,
+        "vertical_point_b_proxy_policy": "vertical-only inferred point_B is extended along its local distal direction so the proxy is closer to the fingertip" if motion_family != "world_y_approach" else None,
         "vertical_raw_point_B_contact_mark_before_xy_reference": raw_contact_b_world.tolist() if motion_family != "world_y_approach" else None,
         "vertical_xy_reference_link_log": vertical_xy_reference_log if motion_family != "world_y_approach" else None,
         "vertical_xy_reference_mode": None if motion_family == "world_y_approach" or vertical_xy_reference_log is None else vertical_xy_reference_log.get("reference_mode", "single_reference_link"),
@@ -5172,8 +5263,13 @@ def _candidate_diagnostic_view(candidate: dict[str, Any] | None) -> dict[str, An
         "dot_with_world_pos_y",
         "dot_with_world_neg_y",
         "far_low_side_prepare_B_world",
+        "far_safe_z_lower_B_world",
         "far_xy_align_B_world",
         "far_descend_B_world",
+        "vertical_point_b_offset_local_adjustment",
+        "vertical_point_b_distal_extension_m",
+        "vertical_point_b_distal_extension_applied",
+        "vertical_point_b_distal_extension_reason",
         "contact_point_B_world",
         "target_point_A_world",
         "target_point_B_world",
@@ -5368,10 +5464,15 @@ def _evaluate_pregrasp_candidates(
                 "vertical_arm_lateral_bias_correction_rule": preset_geometry.get("vertical_arm_lateral_bias_correction_rule"),
                 "vertical_xy_reference_offset_local": preset_geometry.get("vertical_xy_reference_offset_local"),
                 "vertical_raw_point_B_contact_mark_before_xy_reference": preset_geometry.get("vertical_raw_point_B_contact_mark_before_xy_reference"),
+                "vertical_point_b_offset_local_adjustment": preset_geometry.get("vertical_point_b_offset_local_adjustment"),
+                "vertical_point_b_distal_extension_m": preset_geometry.get("vertical_point_b_distal_extension_m"),
+                "vertical_point_b_distal_extension_applied": preset_geometry.get("vertical_point_b_distal_extension_applied"),
+                "vertical_point_b_distal_extension_reason": preset_geometry.get("vertical_point_b_distal_extension_reason"),
                 "far_reach_axis_world": preset_geometry.get("far_reach_axis_world"),
                 "dot_with_world_pos_y": preset.get("dot_with_world_pos_y"),
                 "dot_with_world_neg_y": preset.get("dot_with_world_neg_y"),
                 "far_low_side_prepare_B_world": preset_geometry.get("far_low_side_prepare_B_world"),
+                "far_safe_z_lower_B_world": preset_geometry.get("far_safe_z_lower_B_world"),
                 "far_xy_align_B_world": preset_geometry.get("far_xy_align_B_world"),
                 "far_descend_B_world": preset_geometry.get("far_descend_B_world"),
                 "contact_point_B_world": preset_geometry.get("contact_point_B_world"),
@@ -6408,6 +6509,7 @@ def _pre_close_gate(
         "close_critical_error_before_close_m": close_critical_error,
         "close_critical_uses_real_grasp_center": close_critical_uses_real_grasp_center,
         "far_low_side_prepare_B_world": geometry.get("far_low_side_prepare_B_world"),
+        "far_safe_z_lower_B_world": geometry.get("far_safe_z_lower_B_world"),
         "far_xy_align_B_world": geometry.get("far_xy_align_B_world"),
         "far_descend_B_world": geometry.get("far_descend_B_world"),
         "far_contact_sequence_policy": geometry.get("far_contact_sequence_policy"),
@@ -6422,6 +6524,10 @@ def _pre_close_gate(
         "far_xy_align_clearance_above_object_m": geometry.get("far_xy_align_clearance_above_object_m"),
         "vertical_contact_mark_B_world": geometry.get("vertical_contact_mark_B_world"),
         "vertical_raw_point_B_contact_mark_before_xy_reference": geometry.get("vertical_raw_point_B_contact_mark_before_xy_reference"),
+        "vertical_point_b_offset_local_adjustment": geometry.get("vertical_point_b_offset_local_adjustment"),
+        "vertical_point_b_distal_extension_m": geometry.get("vertical_point_b_distal_extension_m"),
+        "vertical_point_b_distal_extension_applied": geometry.get("vertical_point_b_distal_extension_applied"),
+        "vertical_point_b_distal_extension_reason": geometry.get("vertical_point_b_distal_extension_reason"),
         "vertical_point_b_gap_above_support_m": geometry.get("vertical_point_b_gap_above_support_m"),
         "vertical_close_point_b_tolerance_m": geometry.get("vertical_close_point_b_tolerance_m"),
         "vertical_xy_reference_active": geometry.get("vertical_xy_reference_active"),
@@ -6591,6 +6697,8 @@ def final_descent_local_ik(
         object_center_world = np.array([float("nan"), float("nan"), float("nan")], dtype=float)
     xy_step_max = float(args.phase2_descent_xy_step)
     z_step_max = float(args.phase2_descent_z_step)
+    if phase_name == "phase2_vertical_final_descent_local_ik":
+        z_step_max = min(z_step_max, float(args.vertical_descent_z_step))
     yaw_step_max = float(args.phase2_descent_yaw_step)
     samples: list[dict[str, Any]] = []
     proxy_middle_point_debug_samples: list[dict[str, Any]] = []
@@ -7961,6 +8069,7 @@ def main() -> int:
     parser.add_argument("--far-outboard-transition-clearance", type=float, default=DEFAULT_FAR_OUTBOARD_TRANSITION_CLEARANCE)
     parser.add_argument("--far-null-weight", type=float, default=DEFAULT_FAR_NULL_WEIGHT)
     parser.add_argument("--far-outboard-shoulder-roll-bias", type=float, default=DEFAULT_FAR_OUTBOARD_SHOULDER_ROLL_BIAS)
+    parser.add_argument("--far-safe-descent-xy-clearance", type=float, default=DEFAULT_FAR_SAFE_DESCENT_XY_CLEARANCE)
     parser.add_argument("--pre-close-point-b-tolerance", type=float, default=DEFAULT_PRE_CLOSE_POINT_B_TOLERANCE)
     parser.add_argument("--no-live-coordinate-transform", action="store_true")
     parser.add_argument("--vertical-point-b-gap-above-support", type=float, default=DEFAULT_VERTICAL_POINT_B_GAP_ABOVE_SUPPORT)
@@ -7968,6 +8077,8 @@ def main() -> int:
     parser.add_argument("--vertical-xy-reference-link", default=DEFAULT_VERTICAL_XY_REFERENCE_LINK)
     parser.add_argument("--vertical-xy-reference-tolerance", type=float, default=DEFAULT_VERTICAL_XY_REFERENCE_TOLERANCE)
     parser.add_argument("--vertical-arm-lateral-bias-correction", type=float, default=DEFAULT_VERTICAL_ARM_LATERAL_BIAS_CORRECTION)
+    parser.add_argument("--vertical-descent-z-step", type=float, default=DEFAULT_VERTICAL_DESCENT_Z_STEP_M)
+    parser.add_argument("--vertical-point-b-distal-extension", type=float, default=DEFAULT_VERTICAL_POINT_B_DISTAL_EXTENSION_M)
     parser.add_argument("--align-clearance", type=float, default=DEFAULT_ALIGN_CLEARANCE)
     parser.add_argument("--descend-clearance", type=float, default=DEFAULT_DESCEND_CLEARANCE)
     parser.add_argument("--grasp-depth-offset", type=float, default=0.0)
@@ -8106,6 +8217,7 @@ def main() -> int:
         or not math.isfinite(float(args.far_outboard_transition_clearance))
         or not math.isfinite(float(args.far_null_weight))
         or not math.isfinite(float(args.far_outboard_shoulder_roll_bias))
+        or not math.isfinite(float(args.far_safe_descent_xy_clearance))
         or args.far_low_side_clearance < 0.0
         or args.far_point_b_gap_above_support < 0.0
         or args.far_xy_align_clearance_above_object < 0.0
@@ -8117,6 +8229,7 @@ def main() -> int:
         or args.far_outboard_transition_clearance < 0.0
         or args.far_null_weight < 0.0
         or args.far_outboard_shoulder_roll_bias < 0.0
+        or args.far_safe_descent_xy_clearance < 0.0
     ):
         raise RuntimeError("FAR geometry/null-space knobs must be finite non-negative values, with --far-ab-downward-slant-deg in [0, 80)")
     if (
@@ -8124,9 +8237,13 @@ def main() -> int:
         or not math.isfinite(float(args.vertical_close_point_b_tolerance))
         or not math.isfinite(float(args.vertical_xy_reference_tolerance))
         or not math.isfinite(float(args.vertical_arm_lateral_bias_correction))
+        or not math.isfinite(float(args.vertical_descent_z_step))
+        or not math.isfinite(float(args.vertical_point_b_distal_extension))
         or not math.isfinite(float(args.pre_close_point_b_tolerance))
         or args.vertical_point_b_gap_above_support < 0.0
         or args.vertical_arm_lateral_bias_correction < 0.0
+        or args.vertical_descent_z_step <= 0.0
+        or args.vertical_point_b_distal_extension < 0.0
         or args.vertical_close_point_b_tolerance <= 0.0
         or args.vertical_xy_reference_tolerance <= 0.0
         or args.pre_close_point_b_tolerance <= 0.0
@@ -8236,6 +8353,8 @@ def main() -> int:
                 "ab_downward_slant_deg": float(args.far_ab_downward_slant_deg),
                 "outboard_transition_offset_m": float(args.far_outboard_transition_offset),
                 "outboard_transition_clearance_m": float(args.far_outboard_transition_clearance),
+                "safe_descent_xy_clearance_m": float(args.far_safe_descent_xy_clearance),
+                "safe_descent_sequence": "lower point B in world Z at an off-object XY, then slide horizontally at contact height",
                 "far_null_weight": float(args.far_null_weight),
                 "far_outboard_shoulder_roll_bias_rad": float(args.far_outboard_shoulder_roll_bias),
             },
@@ -8283,7 +8402,7 @@ def main() -> int:
                 "max_retries": int(args.phase2_max_retries),
             },
             "AB_motion_semantics_active": True,
-            "far_motion_policy": "low_side_prepare_then_xy_align_then_world_z_descend",
+            "far_motion_policy": "low_side_prepare_then_world_z_descend_at_safe_xy_then_low_xy_slide",
             "mid_motion_policy": "vertical_AB_world_Z_descend",
             "vertical_contact_policy": {
                 "point_b_gap_above_support_m": float(args.vertical_point_b_gap_above_support),
@@ -8291,7 +8410,10 @@ def main() -> int:
                 "xy_reference_link": str(args.vertical_xy_reference_link),
                 "xy_reference_tolerance_m": float(args.vertical_xy_reference_tolerance),
                 "arm_lateral_bias_correction_m": float(args.vertical_arm_lateral_bias_correction),
-                "arm_lateral_bias_correction_rule": "right arm +baseY, left arm -baseY for vertical-only XY target correction",
+                "arm_lateral_bias_correction_rule": "right arm +baseY and left arm -baseY only when nonzero; default neutral after observed inward bias",
+                "descent_z_step_m": float(args.vertical_descent_z_step),
+                "point_b_distal_extension_m": float(args.vertical_point_b_distal_extension),
+                "point_b_distal_extension_policy": "vertical-only inferred point_B is extended along its local distal direction so the proxy sits closer to the fingertip",
                 "close_after_point_B_contact_gate": True,
             },
             "stop_after_lift": bool(args.stop_after_lift),
@@ -9122,6 +9244,114 @@ def main() -> int:
         geometry = selected_candidate["geometry"]
         args.point_b_offset_local_resolved = list(geometry.get("point_b_offset_local", point_b_offset.tolist()))
         selected_orientation_preset = selected_candidate["selected_orientation_preset"]
+        if geometry.get("motion_policy") == "far_low_side_B_driven" and geometry.get("far_safe_z_lower_B_world") is not None:
+            safe_clearance = float(args.far_safe_descent_xy_clearance)
+            safe_shift_step = max(safe_clearance, 0.020)
+            safe_z_lower_b_world = np.array(geometry["far_safe_z_lower_B_world"], dtype=float)
+            far_reach_axis_world = _finite_world_vector_or_none(geometry.get("far_reach_axis_world"))
+            if far_reach_axis_world is None:
+                far_reach_axis_world = np.array([0.0, 1.0, 0.0], dtype=float)
+            far_reach_axis_xy = far_reach_axis_world.copy()
+            far_reach_axis_xy[2] = 0.0
+            safe_shift_axis_world = -_normalize(far_reach_axis_xy, np.array([0.0, -1.0, 0.0], dtype=float))
+            safe_descent_xy_checks: list[dict[str, Any]] = []
+            safe_total_shift_world = np.zeros(3, dtype=float)
+            for attempt_index in range(8):
+                obstacle_hits = []
+                bbox_errors = []
+                for part_path in part_paths:
+                    try:
+                        part_bbox = _bbox(stage, part_path)
+                    except Exception as exc:
+                        bbox_errors.append({"prim_path": part_path, "bbox_error": repr(exc)})
+                        continue
+                    if _xy_inside_bbox_margin(safe_z_lower_b_world, part_bbox, safe_clearance):
+                        obstacle_hits.append(
+                            {
+                                "prim_path": part_path,
+                                "bbox_center": part_bbox.get("center"),
+                                "bbox_min": part_bbox.get("min"),
+                                "bbox_max": part_bbox.get("max"),
+                                "xy_inside_clearance": True,
+                            }
+                        )
+                safe_descent_xy_checks.append(
+                    {
+                        "attempt_index": attempt_index,
+                        "candidate_safe_z_lower_B_world": safe_z_lower_b_world.tolist(),
+                        "clearance_m": safe_clearance,
+                        "obstacle_hit_count": len(obstacle_hits),
+                        "obstacle_hits": obstacle_hits,
+                        "bbox_errors": bbox_errors,
+                    }
+                )
+                if not obstacle_hits:
+                    break
+                shift_world = safe_shift_axis_world * safe_shift_step
+                shift_world[2] = 0.0
+                safe_z_lower_b_world = safe_z_lower_b_world + shift_world
+                safe_total_shift_world = safe_total_shift_world + shift_world
+
+            safe_descent_all_object_log = {
+                "policy": "shift_safe_descent_xy_away_from_any_part_bbox_before_lowering_z",
+                "clearance_m": safe_clearance,
+                "shift_step_m": safe_shift_step,
+                "shift_axis_world": safe_shift_axis_world.tolist(),
+                "total_shift_world": safe_total_shift_world.tolist(),
+                "total_shift_m": float(np.linalg.norm(safe_total_shift_world[:2])),
+                "attempts": safe_descent_xy_checks,
+                "final_safe_z_lower_B_world": safe_z_lower_b_world.tolist(),
+                "final_clear_of_all_checked_part_bboxes": bool(
+                    safe_descent_xy_checks and safe_descent_xy_checks[-1].get("obstacle_hit_count") == 0
+                ),
+            }
+            if float(np.linalg.norm(safe_total_shift_world[:2])) > 0.0:
+                selected_point_b_offset_for_safe = np.array(geometry.get("point_b_offset_local", point_b_offset), dtype=float)
+                selected_rpy_for_safe = np.array(selected_orientation_preset["rpy"], dtype=float)
+                for point_key in (
+                    "pregrasp_point_B_world",
+                    "pregrasp_contact_world",
+                    "far_low_side_prepare_B_world",
+                    "far_safe_z_lower_B_world",
+                    "far_outboard_transition_B_world",
+                ):
+                    if geometry.get(point_key) is not None:
+                        shifted_point = np.array(geometry[point_key], dtype=float)
+                        shifted_point[:2] = shifted_point[:2] + safe_total_shift_world[:2]
+                        geometry[point_key] = shifted_point.tolist()
+                pregrasp_pose, pregrasp_details = _pose_for_point_b_world(
+                    np.array(geometry["pregrasp_point_B_world"], dtype=float),
+                    coord_transform,
+                    selected_rpy_for_safe,
+                    selected_point_b_offset_for_safe,
+                )
+                safe_z_lower_pose, safe_z_lower_details = _pose_for_point_b_world(
+                    np.array(geometry["far_safe_z_lower_B_world"], dtype=float),
+                    coord_transform,
+                    selected_rpy_for_safe,
+                    selected_point_b_offset_for_safe,
+                )
+                geometry["pregrasp_pose_base"] = pregrasp_pose.tolist()
+                geometry["pregrasp_details"] = pregrasp_details
+                geometry["pregrasp_AB_semantics"] = _ab_pose_semantics(coord_transform, pregrasp_pose, selected_point_b_offset_for_safe)
+                geometry["far_safe_z_lower_pose_base"] = safe_z_lower_pose.tolist()
+                geometry["far_safe_z_lower_details"] = safe_z_lower_details
+                if geometry.get("far_outboard_transition_B_world") is not None:
+                    outboard_pose, outboard_details = _pose_for_point_b_world(
+                        np.array(geometry["far_outboard_transition_B_world"], dtype=float),
+                        coord_transform,
+                        selected_rpy_for_safe,
+                        selected_point_b_offset_for_safe,
+                    )
+                    geometry["far_outboard_transition_pose_base"] = outboard_pose.tolist()
+                    geometry["far_outboard_transition_details"] = outboard_details
+                selected_candidate["pose_base"] = pregrasp_pose.tolist()
+                selected_candidate["target_pose_base"] = pregrasp_pose.tolist()
+                selected_candidate["target_point_B_world"] = geometry["pregrasp_point_B_world"]
+                selected_candidate["far_low_side_prepare_B_world"] = geometry.get("far_low_side_prepare_B_world")
+                selected_candidate["far_safe_z_lower_B_world"] = geometry.get("far_safe_z_lower_B_world")
+            geometry["far_safe_descent_all_object_xy_check"] = safe_descent_all_object_log
+            geometry.setdefault("motion_policy_details", {})["far_safe_descent_all_object_xy_check"] = safe_descent_all_object_log
         payload["selected_approach_family"] = selected_orientation_preset.get("preset_family")
         payload["selected_grasp_family"] = selected_orientation_preset.get("preset_family")
         payload["target_region"] = target_region
@@ -9138,6 +9368,8 @@ def main() -> int:
         payload["selected_far_outboard_transition_offset_m"] = geometry.get("far_outboard_transition_offset_m")
         payload["selected_far_outboard_transition_clearance_m"] = geometry.get("far_outboard_transition_clearance_m")
         payload["selected_far_low_side_prepare_B_world"] = geometry.get("far_low_side_prepare_B_world")
+        payload["selected_far_safe_z_lower_B_world"] = geometry.get("far_safe_z_lower_B_world")
+        payload["selected_far_safe_descent_all_object_xy_check"] = geometry.get("far_safe_descent_all_object_xy_check")
         payload["selected_far_xy_align_B_world"] = geometry.get("far_xy_align_B_world")
         payload["selected_far_descend_B_world"] = geometry.get("far_descend_B_world")
         payload["selected_far_contact_sequence_policy"] = geometry.get("far_contact_sequence_policy")
@@ -9164,6 +9396,10 @@ def main() -> int:
         payload["selected_vertical_arm_lateral_bias_correction_base_y_m"] = geometry.get("vertical_arm_lateral_bias_correction_base_y_m")
         payload["selected_vertical_arm_lateral_bias_correction_world"] = geometry.get("vertical_arm_lateral_bias_correction_world")
         payload["selected_vertical_arm_lateral_bias_correction_rule"] = geometry.get("vertical_arm_lateral_bias_correction_rule")
+        payload["selected_vertical_point_b_offset_local_adjustment"] = geometry.get("vertical_point_b_offset_local_adjustment")
+        payload["selected_vertical_point_b_distal_extension_m"] = geometry.get("vertical_point_b_distal_extension_m")
+        payload["selected_vertical_point_b_distal_extension_applied"] = geometry.get("vertical_point_b_distal_extension_applied")
+        payload["selected_vertical_point_b_distal_extension_reason"] = geometry.get("vertical_point_b_distal_extension_reason")
         payload["selected_vertical_xy_reference_world_position_used_for_offset"] = geometry.get("vertical_xy_reference_world_position_used_for_offset")
         payload["selected_vertical_xy_reference_component_logs"] = geometry.get("vertical_xy_reference_component_logs")
         payload["selected_vertical_xy_reference_offset_local"] = geometry.get("vertical_xy_reference_offset_local")
@@ -9220,6 +9456,10 @@ def main() -> int:
         if geometry.get("far_low_side_prepare_B_world") is not None:
             debug_markers.append(
                 _create_debug_marker(stage, "/World/DebugDualArmIKFarLowSidePrepareB", geometry["far_low_side_prepare_B_world"], 0.024, (0.1, 0.9, 0.9))
+            )
+        if geometry.get("far_safe_z_lower_B_world") is not None:
+            debug_markers.append(
+                _create_debug_marker(stage, "/World/DebugDualArmIKFarSafeZLowerB", geometry["far_safe_z_lower_B_world"], 0.023, (0.6, 1.0, 0.1))
             )
         if geometry.get("far_xy_align_B_world") is not None:
             debug_markers.append(
@@ -9308,6 +9548,8 @@ def main() -> int:
                 "point_B_proxy": geometry["point_B_proxy_definition"],
                 "target_point_B_world": geometry["pregrasp_point_B_world"],
                 "far_low_side_prepare_B_world": geometry.get("far_low_side_prepare_B_world"),
+                "far_safe_z_lower_B_world": geometry.get("far_safe_z_lower_B_world"),
+                "far_safe_descent_all_object_xy_check": geometry.get("far_safe_descent_all_object_xy_check"),
                 "far_xy_align_B_world": geometry.get("far_xy_align_B_world"),
                 "far_descend_B_world": geometry.get("far_descend_B_world"),
                 "contact_point_B_world": geometry.get("contact_point_B_world"),
@@ -9322,6 +9564,10 @@ def main() -> int:
                 "far_point_b_gap_above_support_m": geometry.get("far_point_b_gap_above_support_m"),
                 "far_xy_align_clearance_above_object_m": geometry.get("far_xy_align_clearance_above_object_m"),
                 "far_reach_axis_world": geometry.get("far_reach_axis_world"),
+                "vertical_point_b_offset_local_adjustment": geometry.get("vertical_point_b_offset_local_adjustment"),
+                "vertical_point_b_distal_extension_m": geometry.get("vertical_point_b_distal_extension_m"),
+                "vertical_point_b_distal_extension_applied": geometry.get("vertical_point_b_distal_extension_applied"),
+                "vertical_point_b_distal_extension_reason": geometry.get("vertical_point_b_distal_extension_reason"),
                 "AB_axis_world": geometry.get("AB_axis_world"),
                 "selected_orientation_preset_axial_roll_variant_label": selected_orientation_preset.get("preset_axial_roll_variant_label"),
                 "selected_orientation_preset_axial_roll_about_ab_rad": selected_orientation_preset.get("preset_axial_roll_about_ab_rad"),
@@ -9355,84 +9601,6 @@ def main() -> int:
 
         if far_motion_policy:
             selected_point_b_offset = np.array(geometry.get("point_b_offset_local", point_b_offset), dtype=float)
-            far_xy_align_result = _execute_dualarmik_servo_phase(
-                ServoSpec("far_align_B_over_object_xy", np.array(geometry["align_pose_base"], dtype=float), args.align_tolerance, args.rot_tolerance, args.servo_max_ticks),
-                ik_solver=ik_solver,
-                dc=dc,
-                articulation=articulation,
-                arm_dofs=arm_dofs,
-                arm_side=chosen_arm,
-                coord_transform=coord_transform,
-                gripper_dofs=gripper_dofs,
-                sim_app=sim_app,
-                args=args,
-                counter=counter,
-                phase_log=phase_log,
-                end_effector_name=end_effector_name,
-                end_effector_path=end_effector_path,
-                end_effector_policy=end_effector_policy,
-                coord_transform_refresh_fn=coord_transform_refresh_fn,
-                ik_overrides=far_ik_overrides,
-                extra_details={
-                    "motion_policy": motion_policy,
-                    "far_contact_sequence_policy": geometry.get("far_contact_sequence_policy"),
-                    "point_A_proxy": geometry["point_A_proxy_definition"],
-                    "point_B_proxy": geometry["point_B_proxy_definition"],
-                    "target_point_B_world": geometry["far_xy_align_B_world"],
-                    "far_low_side_prepare_B_world": geometry.get("far_low_side_prepare_B_world"),
-                    "far_xy_align_B_world": geometry.get("far_xy_align_B_world"),
-                    "far_descend_B_world": geometry.get("far_descend_B_world"),
-                    "contact_point_B_world": geometry.get("contact_point_B_world"),
-                    "contact_point_A_world": geometry.get("contact_AB_semantics", {}).get("point_A_world"),
-                    "far_point_b_forward_extension_m": geometry.get("far_point_b_forward_extension_m"),
-                    "far_point_a_extra_height_clearance_m": geometry.get("far_point_a_extra_height_clearance_m"),
-                    "far_point_a_min_extra_height_clearance_m": geometry.get("far_point_a_min_extra_height_clearance_m"),
-                    "far_ab_requested_downward_slant_deg": geometry.get("far_ab_requested_downward_slant_deg"),
-                    "far_ab_downward_slant_deg": geometry.get("far_ab_downward_slant_deg"),
-                    "far_ab_slant_height_clearance_m": geometry.get("far_ab_slant_height_clearance_m"),
-                    "far_ab_base_horizontal_span_m": geometry.get("far_ab_base_horizontal_span_m"),
-                    "far_point_b_gap_above_support_m": geometry.get("far_point_b_gap_above_support_m"),
-                    "far_xy_align_clearance_above_object_m": geometry.get("far_xy_align_clearance_above_object_m"),
-                    "object_top_z": geometry.get("object_top_z_world"),
-                    "align_clearance": geometry.get("align_clearance_m"),
-                    "align_height": geometry.get("align_height"),
-                    "far_reach_axis_world": geometry.get("far_reach_axis_world"),
-                    "AB_axis_world": geometry.get("AB_axis_world"),
-                    "selected_orientation_preset_axial_roll_variant_label": selected_orientation_preset.get("preset_axial_roll_variant_label"),
-                    "selected_orientation_preset_axial_roll_about_ab_rad": selected_orientation_preset.get("preset_axial_roll_about_ab_rad"),
-                    "selected_orientation_preset_planar_yaw_variant_deg": selected_orientation_preset.get("preset_planar_yaw_variant_deg"),
-                    "selected_orientation_preset_planar_yaw_variant_rad": selected_orientation_preset.get("preset_planar_yaw_variant_rad"),
-                    "side_push_avoidance": "XY alignment happens at low-side prepare height before final world-Z lowering",
-                },
-            )
-            current_align_pose = _current_ee_pose_base(ik_solver, dc, articulation, chosen_arm, args=args)
-            current_align_b_world = _point_b_world_from_pose(coord_transform, current_align_pose, selected_point_b_offset)
-            target_align_b_world = np.array(geometry["far_xy_align_B_world"], dtype=float)
-            xy_error_at_descent = float(np.linalg.norm(current_align_b_world[:2] - target_align_b_world[:2]))
-            horizontal_descent_trigger_tolerance = float(args.horizontal_descent_xy_trigger_tolerance)
-            near_enough_xy = bool(xy_error_at_descent < horizontal_descent_trigger_tolerance)
-            descent_trigger_log = {
-                "align_height": geometry.get("align_height"),
-                "object_top_z": geometry.get("object_top_z_world"),
-                "align_clearance": geometry.get("align_clearance_m"),
-                "descent_triggered": near_enough_xy,
-                "xy_error": xy_error_at_descent,
-                "xy_error_at_descent": xy_error_at_descent,
-                "xy_error_at_descent_trigger": xy_error_at_descent,
-                "horizontal_descent_trigger_tolerance_used": horizontal_descent_trigger_tolerance,
-                "xy_descent_trigger_tolerance_m": horizontal_descent_trigger_tolerance,
-                "full_align_final_error_m": far_xy_align_result.get("final_error"),
-                "full_align_rotation_error_rad": far_xy_align_result.get("final_rotation_error_rad"),
-                "descent_trigger_rule": "start descending when horizontal XY error is near enough; do not require perfect full-pose alignment",
-            }
-            far_xy_align_result["horizontal_descent_trigger"] = descent_trigger_log
-            if phase_log and phase_log[-1].get("phase") == "far_align_B_over_object_xy":
-                phase_log[-1]["details"]["horizontal_descent_trigger"] = descent_trigger_log
-            payload["hybrid_phase2"]["horizontal_descent_trigger"] = descent_trigger_log
-            if not near_enough_xy:
-                _fail("align_failed", "far_align_B_over_object_xy did not reach loose XY descent trigger")
-            payload["object_trace"]["after_far_xy_align"] = _bbox_state(stage, target_path)
-
             far_descend_locked_rpy = np.array(selected_orientation_preset["rpy"], dtype=float)
             far_descend_B_world = np.array(geometry["contact_point_B_world"], dtype=float)
             horizontal_grasp_expansion_log = None
@@ -9460,9 +9628,19 @@ def main() -> int:
                         selected_point_b_offset,
                     )
                     geometry["unexpanded_contact_point_B_world"] = unexpanded_contact_point_B_world.tolist()
+                    geometry["contact_point_world"] = far_descend_B_world.tolist()
                     geometry["contact_point_B_world"] = far_descend_B_world.tolist()
                     geometry["far_descend_B_world"] = far_descend_B_world.tolist()
+                    geometry["far_xy_align_B_world"] = far_descend_B_world.tolist()
+                    geometry["align_point_B_world"] = far_descend_B_world.tolist()
                     geometry["contact_pose_base"] = expanded_contact_pose_base.tolist()
+                    geometry["align_pose_base"] = expanded_contact_pose_base.tolist()
+                    geometry["far_xy_align_pose_base"] = expanded_contact_pose_base.tolist()
+                    geometry["far_descend_pose_base"] = expanded_contact_pose_base.tolist()
+                    geometry["contact_details"] = expansion_pose_log
+                    geometry["align_details"] = expansion_pose_log
+                    geometry["contact_AB_semantics"] = _ab_pose_semantics(coord_transform, expanded_contact_pose_base, selected_point_b_offset)
+                    geometry["align_AB_semantics"] = _ab_pose_semantics(coord_transform, expanded_contact_pose_base, selected_point_b_offset)
                     horizontal_grasp_expansion_log = {
                         "enabled": True,
                         "object_width_m": object_width,
@@ -9479,29 +9657,48 @@ def main() -> int:
                 }
             geometry["horizontal_grasp_expansion"] = horizontal_grasp_expansion_log
 
+            safe_z_lower_B_world_raw = geometry.get("far_safe_z_lower_B_world")
+            if safe_z_lower_B_world_raw is None:
+                safe_z_lower_B_world = np.array(geometry["pregrasp_point_B_world"], dtype=float)
+            else:
+                safe_z_lower_B_world = np.array(safe_z_lower_B_world_raw, dtype=float)
+            safe_z_lower_B_world[2] = float(far_descend_B_world[2])
+            safe_z_lower_pose_base, safe_z_lower_pose_log = _pose_for_point_b_world(
+                safe_z_lower_B_world,
+                coord_transform,
+                far_descend_locked_rpy,
+                selected_point_b_offset,
+            )
+            geometry["far_safe_z_lower_B_world"] = safe_z_lower_B_world.tolist()
+            geometry["far_safe_z_lower_pose_base"] = safe_z_lower_pose_base.tolist()
+            geometry["far_safe_z_lower_details"] = safe_z_lower_pose_log
+
             far_z_completion_tolerance = float(args.pre_close_point_b_tolerance)
             far_z_descent_state: dict[str, Any] = {
-                "completion_rule": "point_B_world_z_must_reach_far_descend_B_world_z_before_phase_success",
-                "target_z_world_m": float(far_descend_B_world[2]),
+                "completion_rule": "point_B_world_z_must_reach_far_safe_z_lower_B_world_z_before_low_xy_slide",
+                "horizontal_sequence": "z_lower_at_safe_xy_before_low_xy_slide",
+                "safe_xy_target_point_B_world": safe_z_lower_B_world.tolist(),
+                "final_contact_point_B_world": far_descend_B_world.tolist(),
+                "target_z_world_m": float(safe_z_lower_B_world[2]),
                 "z_completion_tolerance_m": far_z_completion_tolerance,
                 "final_z_reached_by_runtime": False,
                 "descent_stopped_before_contact_z": True,
             }
 
             def update_far_z_descent_state(current_b_world: np.ndarray, commanded_b_world: np.ndarray | None = None) -> float:
-                z_remaining = float(max(0.0, float(current_b_world[2]) - float(far_descend_B_world[2])))
+                z_remaining = float(max(0.0, float(current_b_world[2]) - float(safe_z_lower_B_world[2])))
                 far_z_descent_state.update(
                     {
                         "current_point_B_world": np.array(current_b_world, dtype=float).tolist(),
                         "current_z_world_m": float(current_b_world[2]),
-                        "target_z_world_m": float(far_descend_B_world[2]),
+                        "target_z_world_m": float(safe_z_lower_B_world[2]),
                         "z_remaining_to_contact_m": z_remaining,
                         "final_z_reached_by_runtime": bool(z_remaining <= far_z_completion_tolerance),
                         "descent_stopped_before_contact_z": bool(z_remaining > far_z_completion_tolerance),
                     }
                 )
                 if commanded_b_world is not None:
-                    commanded_remaining = float(max(0.0, float(commanded_b_world[2]) - float(far_descend_B_world[2])))
+                    commanded_remaining = float(max(0.0, float(commanded_b_world[2]) - float(safe_z_lower_B_world[2])))
                     far_z_descent_state.update(
                         {
                             "commanded_point_B_world": np.array(commanded_b_world, dtype=float).tolist(),
@@ -9515,8 +9712,8 @@ def main() -> int:
             def far_world_z_lower_fn():
                 curr_pose = _current_ee_pose_base(ik_solver, dc, articulation, chosen_arm, args=args)
                 curr_B_world = _point_b_world_from_pose(coord_transform, curr_pose, selected_point_b_offset)
-                next_B_world = far_descend_B_world.copy()
-                next_B_world[2] = max(float(far_descend_B_world[2]), float(curr_B_world[2]) - 0.002)
+                next_B_world = safe_z_lower_B_world.copy()
+                next_B_world[2] = max(float(safe_z_lower_B_world[2]), float(curr_B_world[2]) - float(args.phase2_descent_z_step))
                 update_far_z_descent_state(curr_B_world, next_B_world)
                 target_pose, _ = _pose_for_point_b_world(next_B_world, coord_transform, far_descend_locked_rpy, selected_point_b_offset)
                 return target_pose
@@ -9528,7 +9725,7 @@ def main() -> int:
                 return bool(z_remaining <= far_z_completion_tolerance)
 
             descend_result = _execute_dualarmik_servo_phase(
-                ServoSpec("far_lower_B_world_z", np.array(geometry["contact_pose_base"], dtype=float), args.descend_tolerance, args.rot_tolerance, args.servo_max_ticks * 2),
+                ServoSpec("far_lower_B_world_z", safe_z_lower_pose_base, args.descend_tolerance, args.rot_tolerance, args.servo_max_ticks * 2),
                 ik_solver=ik_solver,
                 dc=dc,
                 articulation=articulation,
@@ -9547,10 +9744,11 @@ def main() -> int:
                 ik_overrides=far_ik_overrides,
                 target_pose_fn=far_world_z_lower_fn,
                 completion_condition_fn=far_z_descent_completion_fn,
-                completion_condition_label="far_point_B_runtime_z_reached_contact_target",
+                completion_condition_label="far_point_B_runtime_z_reached_safe_lower_target",
                 extra_details={
                     "motion_policy": motion_policy,
                     "far_contact_sequence_policy": geometry.get("far_contact_sequence_policy"),
+                    "horizontal_sequence": "safe_world_z_lower_before_low_xy_slide",
                     "descend_locked_rpy_source": "selected_orientation_preset",
                     "selected_approach_family": selected_orientation_preset.get("preset_family"),
                     "selected_grasp_family": selected_orientation_preset.get("preset_family"),
@@ -9559,13 +9757,18 @@ def main() -> int:
                     "selected_orientation_preset_approach_axis_world": selected_orientation_preset.get("approach_axis_world"),
                     "selected_orientation_preset_planar_yaw_variant_deg": selected_orientation_preset.get("preset_planar_yaw_variant_deg"),
                     "selected_orientation_preset_planar_yaw_variant_rad": selected_orientation_preset.get("preset_planar_yaw_variant_rad"),
-                    "target_point_B_world": geometry["contact_point_B_world"],
-                    "descent_triggered": near_enough_xy,
-                    "xy_error": xy_error_at_descent,
-                    "xy_error_at_descent_trigger": xy_error_at_descent,
-                    "horizontal_descent_trigger_tolerance_used": horizontal_descent_trigger_tolerance,
+                    "target_point_B_world": geometry["far_safe_z_lower_B_world"],
+                    "final_contact_point_B_world": geometry["contact_point_B_world"],
                     "horizontal_grasp_expansion": horizontal_grasp_expansion_log,
                     "far_low_side_prepare_B_world": geometry.get("far_low_side_prepare_B_world"),
+                    "far_safe_z_lower_B_world": geometry.get("far_safe_z_lower_B_world"),
+                    "far_safe_z_lower_pose_details": geometry.get("far_safe_z_lower_details"),
+                    "far_safe_descent_xy_clearance_m": geometry.get("far_safe_descent_xy_clearance_m"),
+                    "far_safe_descent_initial_xy_inside_target_bbox": geometry.get("far_safe_descent_initial_xy_inside_target_bbox"),
+                    "far_safe_descent_adjusted": geometry.get("far_safe_descent_adjusted"),
+                    "far_safe_descent_adjustment_m": geometry.get("far_safe_descent_adjustment_m"),
+                    "far_safe_descent_target_bbox_xy": geometry.get("far_safe_descent_target_bbox_xy"),
+                    "far_safe_descent_all_object_xy_check": geometry.get("far_safe_descent_all_object_xy_check"),
                     "far_xy_align_B_world": geometry.get("far_xy_align_B_world"),
                     "far_descend_B_world": geometry.get("far_descend_B_world"),
                     "contact_point_B_world": geometry.get("contact_point_B_world"),
@@ -9575,10 +9778,93 @@ def main() -> int:
                     "AB_axis_world": geometry.get("AB_axis_world"),
                     "world_z_lowering": True,
                     "z_descent_completion": far_z_descent_state,
-                    "side_push_avoidance": "final contact moves only in world Z after XY alignment",
+                    "side_push_avoidance": "point B lowers in world Z at safe off-object XY before any low contact-height XY slide",
                 },
             )
-            payload["object_trace"]["after_far_world_z_lower"] = _bbox_state(stage, target_path)
+            payload["object_trace"]["after_far_safe_z_lower"] = _bbox_state(stage, target_path)
+
+            far_xy_align_result = _execute_dualarmik_servo_phase(
+                ServoSpec("far_align_B_over_object_xy", np.array(geometry["align_pose_base"], dtype=float), args.align_tolerance, args.rot_tolerance, args.servo_max_ticks),
+                ik_solver=ik_solver,
+                dc=dc,
+                articulation=articulation,
+                arm_dofs=arm_dofs,
+                arm_side=chosen_arm,
+                coord_transform=coord_transform,
+                gripper_dofs=gripper_dofs,
+                sim_app=sim_app,
+                args=args,
+                counter=counter,
+                phase_log=phase_log,
+                end_effector_name=end_effector_name,
+                end_effector_path=end_effector_path,
+                end_effector_policy=end_effector_policy,
+                coord_transform_refresh_fn=coord_transform_refresh_fn,
+                ik_overrides=far_ik_overrides,
+                extra_details={
+                    "motion_policy": motion_policy,
+                    "far_contact_sequence_policy": geometry.get("far_contact_sequence_policy"),
+                    "horizontal_sequence": "low_xy_slide_after_safe_world_z_lower",
+                    "point_A_proxy": geometry["point_A_proxy_definition"],
+                    "point_B_proxy": geometry["point_B_proxy_definition"],
+                    "target_point_B_world": geometry["far_xy_align_B_world"],
+                    "far_low_side_prepare_B_world": geometry.get("far_low_side_prepare_B_world"),
+                    "far_safe_z_lower_B_world": geometry.get("far_safe_z_lower_B_world"),
+                    "far_safe_descent_all_object_xy_check": geometry.get("far_safe_descent_all_object_xy_check"),
+                    "far_xy_align_B_world": geometry.get("far_xy_align_B_world"),
+                    "far_descend_B_world": geometry.get("far_descend_B_world"),
+                    "contact_point_B_world": geometry.get("contact_point_B_world"),
+                    "contact_point_A_world": geometry.get("contact_AB_semantics", {}).get("point_A_world"),
+                    "horizontal_grasp_expansion": horizontal_grasp_expansion_log,
+                    "far_point_b_forward_extension_m": geometry.get("far_point_b_forward_extension_m"),
+                    "far_point_a_extra_height_clearance_m": geometry.get("far_point_a_extra_height_clearance_m"),
+                    "far_point_a_min_extra_height_clearance_m": geometry.get("far_point_a_min_extra_height_clearance_m"),
+                    "far_ab_requested_downward_slant_deg": geometry.get("far_ab_requested_downward_slant_deg"),
+                    "far_ab_downward_slant_deg": geometry.get("far_ab_downward_slant_deg"),
+                    "far_ab_slant_height_clearance_m": geometry.get("far_ab_slant_height_clearance_m"),
+                    "far_ab_base_horizontal_span_m": geometry.get("far_ab_base_horizontal_span_m"),
+                    "far_point_b_gap_above_support_m": geometry.get("far_point_b_gap_above_support_m"),
+                    "far_xy_align_clearance_above_object_m": geometry.get("far_xy_align_clearance_above_object_m"),
+                    "object_top_z": geometry.get("object_top_z_world"),
+                    "align_clearance": geometry.get("align_clearance_m"),
+                    "align_height": geometry.get("align_height"),
+                    "far_reach_axis_world": geometry.get("far_reach_axis_world"),
+                    "AB_axis_world": geometry.get("AB_axis_world"),
+                    "selected_orientation_preset_axial_roll_variant_label": selected_orientation_preset.get("preset_axial_roll_variant_label"),
+                    "selected_orientation_preset_axial_roll_about_ab_rad": selected_orientation_preset.get("preset_axial_roll_about_ab_rad"),
+                    "selected_orientation_preset_planar_yaw_variant_deg": selected_orientation_preset.get("preset_planar_yaw_variant_deg"),
+                    "selected_orientation_preset_planar_yaw_variant_rad": selected_orientation_preset.get("preset_planar_yaw_variant_rad"),
+                    "side_push_avoidance": "world-Z lowering happened first at safe off-object XY; this phase slides into final XY at contact height",
+                },
+            )
+            current_align_pose = _current_ee_pose_base(ik_solver, dc, articulation, chosen_arm, args=args)
+            current_align_b_world = _point_b_world_from_pose(coord_transform, current_align_pose, selected_point_b_offset)
+            target_align_b_world = np.array(geometry["far_xy_align_B_world"], dtype=float)
+            xy_error_at_descent = float(np.linalg.norm(current_align_b_world[:2] - target_align_b_world[:2]))
+            horizontal_descent_trigger_tolerance = float(args.horizontal_descent_xy_trigger_tolerance)
+            near_enough_xy = bool(xy_error_at_descent < horizontal_descent_trigger_tolerance)
+            descent_trigger_log = {
+                "align_height": geometry.get("align_height"),
+                "object_top_z": geometry.get("object_top_z_world"),
+                "align_clearance": geometry.get("align_clearance_m"),
+                "descent_triggered": near_enough_xy,
+                "xy_error": xy_error_at_descent,
+                "xy_error_at_descent": xy_error_at_descent,
+                "xy_error_at_descent_trigger": xy_error_at_descent,
+                "horizontal_descent_trigger_tolerance_used": horizontal_descent_trigger_tolerance,
+                "xy_descent_trigger_tolerance_m": horizontal_descent_trigger_tolerance,
+                "full_align_final_error_m": far_xy_align_result.get("final_error"),
+                "full_align_rotation_error_rad": far_xy_align_result.get("final_rotation_error_rad"),
+                "descent_trigger_rule": "after safe Z lowering, require low contact-height XY slide to reach final point-B XY before close",
+                "horizontal_sequence": "safe_world_z_lower_before_low_xy_slide",
+            }
+            far_xy_align_result["horizontal_descent_trigger"] = descent_trigger_log
+            if phase_log and phase_log[-1].get("phase") == "far_align_B_over_object_xy":
+                phase_log[-1]["details"]["horizontal_descent_trigger"] = descent_trigger_log
+            payload["hybrid_phase2"]["horizontal_descent_trigger"] = descent_trigger_log
+            if not near_enough_xy:
+                _fail("align_failed", "far_align_B_over_object_xy did not reach final low XY contact target")
+            payload["object_trace"]["after_far_xy_align"] = _bbox_state(stage, target_path)
             contact_gate_phase_index = -1
             if bool(args.phase2_final_descent_enable):
                 contact_centric_control_subject_log = {
@@ -9621,7 +9907,7 @@ def main() -> int:
                 payload["object_trace"]["after_phase2_far_final_descent"] = _bbox_state(stage, target_path)
                 contact_gate_phase_index = -1
             if not bool(args.phase2_final_descent_enable) and descend_result["final_error"] > args.descend_tolerance:
-                _fail("descend_failed", "far_lower_B_world_z did not reach DualArmIK 6D target")
+                _fail("descend_failed", "far_lower_B_world_z did not reach safe world-Z descent target")
 
         else:
             final_contact_pose = np.array(geometry["contact_pose_base"], dtype=float)
@@ -9639,14 +9925,56 @@ def main() -> int:
             vertical_ref_phase_start_world = _finite_world_vector_or_none(
                 geometry.get("vertical_xy_reference_world_position_used_for_offset")
             )
+            vertical_z_descent_state: dict[str, Any] = {
+                "completion_rule": "point_B_world_z_must_reach_vertical_contact_B_world_z_before_phase_success",
+                "target_z_world_m": float(vertical_contact_b_world[2]),
+                "z_step_m": float(args.vertical_descent_z_step),
+                "z_completion_tolerance_m": vertical_descend_pos_tolerance,
+                "final_z_reached_by_runtime": False,
+                "descent_stopped_before_contact_z": True,
+            }
+
+            def update_vertical_z_descent_state(current_b_world: np.ndarray, commanded_b_world: np.ndarray | None = None) -> float:
+                z_remaining = float(max(0.0, float(current_b_world[2]) - float(vertical_contact_b_world[2])))
+                vertical_z_descent_state.update(
+                    {
+                        "current_point_B_world": np.array(current_b_world, dtype=float).tolist(),
+                        "current_z_world_m": float(current_b_world[2]),
+                        "target_z_world_m": float(vertical_contact_b_world[2]),
+                        "z_remaining_to_contact_m": z_remaining,
+                        "final_z_reached_by_runtime": bool(z_remaining <= vertical_descend_pos_tolerance),
+                        "descent_stopped_before_contact_z": bool(z_remaining > vertical_descend_pos_tolerance),
+                    }
+                )
+                if commanded_b_world is not None:
+                    commanded_remaining = float(max(0.0, float(commanded_b_world[2]) - float(vertical_contact_b_world[2])))
+                    vertical_z_descent_state.update(
+                        {
+                            "commanded_point_B_world": np.array(commanded_b_world, dtype=float).tolist(),
+                            "commanded_z_world_m": float(commanded_b_world[2]),
+                            "commanded_z_remaining_to_contact_m": commanded_remaining,
+                            "final_z_reached_by_command": bool(commanded_remaining <= vertical_descend_pos_tolerance),
+                        }
+                    )
+                return z_remaining
+
+            def vertical_descend_completion_fn() -> bool:
+                curr_pose = _current_ee_pose_base(ik_solver, dc, articulation, chosen_arm, args=args)
+                curr_b_world = _point_b_world_from_pose(coord_transform, curr_pose, selected_point_b_offset)
+                z_remaining = update_vertical_z_descent_state(curr_b_world)
+                return bool(z_remaining <= vertical_descend_pos_tolerance)
 
             def vertical_xy_locked_descend_target_fn():
                 nonlocal vertical_xy_feedback_call_count
-                if vertical_ref_offset is None or vertical_ref_target_xy is None:
-                    return final_contact_pose
                 vertical_xy_feedback_call_count += 1
                 curr_pose = _current_ee_pose_base(ik_solver, dc, articulation, chosen_arm, args=args)
                 curr_b_world = _point_b_world_from_pose(coord_transform, curr_pose, selected_point_b_offset)
+                target_b_world = vertical_contact_b_world.copy()
+                target_b_world[2] = max(float(vertical_contact_b_world[2]), float(curr_b_world[2]) - float(args.vertical_descent_z_step))
+                if vertical_ref_offset is None or vertical_ref_target_xy is None:
+                    update_vertical_z_descent_state(curr_b_world, target_b_world)
+                    target_pose, _ = _pose_for_point_b_world(target_b_world, coord_transform, descend_locked_rpy, selected_point_b_offset)
+                    return target_pose
                 curr_ref_world, curr_ref_runtime_log = _resolve_current_vertical_xy_reference_world(
                     stage=stage,
                     dc=dc,
@@ -9662,9 +9990,8 @@ def main() -> int:
                 if vertical_ref_phase_start_world is not None and curr_ref_world is not None:
                     reference_world_delta_from_phase_start = np.array(curr_ref_world, dtype=float) - vertical_ref_phase_start_world
                 xy_error = vertical_ref_target_xy[:2] - curr_ref_world[:2]
-                target_b_world = vertical_contact_b_world.copy()
                 target_b_world[:2] = vertical_contact_b_world[:2] + xy_error
-                target_b_world[2] = vertical_contact_b_world[2]
+                update_vertical_z_descent_state(curr_b_world, target_b_world)
                 if vertical_xy_feedback_call_count == 1 or vertical_xy_feedback_call_count % int(args.trace_interval) == 0:
                     vertical_xy_feedback_samples.append(
                         {
@@ -9695,6 +10022,8 @@ def main() -> int:
                             "current_fingertip_reference_source": curr_ref_runtime_log.get("fingertip_reference_source_used", curr_ref_runtime_log.get("source")),
                             "nominal_contact_point_B_world": vertical_contact_b_world.tolist(),
                             "commanded_target_point_B_world": target_b_world.tolist(),
+                            "vertical_descent_z_step_m": float(args.vertical_descent_z_step),
+                            "vertical_z_descent_state": dict(vertical_z_descent_state),
                         }
                     )
                 target_pose, _ = _pose_for_point_b_world(target_b_world, coord_transform, descend_locked_rpy, selected_point_b_offset)
@@ -9718,6 +10047,8 @@ def main() -> int:
                 end_effector_policy=end_effector_policy,
                 coord_transform_refresh_fn=coord_transform_refresh_fn,
                 target_pose_fn=vertical_xy_locked_descend_target_fn,
+                completion_condition_fn=vertical_descend_completion_fn,
+                completion_condition_label="vertical_point_B_runtime_z_reached_contact_target",
                 extra_details={
                     "motion_policy": motion_policy,
                     "descend_locked_rpy_source": "selected_orientation_preset",
@@ -9745,12 +10076,18 @@ def main() -> int:
                     "vertical_arm_lateral_bias_correction_base_y_m": geometry.get("vertical_arm_lateral_bias_correction_base_y_m"),
                     "vertical_arm_lateral_bias_correction_world": geometry.get("vertical_arm_lateral_bias_correction_world"),
                     "vertical_arm_lateral_bias_correction_rule": geometry.get("vertical_arm_lateral_bias_correction_rule"),
+                    "vertical_point_b_offset_local_adjustment": geometry.get("vertical_point_b_offset_local_adjustment"),
+                    "vertical_point_b_distal_extension_m": geometry.get("vertical_point_b_distal_extension_m"),
+                    "vertical_point_b_distal_extension_applied": geometry.get("vertical_point_b_distal_extension_applied"),
+                    "vertical_point_b_distal_extension_reason": geometry.get("vertical_point_b_distal_extension_reason"),
                     "vertical_xy_reference_offset_local": geometry.get("vertical_xy_reference_offset_local"),
                     "vertical_xy_reference_tolerance_m": geometry.get("vertical_xy_reference_tolerance_m"),
                     "vertical_point_b_gap_above_support_m": geometry.get("vertical_point_b_gap_above_support_m"),
                     "vertical_close_point_b_tolerance_m": geometry.get("vertical_close_point_b_tolerance_m"),
                     "vertical_descend_position_tolerance_m": vertical_descend_pos_tolerance,
-                    "vertical_descend_target_policy": "continuous_vertical_xy_reference_feedback_to_final_point_B_z",
+                    "vertical_descent_z_step_m": float(args.vertical_descent_z_step),
+                    "vertical_z_descent_state": vertical_z_descent_state,
+                    "vertical_descend_target_policy": "continuous_vertical_xy_reference_feedback_with_slow_stepped_point_B_z",
                     "vertical_xy_reference_feedback_active": bool(vertical_ref_offset is not None and vertical_ref_target_xy is not None),
                     "vertical_xy_reference_feedback_rule": "nominal_contact_B_xy_plus_live_reference_error",
                     "vertical_xy_reference_world_at_phase_start": None
