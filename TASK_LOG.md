@@ -1128,3 +1128,11 @@
 - Content covers repository purpose, current phase, Task 1 plan phase, workflow, official resources, tracked file roles, script families, integration status, known risks, and next engineering direction.
 - Documentation-only update; no runtime code, training code, or scripts changed.
 - Checks run: repo inspection only; no Isaac runtime or simulation commands were run.
+
+## 2026-04-20 — Contact-centric explanation Markdown conversion
+
+- Added Markdown version of `docs/task1_phase2_contact_centric_patch_giai_trinh_thuat_toan_vi.txt`.
+- New document path: `docs/task1_phase2_contact_centric_patch_giai_trinh_thuat_toan_vi.md`.
+- Converted the same explanation into Markdown headings and Vietnamese text with full diacritics while preserving source line references, formulas, function names, code identifiers, paths, and technical ordering.
+- Kept the original `.txt` file unchanged for audit comparison.
+- Documentation-only update; no runtime code, training code, or scripts changed.
