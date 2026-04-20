@@ -1167,3 +1167,14 @@
 - Reduced the default `--vertical-arm-lateral-bias-correction` from `0.04` m to `0.015` m to avoid overcorrecting the small observed offset.
 - Updated motion-policy and geometry logs so the new inward correction rule is visible in runtime payloads.
 - Runtime limitation: no Linux Isaac Sim run was executed on Mac; next Linux run should compare `vertical_arm_lateral_bias_correction_base_y_m`, `vertical_xy_reference_target_xy_world`, and the observed fingertip midpoint before close.
+
+## 2026-04-20 — Phase 2 Task 1 diagonal hand-yaw pregrasp search
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Added small planar hand-yaw variants around the base/world vertical axis with default offsets `0`, `-15`, and `+15` degrees, so the hand is no longer forced to stay exactly parallel/perpendicular to the table axes.
+- Added CLI control via `--orientation-planar-yaw-variant-deg` / `--orientation-yaw-variant-deg`, capped at `+/-35` degrees and always retaining the zero-yaw baseline candidate for stability.
+- Changed pregrasp selection from strict first-valid to strict best-scored-valid: candidates still must pass the existing IK/error gates, then score by combined gate error with small penalties for extra yaw, higher pregrasp offset, and non-internal IK success.
+- Added yaw-variant and selection-score diagnostics to orientation preset logs, candidate diagnostics, selected payload fields, and motion-policy metadata.
+- Checks passed: `python3 -m py_compile scripts/task1_phase2_contact_centric_patch.py` and `git diff --check -- scripts/task1_phase2_contact_centric_patch.py TASK_LOG.md`.
+- Local CLI `--help` could not run in this Mac shell because `python3` is missing `numpy`; no dependency install was attempted.
+- Runtime limitation: no Linux Isaac Sim run was executed on Mac; next Linux run should inspect `selected_orientation_preset_planar_yaw_variant_deg` and `selected_pregrasp_candidate_selection_score_terms` to confirm whether a diagonal candidate improves the observed XY/approach alignment.

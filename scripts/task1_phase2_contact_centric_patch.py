@@ -228,6 +228,12 @@ WORLD_Y_APPROACH_AB_ROLL_VARIANTS = [
 RIGHT_WORLD_Y_APPROACH_PRESETS = _build_world_y_approach_presets(RIGHT_WORLD_Y_APPROACH_BASE_PRESETS)
 LEFT_WORLD_Y_APPROACH_PRESETS = _build_world_y_approach_presets(LEFT_WORLD_Y_APPROACH_BASE_PRESETS)
 
+DEFAULT_ORIENTATION_PLANAR_YAW_VARIANT_DEG = (0.0, -15.0, 15.0)
+ORIENTATION_PLANAR_YAW_VARIANT_MAX_ABS_DEG = 35.0
+PREGRASP_SELECTION_PLANAR_YAW_WEIGHT = 0.08
+PREGRASP_SELECTION_HIGHER_OFFSET_WEIGHT = 0.03
+PREGRASP_SELECTION_NON_INTERNAL_OK_PENALTY = 0.25
+
 DEFAULT_FAR_THRESHOLD = 0.42
 DEFAULT_NEAR_BODY_THRESHOLD = 0.28
 DEFAULT_FAR_LOW_SIDE_CLEARANCE = 0.002
@@ -3903,6 +3909,33 @@ def _normalize(vector: np.ndarray, fallback: np.ndarray) -> np.ndarray:
         norm = float(np.linalg.norm(v))
     return v / max(norm, 1.0e-9)
 
+
+def _axis_angle_to_rot(axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    a = _normalize(np.array(axis, dtype=float), np.array([0.0, 0.0, 1.0], dtype=float))
+    x, y, z = float(a[0]), float(a[1]), float(a[2])
+    c = math.cos(float(angle_rad))
+    s = math.sin(float(angle_rad))
+    one_minus_c = 1.0 - c
+    return np.array(
+        [
+            [c + x * x * one_minus_c, x * y * one_minus_c - z * s, x * z * one_minus_c + y * s],
+            [y * x * one_minus_c + z * s, c + y * y * one_minus_c, y * z * one_minus_c - x * s],
+            [z * x * one_minus_c - y * s, z * y * one_minus_c + x * s, c + z * z * one_minus_c],
+        ],
+        dtype=float,
+    )
+
+
+def _base_up_vector(coord_transform: Any | None) -> np.ndarray:
+    world_up = np.array([0.0, 0.0, 1.0], dtype=float)
+    if coord_transform is None:
+        return world_up
+    try:
+        return _normalize(coord_transform.robot_world_R_inv @ world_up, world_up)
+    except Exception:
+        return world_up
+
+
 def _approach_axis_from_mode(rot: np.ndarray, mode: str) -> np.ndarray:
     if mode == "neg_z":
         return -rot[:, 2]
@@ -3958,6 +3991,51 @@ def _debug_fixed_rpy_for_arm(args: argparse.Namespace, arm_side: str) -> tuple[s
     return None
 
 
+def _orientation_planar_yaw_variant_degrees(args: argparse.Namespace) -> list[float]:
+    raw_values = getattr(args, "orientation_planar_yaw_variant_deg", None)
+    values = list(DEFAULT_ORIENTATION_PLANAR_YAW_VARIANT_DEG) if raw_values is None else list(raw_values)
+    if not values:
+        values = [0.0]
+
+    normalized: list[float] = []
+    for raw_value in values:
+        value = float(raw_value)
+        if not math.isfinite(value):
+            raise RuntimeError("--orientation-planar-yaw-variant-deg values must be finite")
+        if abs(value) > ORIENTATION_PLANAR_YAW_VARIANT_MAX_ABS_DEG:
+            raise RuntimeError(
+                "--orientation-planar-yaw-variant-deg values must stay within "
+                f"+/-{ORIENTATION_PLANAR_YAW_VARIANT_MAX_ABS_DEG} degrees"
+            )
+        if not any(abs(value - existing) <= 1.0e-9 for existing in normalized):
+            normalized.append(value)
+
+    if not any(abs(value) <= 1.0e-9 for value in normalized):
+        normalized.insert(0, 0.0)
+    return normalized
+
+
+def _planar_yaw_variant_label(yaw_deg: float) -> str:
+    if abs(float(yaw_deg)) <= 1.0e-9:
+        return "planar_yaw_0deg"
+    sign_label = "plus" if yaw_deg > 0.0 else "minus"
+    magnitude_label = f"{abs(float(yaw_deg)):.1f}".rstrip("0").rstrip(".").replace(".", "p")
+    return f"planar_yaw_{sign_label}_{magnitude_label}deg"
+
+
+def _preset_with_base_planar_yaw_variant(
+    rpy_values: list[float],
+    yaw_deg: float,
+    coord_transform: Any | None,
+) -> tuple[list[float], list[float]]:
+    yaw_axis_base = _base_up_vector(coord_transform)
+    if abs(float(yaw_deg)) <= 1.0e-9:
+        return [float(value) for value in rpy_values], yaw_axis_base.tolist()
+    base_rot = _euler_xyz_to_rot(float(rpy_values[0]), float(rpy_values[1]), float(rpy_values[2]))
+    yaw_rot_base = _axis_angle_to_rot(yaw_axis_base, math.radians(float(yaw_deg)))
+    return _rot_to_euler_xyz(yaw_rot_base @ base_rot).tolist(), yaw_axis_base.tolist()
+
+
 def _world_y_axis_diagnostics(coord_transform: Any | None, approach_axis_base: np.ndarray) -> dict[str, Any]:
     if coord_transform is None:
         return {
@@ -4001,20 +4079,29 @@ def _orientation_preset_record(
     *,
     coord_transform: Any | None = None,
     debug_override: bool = False,
+    preset_base_label: str | None = None,
+    planar_yaw_variant_deg: float = 0.0,
+    planar_yaw_variant_axis_base: list[float] | None = None,
 ) -> dict[str, Any]:
     rpy = np.array(rpy_values, dtype=float)
     rot = _euler_xyz_to_rot(float(rpy[0]), float(rpy[1]), float(rpy[2]))
     approach_axis_base = _normalize(rot[:, 2], np.array([0.0, 0.0, -1.0], dtype=float))
     axis_diagnostics = _world_y_axis_diagnostics(coord_transform, approach_axis_base)
+    planar_yaw_variant_rad = math.radians(float(planar_yaw_variant_deg))
     return {
         "preset_index": int(index),
         "preset_label": label,
+        "preset_base_label": preset_base_label or label,
         "preset_family": family_name,
         "rpy": rpy.tolist(),
         "rotation_matrix": rot.tolist(),
         "approach_axis_base": approach_axis_base.tolist(),
         "AB_axis_base": approach_axis_base.tolist(),
         "AB_axis_world": axis_diagnostics["approach_axis_world"],
+        "preset_planar_yaw_variant_deg": float(planar_yaw_variant_deg),
+        "preset_planar_yaw_variant_rad": float(planar_yaw_variant_rad),
+        "preset_planar_yaw_variant_enabled": bool(abs(float(planar_yaw_variant_deg)) > 1.0e-9),
+        "preset_planar_yaw_variant_axis_base": planar_yaw_variant_axis_base,
         "up_axis_base": (-rot[:, 2]).tolist(),
         "z_axis_base": rot[:, 2].tolist(),
         "debug_override": bool(debug_override),
@@ -4029,13 +4116,28 @@ def _orientation_presets_by_arm_and_family(
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
     raw_by_arm = _raw_orientation_presets_by_arm_and_family()
     presets: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    yaw_variants_deg = _orientation_planar_yaw_variant_degrees(args)
     for arm_side, raw_by_family in raw_by_arm.items():
         presets[arm_side] = {}
         for family_name, raw_presets in raw_by_family.items():
-            presets[arm_side][family_name] = [
-                _orientation_preset_record(index, label, rpy_values, family_name, coord_transform=coord_transform)
-                for index, (label, rpy_values) in enumerate(raw_presets)
-            ]
+            records: list[dict[str, Any]] = []
+            for label, rpy_values in raw_presets:
+                for yaw_deg in yaw_variants_deg:
+                    variant_rpy, yaw_axis_base = _preset_with_base_planar_yaw_variant(rpy_values, yaw_deg, coord_transform)
+                    variant_label = label if abs(float(yaw_deg)) <= 1.0e-9 else f"{label}_{_planar_yaw_variant_label(yaw_deg)}"
+                    records.append(
+                        _orientation_preset_record(
+                            len(records),
+                            variant_label,
+                            variant_rpy,
+                            family_name,
+                            coord_transform=coord_transform,
+                            preset_base_label=label,
+                            planar_yaw_variant_deg=float(yaw_deg),
+                            planar_yaw_variant_axis_base=yaw_axis_base,
+                        )
+                    )
+            presets[arm_side][family_name] = records
     return presets
 
 
@@ -4061,32 +4163,48 @@ def _region_filtered_orientation_presets(
         for label, rpy_values in raw_by_arm[arm_side][family_name]:
             merged.append((label, rpy_values, family_name, False))
 
-    presets = [
-        _orientation_preset_record(
-            index,
-            label,
-            rpy_values,
-            family_name,
-            coord_transform=coord_transform,
-            debug_override=debug_override,
-        )
-        for index, (label, rpy_values, family_name, debug_override) in enumerate(merged)
-    ]
+    presets: list[dict[str, Any]] = []
+    configured_yaw_variants_deg = _orientation_planar_yaw_variant_degrees(args)
+    for label, rpy_values, family_name, debug_override in merged:
+        yaw_variants_deg = [0.0] if debug_override else configured_yaw_variants_deg
+        for yaw_deg in yaw_variants_deg:
+            variant_rpy, yaw_axis_base = _preset_with_base_planar_yaw_variant(rpy_values, yaw_deg, coord_transform)
+            variant_label = label if abs(float(yaw_deg)) <= 1.0e-9 else f"{label}_{_planar_yaw_variant_label(yaw_deg)}"
+            presets.append(
+                _orientation_preset_record(
+                    len(presets),
+                    variant_label,
+                    variant_rpy,
+                    family_name,
+                    coord_transform=coord_transform,
+                    debug_override=debug_override,
+                    preset_base_label=label,
+                    planar_yaw_variant_deg=float(yaw_deg),
+                    planar_yaw_variant_axis_base=yaw_axis_base,
+                )
+            )
     return presets, {
         "arm_side": arm_side,
         "target_region": region,
         "approach_family_order": family_order,
+        "orientation_planar_yaw_variants_deg": configured_yaw_variants_deg,
+        "orientation_planar_yaw_variant_axis": "base/world vertical",
+        "orientation_planar_yaw_variant_policy": "generate small diagonal hand-angle variants and let strict IK pregrasp scoring select the best valid pose",
         "preset_labels": [preset["preset_label"] for preset in presets],
         "preset_families": [preset["preset_family"] for preset in presets],
         "preset_world_y_axis_diagnostics": [
             {
                 "preset_label": preset["preset_label"],
+                "preset_base_label": preset.get("preset_base_label"),
                 "preset_family": preset["preset_family"],
                 "approach_axis_base": preset["approach_axis_base"],
                 "approach_axis_world": preset["approach_axis_world"],
                 "AB_axis_world": preset.get("AB_axis_world"),
                 "preset_axial_roll_variant_label": preset.get("preset_axial_roll_variant_label"),
                 "preset_axial_roll_about_ab_rad": preset.get("preset_axial_roll_about_ab_rad"),
+                "preset_planar_yaw_variant_deg": preset.get("preset_planar_yaw_variant_deg"),
+                "preset_planar_yaw_variant_rad": preset.get("preset_planar_yaw_variant_rad"),
+                "preset_planar_yaw_variant_axis_base": preset.get("preset_planar_yaw_variant_axis_base"),
                 "dot_with_world_pos_y": preset["dot_with_world_pos_y"],
                 "dot_with_world_neg_y": preset["dot_with_world_neg_y"],
             }
@@ -4948,6 +5066,45 @@ def _candidate_gate_metrics(
     }
 
 
+def _pregrasp_candidate_selection_score(candidate: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    combined_error = _finite_float_or_none(candidate.get("combined_gate_error_norm"))
+    combined_score = combined_error if combined_error is not None else 1.0e9
+
+    planar_yaw_deg = _finite_float_or_none(candidate.get("preset_planar_yaw_variant_deg"))
+    planar_yaw_abs_deg = abs(float(planar_yaw_deg or 0.0))
+    planar_yaw_penalty = PREGRASP_SELECTION_PLANAR_YAW_WEIGHT * (
+        planar_yaw_abs_deg / max(ORIENTATION_PLANAR_YAW_VARIANT_MAX_ABS_DEG, 1.0e-9)
+    )
+
+    higher_offset_m = _finite_float_or_none(candidate.get("higher_offset_m"))
+    higher_offset_penalty = PREGRASP_SELECTION_HIGHER_OFFSET_WEIGHT * (
+        max(float(higher_offset_m or 0.0), 0.0) / 0.03
+    )
+    internal_ok_penalty = 0.0 if bool(candidate.get("dualarmik_internal_ok")) else PREGRASP_SELECTION_NON_INTERNAL_OK_PENALTY
+    score = float(combined_score + planar_yaw_penalty + higher_offset_penalty + internal_ok_penalty)
+    return score, {
+        "combined_gate_error_norm": combined_error,
+        "planar_yaw_abs_deg": planar_yaw_abs_deg,
+        "planar_yaw_penalty": float(planar_yaw_penalty),
+        "higher_offset_m": higher_offset_m,
+        "higher_offset_penalty": float(higher_offset_penalty),
+        "dualarmik_internal_ok": bool(candidate.get("dualarmik_internal_ok")),
+        "internal_ok_penalty": float(internal_ok_penalty),
+        "score_formula": "combined_gate_error_norm + small planar-yaw penalty + small higher-offset penalty + internal-ok penalty",
+    }
+
+
+def _pregrasp_candidate_selection_rank_key(candidate: dict[str, Any]) -> tuple[float, float, int, int]:
+    score = _finite_float_or_none(candidate.get("candidate_selection_score"))
+    combined_error = _finite_float_or_none(candidate.get("combined_gate_error_norm"))
+    return (
+        score if score is not None else 1.0e9,
+        combined_error if combined_error is not None else 1.0e9,
+        int(candidate.get("preset_index", 1_000_000)),
+        int(candidate.get("candidate_index", 1_000_000)),
+    )
+
+
 def _candidate_diagnostic_view(candidate: dict[str, Any] | None) -> dict[str, Any] | None:
     if candidate is None:
         return None
@@ -4956,7 +5113,14 @@ def _candidate_diagnostic_view(candidate: dict[str, Any] | None) -> dict[str, An
         "candidate_label",
         "preset_index",
         "preset_label",
+        "preset_base_label",
         "preset_family",
+        "preset_planar_yaw_variant_deg",
+        "preset_planar_yaw_variant_rad",
+        "preset_planar_yaw_variant_enabled",
+        "preset_planar_yaw_variant_axis_base",
+        "candidate_selection_score",
+        "candidate_selection_score_terms",
         "success",
         "failure_reason",
         "candidate_classification",
@@ -5040,6 +5204,7 @@ def _best_candidate_diagnostics(candidate_results: list[dict[str, Any]], target_
         "best_position_error_candidate": _best_candidate_by_metric(candidate_results, "position_error_base_m"),
         "best_rotation_error_candidate": _best_candidate_by_metric(candidate_results, "rotation_error_rad"),
         "best_combined_error_candidate": _best_candidate_by_metric(candidate_results, "combined_gate_error_norm"),
+        "best_selection_score_candidate": _best_candidate_by_metric(candidate_results, "candidate_selection_score"),
     }
 
 
@@ -5095,6 +5260,7 @@ def _evaluate_pregrasp_candidates(
     preset_results: list[dict[str, Any]] = []
     flat_results: list[dict[str, Any]] = []
     selected: dict[str, Any] | None = None
+    valid_selection_records: list[dict[str, Any]] = []
     candidate_ik_settings = _candidate_ik_overrides(args)
 
     for preset in orientation_presets:
@@ -5163,6 +5329,7 @@ def _evaluate_pregrasp_candidates(
                 "failure_reason": candidate_failure_reason,
                 "candidate_classification": candidate_classification,
                 "preset_label": preset["preset_label"],
+                "preset_base_label": preset.get("preset_base_label"),
                 "preset_index": int(preset["preset_index"]),
                 "preset_family": preset.get("preset_family"),
                 "preset_rpy": preset["rpy"],
@@ -5172,6 +5339,10 @@ def _evaluate_pregrasp_candidates(
                 "AB_axis_world": preset_geometry.get("AB_axis_world"),
                 "preset_axial_roll_variant_label": preset.get("preset_axial_roll_variant_label"),
                 "preset_axial_roll_about_ab_rad": preset.get("preset_axial_roll_about_ab_rad"),
+                "preset_planar_yaw_variant_deg": preset.get("preset_planar_yaw_variant_deg"),
+                "preset_planar_yaw_variant_rad": preset.get("preset_planar_yaw_variant_rad"),
+                "preset_planar_yaw_variant_enabled": preset.get("preset_planar_yaw_variant_enabled"),
+                "preset_planar_yaw_variant_axis_base": preset.get("preset_planar_yaw_variant_axis_base"),
                 "far_point_b_forward_extension_m": preset_geometry.get("far_point_b_forward_extension_m"),
                 "far_point_a_extra_height_clearance_m": preset_geometry.get("far_point_a_extra_height_clearance_m"),
                 "far_point_a_min_extra_height_clearance_m": preset_geometry.get("far_point_a_min_extra_height_clearance_m"),
@@ -5229,6 +5400,9 @@ def _evaluate_pregrasp_candidates(
                 "accepted_for_pregrasp_selection": bool(valid),
                 "accepted_despite_internal_not_ok": bool(valid and not ok),
             }
+            selection_score, selection_score_terms = _pregrasp_candidate_selection_score(result)
+            result["candidate_selection_score"] = selection_score
+            result["candidate_selection_score_terms"] = selection_score_terms
             selection_record = {
                 **result,
                 "geometry": preset_geometry,
@@ -5236,16 +5410,13 @@ def _evaluate_pregrasp_candidates(
             }
             candidate_results.append(result)
             flat_results.append(result)
-            if valid and selected is None:
-                selected = {
-                    **selection_record,
-                    "strict_candidate_success": True,
-                    "selection_mode": "strict_valid_candidate",
-                }
+            if valid:
+                valid_selection_records.append(selection_record)
         preset_summary = _candidate_failure_summary(candidate_results)
         preset_results.append(
             {
                 "preset_label": preset["preset_label"],
+                "preset_base_label": preset.get("preset_base_label"),
                 "preset_index": int(preset["preset_index"]),
                 "preset_family": preset.get("preset_family"),
                 "preset_rpy": preset["rpy"],
@@ -5255,6 +5426,10 @@ def _evaluate_pregrasp_candidates(
                 "AB_axis_world": preset_geometry.get("AB_axis_world"),
                 "preset_axial_roll_variant_label": preset.get("preset_axial_roll_variant_label"),
                 "preset_axial_roll_about_ab_rad": preset.get("preset_axial_roll_about_ab_rad"),
+                "preset_planar_yaw_variant_deg": preset.get("preset_planar_yaw_variant_deg"),
+                "preset_planar_yaw_variant_rad": preset.get("preset_planar_yaw_variant_rad"),
+                "preset_planar_yaw_variant_enabled": preset.get("preset_planar_yaw_variant_enabled"),
+                "preset_planar_yaw_variant_axis_base": preset.get("preset_planar_yaw_variant_axis_base"),
                 "far_point_b_forward_extension_m": preset_geometry.get("far_point_b_forward_extension_m"),
                 "far_point_a_extra_height_clearance_m": preset_geometry.get("far_point_a_extra_height_clearance_m"),
                 "far_point_a_min_extra_height_clearance_m": preset_geometry.get("far_point_a_min_extra_height_clearance_m"),
@@ -5297,6 +5472,16 @@ def _evaluate_pregrasp_candidates(
         )
 
     ik_solver.q = reference_q.copy()
+    if valid_selection_records:
+        selected = min(
+            valid_selection_records,
+            key=_pregrasp_candidate_selection_rank_key,
+        )
+        selected = {
+            **selected,
+            "strict_candidate_success": True,
+            "selection_mode": "best_scored_valid_candidate",
+        }
     success = selected is not None
     summary = _candidate_failure_summary(flat_results)
     if success:
@@ -5325,7 +5510,15 @@ def _evaluate_pregrasp_candidates(
         "best_error": None if selected is None else selected["position_error_base_m"],
         "iteration_count": len(flat_results),
         "failure_reason": failure_reason,
-        "candidate_policy": "region_filtered_approach_family_order_region_specific_strict_first_valid_candidate",
+        "candidate_policy": "region_filtered_approach_family_order_region_specific_best_scored_valid_candidate",
+        "valid_pregrasp_candidate_count": int(len(valid_selection_records)),
+        "candidate_selection_score_policy": {
+            "policy": "choose lowest candidate_selection_score among strict-valid pregrasp candidates",
+            "formula": "combined_gate_error_norm + small planar-yaw penalty + small higher-offset penalty + internal-ok penalty",
+            "planar_yaw_weight": float(PREGRASP_SELECTION_PLANAR_YAW_WEIGHT),
+            "higher_offset_weight": float(PREGRASP_SELECTION_HIGHER_OFFSET_WEIGHT),
+            "non_internal_ok_penalty": float(PREGRASP_SELECTION_NON_INTERNAL_OK_PENALTY),
+        },
         "target_region": target_region,
         "forward_base": float(forward_base),
         "approach_family_order": list(approach_family_order),
@@ -5344,6 +5537,7 @@ def _evaluate_pregrasp_candidates(
         "best_position_error_candidate": best_candidate_diagnostics["best_position_error_candidate"],
         "best_rotation_error_candidate": best_candidate_diagnostics["best_rotation_error_candidate"],
         "best_combined_error_candidate": best_candidate_diagnostics["best_combined_error_candidate"],
+        "best_selection_score_candidate": best_candidate_diagnostics["best_selection_score_candidate"],
         "best_candidate_diagnostics": best_candidate_diagnostics,
         "candidate_results": flat_results,
         "selected_candidate": selected,
@@ -5355,9 +5549,14 @@ def _evaluate_pregrasp_candidates(
         "selected_orientation_preset_AB_axis_world": None if selected is None else selected["selected_orientation_preset"].get("AB_axis_world"),
         "selected_orientation_preset_axial_roll_variant_label": None if selected is None else selected["selected_orientation_preset"].get("preset_axial_roll_variant_label"),
         "selected_orientation_preset_axial_roll_about_ab_rad": None if selected is None else selected["selected_orientation_preset"].get("preset_axial_roll_about_ab_rad"),
+        "selected_orientation_preset_planar_yaw_variant_deg": None if selected is None else selected["selected_orientation_preset"].get("preset_planar_yaw_variant_deg"),
+        "selected_orientation_preset_planar_yaw_variant_rad": None if selected is None else selected["selected_orientation_preset"].get("preset_planar_yaw_variant_rad"),
+        "selected_orientation_preset_planar_yaw_variant_axis_base": None if selected is None else selected["selected_orientation_preset"].get("preset_planar_yaw_variant_axis_base"),
         "selected_orientation_preset_dot_with_world_pos_y": None if selected is None else selected["selected_orientation_preset"].get("dot_with_world_pos_y"),
         "selected_orientation_preset_dot_with_world_neg_y": None if selected is None else selected["selected_orientation_preset"].get("dot_with_world_neg_y"),
         "selected_orientation_preset_rpy": None if selected is None else selected["selected_orientation_preset"]["rpy"],
+        "selected_candidate_selection_score": None if selected is None else selected.get("candidate_selection_score"),
+        "selected_candidate_selection_score_terms": None if selected is None else selected.get("candidate_selection_score_terms"),
     }
     _append_phase(
         phase_log,
@@ -7787,6 +7986,15 @@ def main() -> int:
     parser.add_argument("--debug-pregrasp-rot-tol", type=float)
     parser.add_argument("--debug-fixed-rpy-right", type=float, nargs=3)
     parser.add_argument("--debug-fixed-rpy-left", type=float, nargs=3)
+    parser.add_argument(
+        "--orientation-planar-yaw-variant-deg",
+        "--orientation-yaw-variant-deg",
+        dest="orientation_planar_yaw_variant_deg",
+        type=float,
+        nargs="*",
+        default=list(DEFAULT_ORIENTATION_PLANAR_YAW_VARIANT_DEG),
+        help="Base/world-vertical yaw offsets to try for each hand orientation preset, in degrees.",
+    )
     parser.add_argument("--point-b-offset-local", type=float, nargs=3)
     parser.add_argument("--tcp-offset", type=float, nargs=3)
     parser.add_argument("--tcp-fallback-x", type=float, default=TCP_OFFSET_FALLBACK_X)
@@ -7886,6 +8094,7 @@ def main() -> int:
         raise RuntimeError("--debug-pregrasp-pos-tol must be positive when provided")
     if args.debug_pregrasp_rot_tol is not None and args.debug_pregrasp_rot_tol <= 0.0:
         raise RuntimeError("--debug-pregrasp-rot-tol must be positive when provided")
+    args.orientation_planar_yaw_variant_deg = _orientation_planar_yaw_variant_degrees(args)
     if (
         not math.isfinite(float(args.far_low_side_clearance))
         or not math.isfinite(float(args.far_point_b_gap_above_support))
@@ -8029,6 +8238,17 @@ def main() -> int:
                 "outboard_transition_clearance_m": float(args.far_outboard_transition_clearance),
                 "far_null_weight": float(args.far_null_weight),
                 "far_outboard_shoulder_roll_bias_rad": float(args.far_outboard_shoulder_roll_bias),
+            },
+            "orientation_planar_yaw_search": {
+                "variant_deg": [float(value) for value in args.orientation_planar_yaw_variant_deg],
+                "axis": "base/world vertical",
+                "selection_rule": "strict-valid pregrasp candidates are scored and the lowest score is selected",
+                "score_terms": {
+                    "combined_gate_error_norm": True,
+                    "planar_yaw_weight": float(PREGRASP_SELECTION_PLANAR_YAW_WEIGHT),
+                    "higher_offset_weight": float(PREGRASP_SELECTION_HIGHER_OFFSET_WEIGHT),
+                    "non_internal_ok_penalty": float(PREGRASP_SELECTION_NON_INTERNAL_OK_PENALTY),
+                },
             },
             "live_coordinate_transform_refresh": {
                 "enabled": bool(args.live_coordinate_transform),
@@ -8951,13 +9171,19 @@ def main() -> int:
         payload["selected_contact_AB_semantics"] = geometry.get("contact_AB_semantics")
         payload["selected_orientation_preset"] = selected_orientation_preset
         payload["selected_orientation_preset_label"] = selected_orientation_preset["preset_label"]
+        payload["selected_orientation_preset_base_label"] = selected_orientation_preset.get("preset_base_label")
         payload["selected_orientation_preset_rpy"] = selected_orientation_preset["rpy"]
         payload["selected_orientation_preset_approach_axis_world"] = selected_orientation_preset.get("approach_axis_world")
         payload["selected_orientation_preset_AB_axis_world"] = selected_orientation_preset.get("AB_axis_world")
         payload["selected_orientation_preset_axial_roll_variant_label"] = selected_orientation_preset.get("preset_axial_roll_variant_label")
         payload["selected_orientation_preset_axial_roll_about_ab_rad"] = selected_orientation_preset.get("preset_axial_roll_about_ab_rad")
+        payload["selected_orientation_preset_planar_yaw_variant_deg"] = selected_orientation_preset.get("preset_planar_yaw_variant_deg")
+        payload["selected_orientation_preset_planar_yaw_variant_rad"] = selected_orientation_preset.get("preset_planar_yaw_variant_rad")
+        payload["selected_orientation_preset_planar_yaw_variant_axis_base"] = selected_orientation_preset.get("preset_planar_yaw_variant_axis_base")
         payload["selected_orientation_preset_dot_with_world_pos_y"] = selected_orientation_preset.get("dot_with_world_pos_y")
         payload["selected_orientation_preset_dot_with_world_neg_y"] = selected_orientation_preset.get("dot_with_world_neg_y")
+        payload["selected_pregrasp_candidate_selection_score"] = selected_candidate.get("candidate_selection_score")
+        payload["selected_pregrasp_candidate_selection_score_terms"] = selected_candidate.get("candidate_selection_score_terms")
         payload["selected_hybrid_phase1_candidate"] = selected_hybrid_candidate
         payload["selected_arm"] = selected_hybrid_candidate["arm"]
         payload["selected_preset_id"] = selected_hybrid_candidate["preset_id"]
@@ -9099,6 +9325,8 @@ def main() -> int:
                 "AB_axis_world": geometry.get("AB_axis_world"),
                 "selected_orientation_preset_axial_roll_variant_label": selected_orientation_preset.get("preset_axial_roll_variant_label"),
                 "selected_orientation_preset_axial_roll_about_ab_rad": selected_orientation_preset.get("preset_axial_roll_about_ab_rad"),
+                "selected_orientation_preset_planar_yaw_variant_deg": selected_orientation_preset.get("preset_planar_yaw_variant_deg"),
+                "selected_orientation_preset_planar_yaw_variant_rad": selected_orientation_preset.get("preset_planar_yaw_variant_rad"),
             },
         )
         payload["pregrasp_result"] = {
@@ -9172,6 +9400,8 @@ def main() -> int:
                     "AB_axis_world": geometry.get("AB_axis_world"),
                     "selected_orientation_preset_axial_roll_variant_label": selected_orientation_preset.get("preset_axial_roll_variant_label"),
                     "selected_orientation_preset_axial_roll_about_ab_rad": selected_orientation_preset.get("preset_axial_roll_about_ab_rad"),
+                    "selected_orientation_preset_planar_yaw_variant_deg": selected_orientation_preset.get("preset_planar_yaw_variant_deg"),
+                    "selected_orientation_preset_planar_yaw_variant_rad": selected_orientation_preset.get("preset_planar_yaw_variant_rad"),
                     "side_push_avoidance": "XY alignment happens at low-side prepare height before final world-Z lowering",
                 },
             )
@@ -9327,6 +9557,8 @@ def main() -> int:
                     "selected_orientation_preset_label": selected_orientation_preset["preset_label"],
                     "selected_orientation_preset_rpy": selected_orientation_preset["rpy"],
                     "selected_orientation_preset_approach_axis_world": selected_orientation_preset.get("approach_axis_world"),
+                    "selected_orientation_preset_planar_yaw_variant_deg": selected_orientation_preset.get("preset_planar_yaw_variant_deg"),
+                    "selected_orientation_preset_planar_yaw_variant_rad": selected_orientation_preset.get("preset_planar_yaw_variant_rad"),
                     "target_point_B_world": geometry["contact_point_B_world"],
                     "descent_triggered": near_enough_xy,
                     "xy_error": xy_error_at_descent,
@@ -9494,6 +9726,8 @@ def main() -> int:
                     "selected_orientation_preset_label": selected_orientation_preset["preset_label"],
                     "selected_orientation_preset_rpy": selected_orientation_preset["rpy"],
                     "selected_orientation_preset_approach_axis_world": selected_orientation_preset.get("approach_axis_world"),
+                    "selected_orientation_preset_planar_yaw_variant_deg": selected_orientation_preset.get("preset_planar_yaw_variant_deg"),
+                    "selected_orientation_preset_planar_yaw_variant_rad": selected_orientation_preset.get("preset_planar_yaw_variant_rad"),
                     "selected_orientation_preset_dot_with_world_pos_y": selected_orientation_preset.get("dot_with_world_pos_y"),
                     "selected_orientation_preset_dot_with_world_neg_y": selected_orientation_preset.get("dot_with_world_neg_y"),
                     "target_point_B_world": geometry["contact_point_B_world"],
