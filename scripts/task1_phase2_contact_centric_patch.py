@@ -3157,9 +3157,44 @@ def _preferred_arm_from_components(target_components: dict[str, Any]) -> str:
     return "left" if float(target_components.get("lateral_base", 0.0)) > 0.0 else "right"
 
 
+def _candidate_base_yaw_from_grasp_frame(
+    object_info: dict[str, Any],
+    object_grasp_frame: dict[str, Any] | None,
+) -> tuple[float, dict[str, Any]]:
+    if isinstance(object_grasp_frame, dict):
+        try:
+            axis = np.array(object_grasp_frame.get("closing_axis_table", []), dtype=float).reshape(-1)
+        except Exception:
+            axis = np.array([], dtype=float)
+        if axis.size >= 2 and np.isfinite(axis[:2]).all():
+            axis_xy = axis[:2]
+            axis_norm = float(np.linalg.norm(axis_xy))
+            if axis_norm > 1.0e-9:
+                normalized_axis = axis_xy / axis_norm
+                yaw = float(math.atan2(float(normalized_axis[1]), float(normalized_axis[0])))
+                return yaw, {
+                    "base_yaw_source": "object_grasp_frame_closing_axis_table",
+                    "closing_axis_table": axis[:3].tolist() if axis.size >= 3 else axis.tolist(),
+                    "normalized_closing_axis_xy": normalized_axis.tolist(),
+                    "base_yaw_rad": yaw,
+                    "base_yaw_deg": math.degrees(yaw),
+                    "fallback_used": False,
+                }
+
+    yaw = float(object_info.get("yaw_table", 0.0))
+    return yaw, {
+        "base_yaw_source": str(object_info.get("yaw_table_source", "object_info_yaw_table_fallback")),
+        "base_yaw_rad": yaw,
+        "base_yaw_deg": math.degrees(yaw),
+        "fallback_used": True,
+        "fallback_reason": "object_grasp_frame_closing_axis_table_unavailable_or_invalid",
+    }
+
+
 def generate_approach_candidates_for_object(
     *,
     object_info: dict[str, Any],
+    object_grasp_frame: dict[str, Any] | None,
     table_frame: dict[str, Any],
     target_components: dict[str, Any],
     approach_family_order: list[str],
@@ -3173,9 +3208,11 @@ def generate_approach_candidates_for_object(
     grasp_center_world = table_to_world(grasp_center_table, table_frame)
     approach_mode = str(approach_family_order[0]) if approach_family_order else "z_approach"
     preferred_arm = _preferred_arm_from_components(target_components)
+    base_hand_yaw, yaw_generation_log = _candidate_base_yaw_from_grasp_frame(object_info, object_grasp_frame)
     candidates: list[dict[str, Any]] = []
     for arm in _candidate_arm_list(requested_arm):
         for yaw_index, yaw_offset_deg in enumerate(HYBRID_PHASE1_PRESET_YAW_DEG):
+            hand_yaw = float(base_hand_yaw) + math.radians(float(yaw_offset_deg))
             pregrasp_table = center_table.copy()
             pregrasp_table[2] = max(float(bbox_table["max"][2]) + float(args.pregrasp_clearance), float(args.pregrasp_clearance))
             if approach_mode == "world_y_approach":
@@ -3198,7 +3235,12 @@ def generate_approach_candidates_for_object(
                     "object_grasp_center_world": grasp_center_world.tolist(),
                     "object_grasp_center_table_m": grasp_center_table.tolist(),
                     "object_grasp_center_table_unit": _table_units(grasp_center_table),
-                    "hand_yaw": float(object_info["yaw_table"]) + math.radians(float(yaw_offset_deg)),
+                    "hand_yaw": hand_yaw,
+                    "hand_yaw_deg": math.degrees(hand_yaw),
+                    "hand_yaw_base": float(base_hand_yaw),
+                    "hand_yaw_base_deg": math.degrees(float(base_hand_yaw)),
+                    "hand_yaw_base_source": yaw_generation_log["base_yaw_source"],
+                    "hand_yaw_generation": yaw_generation_log,
                     "hand_pitch": math.pi,
                     "hand_roll": 0.0,
                     "motion_cost": motion_cost,
@@ -8176,8 +8218,10 @@ def main() -> int:
             target_category=target_category,
             table_frame=table_frame,
         )
+        object_grasp_frame = estimate_object_grasp_frame(object_info, table_frame)
         hybrid_candidates = generate_approach_candidates_for_object(
             object_info=object_info,
+            object_grasp_frame=object_grasp_frame,
             table_frame=table_frame,
             target_components=target_components,
             approach_family_order=approach_family_order,
@@ -8185,7 +8229,6 @@ def main() -> int:
             robot_base_position=robot_base_position,
             args=args,
         )
-        object_grasp_frame = estimate_object_grasp_frame(object_info, table_frame)
         object_grasp_center_world = np.array(object_grasp_frame.get("grasp_center_world", []), dtype=float)
         object_grasp_center_marker_path = None
         if object_grasp_center_world.size == 3 and np.isfinite(object_grasp_center_world).all():

@@ -1148,3 +1148,13 @@
 - Added diagnostic fields for `z_remaining_to_contact_m`, `commanded_z_remaining_to_contact_m`, `final_z_reached_by_runtime`, `final_z_reached_by_command`, `descent_stopped_before_contact_z`, and completion-condition block counts.
 - Checks passed: `python3 -m py_compile scripts/task1_phase2_contact_centric_patch.py`.
 - Runtime limitation: no Linux Isaac Sim run was executed on Mac; next Linux run should confirm that far/horizontal descent no longer passes while the contact reference remains above target Z.
+
+## 2026-04-20 — Phase 2 Task 1 object-axis yaw candidate fix
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Issue addressed: Phase 2 candidate generation used `object_info["yaw_table"] == 0.0` plus only small yaw offsets, so table-Y closing-axis objects could fail every `alignment_pass` before IK.
+- Added `_candidate_base_yaw_from_grasp_frame(...)` to derive the candidate yaw base from `object_grasp_frame["closing_axis_table"]` when available.
+- Moved object grasp-frame estimation before Phase 1/Phase 2 candidate generation and passed it into `generate_approach_candidates_for_object(...)`.
+- Candidate yaw offsets remain the existing finite Phase 1 offsets, but they are now applied around the object closing axis instead of always around table X.
+- Added per-candidate yaw diagnostics: `hand_yaw_deg`, `hand_yaw_base_deg`, `hand_yaw_base_source`, and `hand_yaw_generation`.
+- Runtime limitation: no Linux Isaac Sim run was executed on Mac; next Linux run should confirm `geometric_pass_candidate_count > 0` for table-Y closing-axis targets.
