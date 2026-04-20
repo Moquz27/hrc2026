@@ -1136,3 +1136,15 @@
 - Converted the same explanation into Markdown headings and Vietnamese text with full diacritics while preserving source line references, formulas, function names, code identifiers, paths, and technical ordering.
 - Kept the original `.txt` file unchanged for audit comparison.
 - Documentation-only update; no runtime code, training code, or scripts changed.
+
+## 2026-04-20 — Phase 2 Task 1 horizontal Z-descent completion guard
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Issue addressed: far/horizontal descent could satisfy the servo's normal position tolerance against an intermediate 2-3 mm Z step before the runtime hand/contact reference reached the final contact Z.
+- Added an optional servo completion condition in `_execute_dualarmik_servo_phase(...)`; normal position/rotation tolerance can now be blocked until an explicit phase-level completion condition passes.
+- Disabled best-pose restoration for phases using a completion condition, so a low-error intermediate mini-target cannot restore the arm above the final contact Z.
+- Applied the completion condition to `far_lower_B_world_z`, requiring runtime point B Z to reach `far_descend_B_world[2]` within `--pre-close-point-b-tolerance` before the phase can pass.
+- Applied the completion condition only to `phase2_far_final_descent_local_ik`, requiring the runtime contact reference Z to reach locked contact target Z within the stricter of `--phase2-close-real-center-tolerance` and `--pre-close-point-b-tolerance`; vertical final descent behavior is not enforced by this new condition.
+- Added diagnostic fields for `z_remaining_to_contact_m`, `commanded_z_remaining_to_contact_m`, `final_z_reached_by_runtime`, `final_z_reached_by_command`, `descent_stopped_before_contact_z`, and completion-condition block counts.
+- Checks passed: `python3 -m py_compile scripts/task1_phase2_contact_centric_patch.py`.
+- Runtime limitation: no Linux Isaac Sim run was executed on Mac; next Linux run should confirm that far/horizontal descent no longer passes while the contact reference remains above target Z.

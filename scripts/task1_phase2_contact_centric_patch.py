@@ -5353,6 +5353,8 @@ def _execute_dualarmik_servo_phase(
     ik_overrides: dict[str, Any] | None = None,
     position_metric_offset_local: np.ndarray | None = None,
     position_metric_label: str | None = None,
+    completion_condition_fn: Callable[[], bool] | None = None,
+    completion_condition_label: str | None = None,
     extra_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     start_step = counter["step"]
@@ -5389,6 +5391,9 @@ def _execute_dualarmik_servo_phase(
     last_ik_refresh_tick: int | None = None
     latest_ik_refresh_reason: str | None = None
     early_stop_details: dict[str, Any] | None = None
+    completion_condition_error: str | None = None
+    completion_condition_last_value = True
+    completion_condition_blocked_normal_stop_count = 0
 
     def evaluate_target_pose() -> np.ndarray:
         nonlocal target_pose_eval_count, early_stop_details
@@ -5427,6 +5432,18 @@ def _execute_dualarmik_servo_phase(
         target_metric_world = _point_world_from_pose(coord_transform, target_pose_base, metric_offset_for_stop)
         metric_err = float(np.linalg.norm(current_metric_world - target_metric_world))
         return metric_err, ee_pos_err, metric_err
+
+    def evaluate_completion_condition() -> bool:
+        nonlocal completion_condition_error, completion_condition_last_value
+        if completion_condition_fn is None:
+            completion_condition_last_value = True
+            return True
+        try:
+            completion_condition_last_value = bool(completion_condition_fn())
+        except Exception as exc:
+            completion_condition_error = repr(exc)
+            completion_condition_last_value = False
+        return bool(completion_condition_last_value)
 
     def target_pose_drift(reference_pose_base: np.ndarray, live_pose_base: np.ndarray) -> dict[str, Any]:
         _, rot_drift = _pose_error(ik_solver, reference_pose_base, live_pose_base)
@@ -5589,7 +5606,9 @@ def _execute_dualarmik_servo_phase(
             best_rot_error = rot_err
             best_joint_positions = _current_positions(dc, arm_dofs)
         if pos_err <= float(spec.pos_tolerance) and rot_err <= float(spec.rot_tolerance):
-            break
+            if evaluate_completion_condition():
+                break
+            completion_condition_blocked_normal_stop_count += 1
 
         q_current = _current_positions(dc, arm_dofs)
         if q_goal is None:
@@ -5653,7 +5672,12 @@ def _execute_dualarmik_servo_phase(
     final_pose = _current_ee_pose_base(ik_solver, dc, articulation, arm_side, args=args)
     final_pos_error, final_ee_pos_error, final_point_b_error = position_metric_errors(final_pose, final_target)
     _, final_rot_error = _pose_error(ik_solver, final_pose, final_target)
-    if early_stop_details is None and best_pos_error < final_pos_error and best_pos_error <= float(spec.pos_tolerance):
+    if (
+        early_stop_details is None
+        and completion_condition_fn is None
+        and best_pos_error < final_pos_error
+        and best_pos_error <= float(spec.pos_tolerance)
+    ):
         _send_position_targets(dc, arm_dofs, [float(value) for value in best_joint_positions])
         _run_updates(sim_app, args.ik_settle_steps, counter, dc=dc, gripper_dofs=gripper_dofs, gripper_effort=spec.gripper_effort)
         maybe_refresh_coord_transform(int(spec.max_ticks), "after_best_pose_restore", force_sample=True)
@@ -5661,9 +5685,21 @@ def _execute_dualarmik_servo_phase(
         final_pos_error, final_ee_pos_error, final_point_b_error = position_metric_errors(final_pose, final_target)
         _, final_rot_error = _pose_error(ik_solver, final_pose, final_target)
 
-    success = bool(early_stop_details is not None or (final_pos_error <= float(spec.pos_tolerance) and final_rot_error <= float(spec.rot_tolerance)))
+    final_completion_condition_met = True if early_stop_details is not None else evaluate_completion_condition()
+    success = bool(
+        early_stop_details is not None
+        or (
+            final_pos_error <= float(spec.pos_tolerance)
+            and final_rot_error <= float(spec.rot_tolerance)
+            and final_completion_condition_met
+        )
+    )
     if not success:
         failure_reason = "tolerance_not_met"
+        if completion_condition_fn is not None and not final_completion_condition_met:
+            failure_reason = "completion_condition_not_met"
+        if completion_condition_error is not None:
+            failure_reason = "completion_condition_error"
     if workspace_violation and not success:
         failure_reason = failure_reason or "workspace_violation"
 
@@ -5735,6 +5771,12 @@ def _execute_dualarmik_servo_phase(
         "servo_early_stop_triggered": bool(early_stop_details is not None),
         "servo_early_stop_reason": None if early_stop_details is None else early_stop_details.get("reason"),
         "servo_early_stop_details": early_stop_details,
+        "completion_condition_required": bool(completion_condition_fn is not None),
+        "completion_condition_label": completion_condition_label,
+        "completion_condition_met": bool(final_completion_condition_met),
+        "completion_condition_last_value": bool(completion_condition_last_value),
+        "completion_condition_blocked_normal_stop_count": int(completion_condition_blocked_normal_stop_count),
+        "completion_condition_error": completion_condition_error,
         "live_coordinate_transform_refresh_active": bool(coord_transform_refresh_fn is not None),
         "live_coordinate_transform_refresh_failures": int(coord_refresh_failures),
         "live_coordinate_transform_refresh_samples": coord_refresh_samples,
@@ -6337,6 +6379,97 @@ def final_descent_local_ik(
             return None
         return float(world_arr[2] - object_support_z)
 
+    z_completion_enforced = bool(phase_name == "phase2_far_final_descent_local_ik")
+    z_completion_tolerance = min(float(args.phase2_close_real_center_tolerance), float(args.pre_close_point_b_tolerance))
+    phase2_z_descent_state: dict[str, Any] = {
+        "completion_rule": "runtime_contact_reference_z_must_reach_locked_target_z_before_phase_success",
+        "completion_enforced": z_completion_enforced,
+        "target_z_world_m": float(locked_target[2]),
+        "z_completion_tolerance_m": z_completion_tolerance,
+        "final_z_reached_by_runtime": False,
+        "descent_stopped_before_contact_z": True,
+    }
+
+    def update_phase2_z_descent_state(
+        measured_world: np.ndarray,
+        *,
+        commanded_world: np.ndarray | None = None,
+        source: str | None = None,
+    ) -> float:
+        z_remaining = float(max(0.0, float(measured_world[2]) - float(locked_target[2])))
+        phase2_z_descent_state.update(
+            {
+                "measured_world": np.array(measured_world, dtype=float).tolist(),
+                "measured_world_source": source,
+                "current_z_world_m": float(measured_world[2]),
+                "target_z_world_m": float(locked_target[2]),
+                "z_remaining_to_contact_m": z_remaining,
+                "final_z_reached_by_runtime": bool(z_remaining <= z_completion_tolerance),
+                "descent_stopped_before_contact_z": bool(z_remaining > z_completion_tolerance),
+            }
+        )
+        if commanded_world is not None:
+            commanded_remaining = float(max(0.0, float(commanded_world[2]) - float(locked_target[2])))
+            phase2_z_descent_state.update(
+                {
+                    "commanded_world": np.array(commanded_world, dtype=float).tolist(),
+                    "commanded_z_world_m": float(commanded_world[2]),
+                    "commanded_z_remaining_to_contact_m": commanded_remaining,
+                    "final_z_reached_by_command": bool(commanded_remaining <= z_completion_tolerance),
+                }
+            )
+        return z_remaining
+
+    def resolve_runtime_contact_reference_for_descent() -> dict[str, Any]:
+        current_pose = _current_ee_pose_base(ik_solver, dc, articulation, arm_side, args=args)
+        real_center_world, real_center_log = _resolve_real_grasp_center_world(
+            stage=stage,
+            dc=dc,
+            articulation=articulation,
+            robot_root_path=robot_root_path,
+            arm_side=arm_side,
+            diagnostic_finger_link_midpoint_bypass=diagnostic_bypass,
+            include_diagnostic_comparison=diagnostic_bypass,
+        )
+        current_point_b_world = _point_b_world_from_pose(coord_transform, current_pose, point_b_offset)
+        trusted_real_center_for_descent = bool(
+            real_center_world is not None
+            and real_center_log.get("close_critical_reference", False)
+        )
+        tip_mid_world_for_descent = (
+            _finite_world_vector_or_none(real_center_log.get("fingertip_midpoint_world"))
+            if trusted_real_center_for_descent
+            else None
+        )
+        if trusted_real_center_for_descent and tip_mid_world_for_descent is None:
+            tip_components_for_descent = real_center_log.get(
+                "fingertip_component_positions_world",
+                real_center_log.get("component_positions_world"),
+            )
+            if isinstance(tip_components_for_descent, list) and len(tip_components_for_descent) >= 2:
+                tip1_for_descent = _finite_world_vector_or_none(tip_components_for_descent[0])
+                tip2_for_descent = _finite_world_vector_or_none(tip_components_for_descent[1])
+                if tip1_for_descent is not None and tip2_for_descent is not None:
+                    tip_mid_world_for_descent = 0.5 * (tip1_for_descent + tip2_for_descent)
+        if tip_mid_world_for_descent is not None:
+            measured_world = tip_mid_world_for_descent
+            control_reference_source = "tip_mid"
+        else:
+            measured_world = current_point_b_world
+            control_reference_source = (
+                "point_B_fallback_untrusted_real_grasp_center"
+                if real_center_world is not None
+                else "point_B_fallback"
+            )
+        return {
+            "current_pose": current_pose,
+            "real_center_world": real_center_world,
+            "real_center_log": real_center_log,
+            "current_point_b_world": current_point_b_world,
+            "measured_world": measured_world,
+            "control_reference_source": control_reference_source,
+        }
+
     initial_real_center_world, initial_real_center_log = _resolve_real_grasp_center_world(
         stage=stage,
         dc=dc,
@@ -6553,46 +6686,12 @@ def final_descent_local_ik(
         nonlocal call_count, previous_commanded_world, last_yaw
         nonlocal vertical_tip_stop_rule_last_sample, vertical_tip_reached_table_z0, vertical_tip_close_stop_reason
         call_count += 1
-        current_pose = _current_ee_pose_base(ik_solver, dc, articulation, arm_side, args=args)
-        real_center_world, real_center_log = _resolve_real_grasp_center_world(
-            stage=stage,
-            dc=dc,
-            articulation=articulation,
-            robot_root_path=robot_root_path,
-            arm_side=arm_side,
-            diagnostic_finger_link_midpoint_bypass=diagnostic_bypass,
-            include_diagnostic_comparison=diagnostic_bypass,
-        )
-        current_point_b_world = _point_b_world_from_pose(coord_transform, current_pose, point_b_offset)
-        trusted_real_center_for_descent = bool(
-            real_center_world is not None
-            and real_center_log.get("close_critical_reference", False)
-        )
-        tip_mid_world_for_descent = (
-            _finite_world_vector_or_none(real_center_log.get("fingertip_midpoint_world"))
-            if trusted_real_center_for_descent
-            else None
-        )
-        if trusted_real_center_for_descent and tip_mid_world_for_descent is None:
-            tip_components_for_descent = real_center_log.get(
-                "fingertip_component_positions_world",
-                real_center_log.get("component_positions_world"),
-            )
-            if isinstance(tip_components_for_descent, list) and len(tip_components_for_descent) >= 2:
-                tip1_for_descent = _finite_world_vector_or_none(tip_components_for_descent[0])
-                tip2_for_descent = _finite_world_vector_or_none(tip_components_for_descent[1])
-                if tip1_for_descent is not None and tip2_for_descent is not None:
-                    tip_mid_world_for_descent = 0.5 * (tip1_for_descent + tip2_for_descent)
-        if tip_mid_world_for_descent is not None:
-            measured_world = tip_mid_world_for_descent
-            control_reference_source = "tip_mid"
-        else:
-            measured_world = current_point_b_world
-            control_reference_source = (
-                "point_B_fallback_untrusted_real_grasp_center"
-                if real_center_world is not None
-                else "point_B_fallback"
-            )
+        reference = resolve_runtime_contact_reference_for_descent()
+        real_center_world = reference["real_center_world"]
+        real_center_log = reference["real_center_log"]
+        current_point_b_world = reference["current_point_b_world"]
+        measured_world = reference["measured_world"]
+        control_reference_source = reference["control_reference_source"]
         measured_world_source_for_descent = control_reference_source
         descent_object_grasp_frame = dict(object_grasp_frame or {})
         if "object_grasp_center_world" not in descent_object_grasp_frame:
@@ -6645,6 +6744,11 @@ def final_descent_local_ik(
         )
         previous_commanded_world = commanded_world.copy()
         commanded_delta_to_target = locked_target - commanded_world
+        update_phase2_z_descent_state(
+            measured_world,
+            commanded_world=commanded_world,
+            source=control_reference_source,
+        )
 
         if call_count == 1 or call_count % int(args.trace_interval) == 0:
             trace_sample_proxy_marker_log = _update_proxy_middle_point_debug_marker(
@@ -6777,6 +6881,14 @@ def final_descent_local_ik(
             samples.append(sample)
         return commanded_pose
 
+    def phase2_z_descent_completion_fn() -> bool:
+        reference = resolve_runtime_contact_reference_for_descent()
+        z_remaining = update_phase2_z_descent_state(
+            reference["measured_world"],
+            source=reference["control_reference_source"],
+        )
+        return bool(z_remaining <= z_completion_tolerance)
+
     result = _execute_dualarmik_servo_phase(
         ServoSpec(
             phase_name,
@@ -6802,6 +6914,12 @@ def final_descent_local_ik(
         target_pose_fn=contact_target_pose_fn,
         position_metric_offset_local=contact_control_offset,
         position_metric_label="contact_reference_world",
+        completion_condition_fn=phase2_z_descent_completion_fn if z_completion_enforced else None,
+        completion_condition_label=(
+            f"{phase_name}_runtime_contact_reference_z_reached_locked_target"
+            if z_completion_enforced
+            else None
+        ),
         per_tick_monitor_fn=(lambda: monitor_vertical_tip_stop_rule(context="per_tick_monitor"))
         if vertical_tip_stop_rule_active
         else None,
@@ -6822,6 +6940,7 @@ def final_descent_local_ik(
                 "contact_control_reference_log": initial_real_center_log,
                 "point_B_proxy_to_contact_control_reference_delta_world": point_b_to_contact_control_delta.tolist(),
                 "point_B_proxy_to_contact_control_reference_delta_world_norm_m": float(np.linalg.norm(point_b_to_contact_control_delta)),
+                "z_descent_completion": phase2_z_descent_state,
                 "point_B_proxy_semantics": "legacy proxy kept for compatibility and diagnostics only; final descent commands the close-critical contact reference when resolved",
                 "contact_centric_command_path": "measure runtime tip-mid/contact reference, clamp contact-reference XY/yaw/Z, then convert contact reference to EE pose for IK",
                 "vertical_tip_stop_rule_active": bool(vertical_tip_stop_rule_active),
@@ -9087,13 +9206,53 @@ def main() -> int:
                 }
             geometry["horizontal_grasp_expansion"] = horizontal_grasp_expansion_log
 
+            far_z_completion_tolerance = float(args.pre_close_point_b_tolerance)
+            far_z_descent_state: dict[str, Any] = {
+                "completion_rule": "point_B_world_z_must_reach_far_descend_B_world_z_before_phase_success",
+                "target_z_world_m": float(far_descend_B_world[2]),
+                "z_completion_tolerance_m": far_z_completion_tolerance,
+                "final_z_reached_by_runtime": False,
+                "descent_stopped_before_contact_z": True,
+            }
+
+            def update_far_z_descent_state(current_b_world: np.ndarray, commanded_b_world: np.ndarray | None = None) -> float:
+                z_remaining = float(max(0.0, float(current_b_world[2]) - float(far_descend_B_world[2])))
+                far_z_descent_state.update(
+                    {
+                        "current_point_B_world": np.array(current_b_world, dtype=float).tolist(),
+                        "current_z_world_m": float(current_b_world[2]),
+                        "target_z_world_m": float(far_descend_B_world[2]),
+                        "z_remaining_to_contact_m": z_remaining,
+                        "final_z_reached_by_runtime": bool(z_remaining <= far_z_completion_tolerance),
+                        "descent_stopped_before_contact_z": bool(z_remaining > far_z_completion_tolerance),
+                    }
+                )
+                if commanded_b_world is not None:
+                    commanded_remaining = float(max(0.0, float(commanded_b_world[2]) - float(far_descend_B_world[2])))
+                    far_z_descent_state.update(
+                        {
+                            "commanded_point_B_world": np.array(commanded_b_world, dtype=float).tolist(),
+                            "commanded_z_world_m": float(commanded_b_world[2]),
+                            "commanded_z_remaining_to_contact_m": commanded_remaining,
+                            "final_z_reached_by_command": bool(commanded_remaining <= far_z_completion_tolerance),
+                        }
+                    )
+                return z_remaining
+
             def far_world_z_lower_fn():
                 curr_pose = _current_ee_pose_base(ik_solver, dc, articulation, chosen_arm, args=args)
                 curr_B_world = _point_b_world_from_pose(coord_transform, curr_pose, selected_point_b_offset)
                 next_B_world = far_descend_B_world.copy()
                 next_B_world[2] = max(float(far_descend_B_world[2]), float(curr_B_world[2]) - 0.002)
+                update_far_z_descent_state(curr_B_world, next_B_world)
                 target_pose, _ = _pose_for_point_b_world(next_B_world, coord_transform, far_descend_locked_rpy, selected_point_b_offset)
                 return target_pose
+
+            def far_z_descent_completion_fn() -> bool:
+                curr_pose = _current_ee_pose_base(ik_solver, dc, articulation, chosen_arm, args=args)
+                curr_B_world = _point_b_world_from_pose(coord_transform, curr_pose, selected_point_b_offset)
+                z_remaining = update_far_z_descent_state(curr_B_world)
+                return bool(z_remaining <= far_z_completion_tolerance)
 
             descend_result = _execute_dualarmik_servo_phase(
                 ServoSpec("far_lower_B_world_z", np.array(geometry["contact_pose_base"], dtype=float), args.descend_tolerance, args.rot_tolerance, args.servo_max_ticks * 2),
@@ -9114,6 +9273,8 @@ def main() -> int:
                 coord_transform_refresh_fn=coord_transform_refresh_fn,
                 ik_overrides=far_ik_overrides,
                 target_pose_fn=far_world_z_lower_fn,
+                completion_condition_fn=far_z_descent_completion_fn,
+                completion_condition_label="far_point_B_runtime_z_reached_contact_target",
                 extra_details={
                     "motion_policy": motion_policy,
                     "far_contact_sequence_policy": geometry.get("far_contact_sequence_policy"),
@@ -9138,6 +9299,7 @@ def main() -> int:
                     "far_reach_axis_world": geometry.get("far_reach_axis_world"),
                     "AB_axis_world": geometry.get("AB_axis_world"),
                     "world_z_lowering": True,
+                    "z_descent_completion": far_z_descent_state,
                     "side_push_avoidance": "final contact moves only in world Z after XY alignment",
                 },
             )
