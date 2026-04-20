@@ -1,0 +1,2069 @@
+DAC TA GIAI TRINH THUAT TOAN
+File nguon: scripts/task1_phase2_contact_centric_patch.py
+Ngon ngu: Tieng Viet
+Pham vi: giai thich y tuong tong quat, sau do giai thich theo tung block code va tung dong/nhom dong co chuc nang.
+
+Ghi chu ve so dong:
+- So dong duoc ghi theo trang thai repo tai thoi diem lap tai lieu nay.
+- Neu file nguon thay doi, so dong co the lech, nhung ten ham va vai tro logic van la diem doi chieu chinh.
+- File nguon dai gan 10.000 dong, nen cac dong lien tiep co cung mot thao tac duoc gop thanh khoang dong de tranh lap lai co hoc.
+
+======================================================================
+1. IDEA GENERAL
+======================================================================
+
+1.1. Muc tieu cua file
+
+File scripts/task1_phase2_contact_centric_patch.py la mot ban Task 1 Phase 2 "contact-centric" cho Walker S2 trong Isaac Sim.
+No khong phai la mot pipeline hoc may, khong them Thinker, khong them YOLO, khong them planner moi.
+No lay nen tu scripts/task1_hybrid_geometric_phase1.py va bo sung lop lam cung tiep xuc:
+- Loc ung vien grasp bang hinh hoc re.
+- Uu tien tham chieu tiep xuc thuc te cua hai dau ngon tay thay vi chi tin vao proxy point_B.
+- Dieu khien final descent theo diem tiep xuc runtime.
+- Gate close dua tren metric runtime cua hai ngon tay, symmetry, alignment, table clearance, support gap va z-stall.
+- Ghi log rat day de debug tung pha, tung nguon tham chieu, tung dieu kien cho phep close.
+
+1.2. Van de file dang giai quyet
+
+Task 1 can robot gap vat tren ban va bo vao bin.
+Trong cac ban baseline truoc, viec "target pose" thuong duoc dinh nghia bang EE origin hoac mot proxy point_B suy ra tu TCP offset.
+Van de la:
+- EE origin khong nam tai diem tiep xuc that.
+- point_B la proxy hinh hoc, khong chac trung voi dau ngon tay that.
+- Neu close dua tren proxy sai, robot co the close khi ngon tay chua den vat, hoac tu choi close vi proxy trong log khong phan anh tiep xuc that.
+
+Ban contact-centric doi cach nhin:
+- DualArmIK van dieu khien pose EE.
+- Nhung dieu kien tiep xuc, final descent va close gate co gang do bang "real grasp center" runtime.
+- Real grasp center duoc uu tien theo thu tu tin cay:
+  1. midpoint cua actual fingertip frame pair neu resolve duoc;
+  2. stable finger-link midpoint neu actual frame khong co;
+  3. calibrated distal proxy chi la diagnostic, khong duoc tu dong authorize close;
+  4. point_B chi la fallback compatibility.
+
+1.3. Luong tong quat cua thuat toan
+
+Buoc 1: Doc tham so CLI va validate runtime paths.
+Script lay baseline root, asset root, Walker S2 USD/URDF, log root, seed, target index, cac threshold Phase 2.
+
+Buoc 2: Khoi tao Isaac Sim va scene Task 1.
+Script dung official SceneBuilder de build table va parts.
+Bin official co van de physics trong cac log truoc, nen script dung visual official box neu can va diagnostic static bin colliders de thao tac on dinh.
+
+Buoc 3: Load Walker S2 va acquire articulation.
+Script tim articulation root, acquire dynamic_control handle, doc joint/body names, apply startup joint map.
+
+Buoc 4: Chon target object.
+Script lay bbox cua cac part, tinh center, sap xep theo target-index/seed/near, gan category A/B neu co.
+
+Buoc 5: Thiet lap frame lam viec.
+Script tao table frame, robot-base/world coordinate transform, EE frame compensation, TCP offset, point_B offset.
+
+Buoc 6: Phan loai target region.
+Target duoc chieu ve frame robot base.
+Neu target xa thi dung family world_y_approach/far_low_side_B_driven.
+Neu target mid/near thi dung vertical Z descent.
+
+Buoc 7: Tao ung vien huong tiep can va pose pregrasp.
+Script dung library orientation preset theo arm va approach family.
+Moi preset duoc bien thanh geometry gom:
+- pregrasp point_B world;
+- align point_B world;
+- contact point_B world;
+- lift, carry, place, retreat pose;
+- AB semantics va cac metric debug.
+
+Buoc 8: Loc ung vien bang IK va hinh hoc.
+Pregrasp candidate phai qua DualArmIK voi error duoi tolerance.
+Phase 2 candidate phai qua cac check hinh hoc: alignment, symmetry, width, clearance, predicted early contact asymmetry.
+
+Buoc 9: Chay phase motion.
+Tuy motion policy:
+- Far: pregrasp -> outboard transition -> low side prepare -> XY align -> final descent.
+- Vertical/mid/near: pregrasp -> align -> descend -> final descent.
+
+Buoc 10: Final descent contact-centric.
+Thay vi chi lenh cho EE den pose co dinh, moi tick script:
+- do contact reference runtime;
+- neu co trusted fingertip midpoint thi dung tip_mid;
+- neu khong, fallback point_B;
+- tinh delta den locked target;
+- clamp XY step;
+- clamp Z chi di xuong, khong cho tang Z;
+- clamp yaw;
+- doi contact-reference target thanh EE pose roi dua cho DualArmIK.
+
+Buoc 11: Pre-close gate.
+Truoc khi close, script thu thap:
+- current EE pose;
+- point_B;
+- real grasp center;
+- fingertip pair metrics;
+- table clearance;
+- selected candidate filter;
+- final descent samples;
+- support gap va z-stall.
+
+Buoc 12: Quyet dinh close.
+Close chi duoc authorize neu pass mot trong cac duong:
+- primary close gate dua tren runtime truth;
+- vertical support/stall fallback;
+- runtime commit fallback.
+Nhung van bi chan boi hard blocker nhu catastrophic table clearance, catastrophic orientation, width sai, hoac close-critical reference khong tin cay.
+
+Buoc 13: Close, lift, retry.
+Script close hai stage, giu effort, short lift verify.
+Neu fail va con retry, recover va lap lai mot phan.
+
+Buoc 14: Carry/place/release/settle va ghi log.
+Neu grasp/retention pass, script carry den bin, place, release, retreat, settle, tinh inside-bin va stability.
+
+1.4. Y nghia cua "contact-centric"
+
+"Contact-centric" trong file nay khong co nghia la co physics contact sensor chinh thuc.
+No co nghia la vong dieu khien gan tiep xuc khong lay EE origin hay point_B lam su that cuoi.
+No co gang resolve tham chieu thuc hon tu runtime:
+- actual fingertip frame;
+- midpoint cua cap ngon tay;
+- link midpoint on dinh;
+- runtime two-finger geometry.
+
+Khi khong co du lieu du tin cay, script van co fallback point_B de tiep tuc debug, nhung log se danh dau ro fallback/proxy, va mot so gate se khong cho close neu nguon do khong du tin cay.
+
+======================================================================
+2. GIAI THICH THEO BLOCK CODE
+======================================================================
+
+----------------------------------------------------------------------
+Block 1: Header, import, hang so va orientation preset co ban
+Dong lien quan: 1-220
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Khai bao muc dich script.
+- Import cac module va helper tu cac script runtime da co.
+- Dinh nghia cac threshold Phase 1/Phase 2.
+- Dinh nghia cac preset orientation cho approach theo Z va theo world-Y.
+
+Giai thich tung dong/nhom dong:
+
+Dong 1:
+Shebang chay bang python3 khi script duoc execute truc tiep.
+
+Dong 2-8:
+Docstring mo ta ro file la Task 1 Phase 2 hybrid geometric contact-hardening.
+Dong nay la contract thiet ke: giu table-frame, scene_state object_info, finite candidate generation, DualArmIK backend va phase-machine execution tu Phase 1.
+Dong nay cung noi ro Phase 2 chi them geometric grasp filtering va contact/descent hardening, khong them Thinker, YOLO, hay planner backend moi.
+
+Dong 10:
+Dung from __future__ import annotations de type hint co the tham chieu ten class/chua can evaluate ngay.
+
+Dong 12-23:
+Import cac thu vien chuan:
+- argparse cho CLI.
+- importlib.util de load official baseline module dong.
+- json cho log.
+- math cho geometry.
+- random cho seed.
+- sys/traceback cho runtime error.
+- dataclass cho ServoSpec.
+- datetime/timezone cho timestamp log.
+- pathlib.Path cho path handling.
+- typing.Any/Callable cho type hint linh hoat.
+
+Dong 25:
+Import numpy lam nen cho vector, matrix, pose va metric.
+
+Dong 27-33:
+Import helper tu control_walker_s2_arms:
+- acquire articulation;
+- hold GUI;
+- read DOF observation;
+- send position target;
+- start timeline.
+Nghia la file nay khong tu viet lai nhung primitive runtime da co.
+
+Dong 34-38:
+Import helper tu diagnose_task1_bin_physics:
+- box relative path mac dinh;
+- add diagnostic static bin colliders;
+- disable physics under visual box.
+Day la dau vet cua chien luoc bin diagnostic thay cho composed official box bi loi physics.
+
+Dong 39:
+Import helper tu load_walker_s2:
+- init steps mac dinh;
+- tao minimal scene;
+- tim joint names;
+- load SimulationApp;
+- validate environment.
+
+Dong 40:
+Import bbox va physics summary tu validate_task1_object_assets de dung lai logic inspect asset/object.
+
+Dong 41-49:
+Import helper tu validate_task1_scene_builder_scene:
+- default asset/baseline/config path;
+- NullDataLogger;
+- category_from_reference;
+- official SceneBuilder loader;
+- reference paths.
+Day la cau noi vao official baseline/resource stack.
+
+Dong 52-54:
+SCRIPT_NAME, LOG_STEM va SOURCE_BASELINE_SCRIPT dat danh tinh log.
+Luu y file hien tai ten task1_phase2_contact_centric_patch.py nhung SCRIPT_NAME/LOG_STEM van ghi task1_hybrid_geometric_phase2.py; day la chi tiet can canh giac khi tim log.
+
+Dong 56:
+TABLE_UNIT_M = 0.035, dung de doi don vi table/config sang meter neu can.
+
+Dong 57-64:
+Hang so Phase 1:
+- yaw preset;
+- weight score reach/side/yaw/width;
+- min/max object width;
+- symmetry tolerance.
+Nhung hang so nay giu compatibility voi lop loc coarse cu.
+
+Dong 66-105:
+Hang so Phase 2:
+- alignment error max;
+- symmetry/contact asymmetry max;
+- table clearance min;
+- width min/max;
+- violation weight;
+- allow least bad candidate mac dinh False;
+- close tolerance;
+- catastrophic orientation/table clearance;
+- runtime commit fallback thresholds;
+- vertical fallback thresholds;
+- final descent step limits;
+- close stage fraction;
+- retention/lift/retry thresholds;
+- fingertip proxy thresholds.
+Day la "bang dieu khien" chinh cua contact-centric patch.
+
+Dong 107-111:
+Official robot prim/name va gripper width/effort.
+DEFAULT_GRIPPER_HOLD_EFFORT = 100.0 la gia tri luc giu da duoc cac run truoc xac nhan tot hon 35.0.
+
+Dong 112-143:
+Debug marker paths, radius, color cho proxy midpoint, object grasp center, pregrasp target, tip1/tip2/tip_mid, object center, runtime object grasp center, real grasp center, contact point, point_B.
+Muc dich la lam ro tren viewport/log: diem nao la proxy, diem nao la runtime truth.
+
+Dong 145-146:
+TCP offset fallback va epsilon cho offset nho.
+
+Dong 147-161:
+OFFICIAL_TORSO_COMPENSATION_MATRIX la ma tran compensate frame official torso/EE.
+No la mot calibration matrix dung khi can align frame DualArmIK voi world/runtime.
+
+Dong 153-160, ham _preset_euler_xyz_to_rot:
+- Dong 154-156 tinh cos/sin roll, pitch, yaw.
+- Dong 157 tao Rx.
+- Dong 158 tao Ry.
+- Dong 159 tao Rz.
+- Dong 160 tra ve R = Rz @ Ry @ Rx, tuc convention Euler XYZ nhung nhan ma tran theo thu tu yaw-pitch-roll.
+
+Dong 163-173, ham _preset_rot_to_euler_xyz:
+- Dong 164 ep input thanh numpy array.
+- Dong 165 check gimbal lock bang r[2,0].
+- Dong 166-168 tinh pitch/roll/yaw neu khong gimbal.
+- Dong 170-172 xu ly gimbal lock: pitch +/- pi/2, roll = 0, yaw tinh tu phan con lai.
+- Dong 173 tra ve list float.
+
+Dong 176-179, ham _preset_with_local_ab_axis_roll:
+- Dong 177 doi rpy goc thanh rotation.
+- Dong 178 tao roll quanh truc local AB bang Euler z local trong convention cua preset.
+- Dong 179 tra ve rpy moi sau khi nhan base_rot @ local_ab_roll.
+
+Dong 182-191, ham _build_world_y_approach_presets:
+- Dong 183 tao list rong.
+- Dong 184 duyet tung preset co ban.
+- Dong 185 duyet tung axial roll variant.
+- Dong 186-187 neu roll xap xi 0 thi giu rpy.
+- Dong 188-189 neu khac 0 thi tao rpy rolled.
+- Dong 190 them label moi co suffix variant.
+- Dong 191 tra ve preset list.
+
+Dong 194-202:
+RIGHT_Z_APPROACH_PRESETS va LEFT_Z_APPROACH_PRESETS.
+Day la cac huong grasp tu tren xuong: straight va tilted_forward.
+
+Dong 204-220:
+Comment va base preset cho world_y_approach.
+Y tuong: FAR diagnostics cu cho thay family world_y_approach cu co approach_axis_world lech gan world +X.
+Vi vay preset moi them quarter-turn yaw de dua local +Z/AB axis ve base +/-X, map sang world +/-Y theo transform quan sat.
+
+----------------------------------------------------------------------
+Block 2: Preset con lai, exception va ServoSpec
+Dong lien quan: 221-398
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Hoan tat orientation preset library.
+- Dinh nghia exception co cau truc cho failure.
+- Dinh nghia ServoSpec de truyen thong so servo phase.
+
+Giai thich tung dong/nhom dong:
+
+Dong 221-376:
+Tiep tuc khai bao preset, variant axial roll, map preset theo arm/family.
+Cac hang so nay quyet dinh vung search orientation truoc khi DualArmIK solve.
+Day la diem can xem khi target "pregrasp unreachable" vi orientation/approach family co the qua chat.
+
+Dong 378-381, class RunFailure:
+- Dong 378 tao exception rieng cho run-level failure.
+- Dong 379 luu reason dang machine-readable.
+- Dong 380 luu message de doc log.
+- Dong 381 goi RuntimeError constructor voi message.
+
+Dong 384-388, class ServoEarlyStop:
+- Dong 384 tao exception rieng cho servo stop som.
+- Dong 385 luu reason.
+- Dong 386 luu details dict.
+- Dong 387 tao message co reason.
+- Dong 388 goi RuntimeError constructor.
+Ham final descent dung exception nay khi vertical tip dat table-z threshold.
+
+Dong 391:
+@dataclass(frozen=True) lam ServoSpec immutable.
+
+Dong 392-398, class ServoSpec:
+- phase_name: ten phase ghi log.
+- target_pose_base: pose target trong base frame.
+- position_tolerance: tolerance vi tri.
+- rotation_tolerance: tolerance xoay.
+- max_ticks: so tick servo toi da.
+ServoSpec giup _execute_dualarmik_servo_phase nhan input gon va nhat quan.
+
+----------------------------------------------------------------------
+Block 3: Path, fail, USD reference, xform, articulation
+Dong lien quan: 401-541
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Chuan hoa path.
+- Fail co reason.
+- Them USD reference vao stage.
+- Set transform prim.
+- Tim va acquire articulation root cua Walker S2.
+
+Giai thich tung dong/nhom dong:
+
+Dong 401-403, _as_path:
+Neu raw_path co gia tri thi tra Path(raw_path).expanduser(), neu khong tra default_path.
+Ham nay giu rule khong hardcode local path trong code chinh; path den tu CLI/env/default relative.
+
+Dong 405-407, _fail:
+Raise RunFailure voi reason va message.
+Tat ca failure chinh nen di qua ham nay de log co reason on dinh.
+
+Dong 409-414, _add_reference:
+- Tao prim tai prim_path.
+- Add reference den USD path.
+- Tra ve prim.
+Dung de load robot/asset vao stage ma khong copy noi dung USD.
+
+Dong 416-433, _set_xform:
+- Set translation, rotation, scale cho prim.
+- Tao XformCommonAPI neu can.
+- Convert tuple/list sang Gf types.
+Day la primitive de dat robot/object/bin.
+
+Dong 436-440, _valid_prim_path:
+Kiem tra prim_path co ton tai trong stage va prim valid.
+Dung truoc khi tin mot path lay tu config/log.
+
+Dong 443-464, _prim_has_articulation_api:
+Kiem tra prim co UsdPhysics.ArticulationRootAPI hoac schema tuong duong.
+Vi official USD co the dat articulation API o nested prim, script can scan.
+
+Dong 467-474, _find_articulation_roots_anywhere:
+Duyet stage, gom cac prim co articulation API, tra ve path.
+Day la fallback khi path official/expected khong dung.
+
+Dong 477-524, _choose_robot_prim_path:
+- Uu tien official robot prim path neu valid.
+- Neu robot_prim_path input valid thi dung.
+- Neu khong, scan articulation roots.
+- Ghi details ve source, candidates, selected path.
+Ham nay lam giam rui ro path robot khac giua official SceneBuilder va script tu load USD.
+
+Dong 507-524, _articulation_acquire_candidates:
+Tao danh sach path co the acquire dynamic_control articulation.
+Thu tu gom detected_path, robot_prim_path, parent/root variants.
+
+Dong 527-541, _acquire_articulation_with_fallback:
+- Thu tung candidate path.
+- Goi _acquire_articulation.
+- Neu thanh cong tra articulation, handle, details.
+- Neu that bai ghi error tung candidate.
+Day la lop chong loi quan trong vi dynamic_control doi khi khong acquire dung path prim dau tien.
+
+----------------------------------------------------------------------
+Block 4: Vector, pose, SE3, coordinate transform, EE compensation
+Dong lien quan: 544-985
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Doi object runtime sang vector numpy.
+- Doc pose body/prim.
+- Chuyen doi SE3/matrix.
+- Tao transform world <-> robot base.
+- Verify va compensate EE frame.
+
+Giai thich tung dong/nhom dong:
+
+Dong 544-549, _vector3:
+Lay x/y/z tu object co field hoac sequence, tra numpy vector.
+
+Dong 551-561:
+_body_pose_position va _body_pose_orientation doc pose body tu dynamic_control.
+Position tra vector.
+Orientation tra dict quaternion neu co.
+
+Dong 563-575, _world_se3_from_prim:
+Lay world transform cua prim USD va doi thanh SE3 cho IK.
+
+Dong 577-585, _pin_frame_se3:
+Lay frame SE3 tu ik_solver theo frame_name.
+Neu khong co frame thi fail co reason.
+
+Dong 588-600:
+_se3_from_matrix va _matrix_from_se3 doi qua lai giua ma tran 4x4 va object SE3 cua official IK.
+Day la cau noi giua numpy va DualArmIK.
+
+Dong 602-605, _rotation_delta_rad:
+Tinh sai khac rotation tu delta_se3.
+Dung cho diagnostics/tolerance.
+
+Dong 608-614, _fk_ee_world_se3:
+Lay forward kinematics EE world SE3 cho arm side.
+
+Dong 617-629:
+_ee_compensation_se3_from_map va _ee_compensation_se3 lay compensation theo arm.
+Neu args bat compensation thi IK target se duoc bien doi qua compensation.
+
+Dong 632-637, _ik_target_pose_se3:
+Chuyen target_pose_base thanh SE3 target cho IK, co ap dung EE compensation neu active.
+
+Dong 640-645, _ee_pose_base_from_ik_state:
+Doc EE pose hien tai tu IK state, tra xyzrpy trong base frame.
+
+Dong 648-729, _coordinate_transform_from_anchor va _refresh_coordinate_transform_from_selection:
+Hai ham nay tao/refresh object coordinate transform tu robot anchor.
+No luu robot_world_R, inverse, world_to_robot, robot_to_world.
+Day la nen cua moi cong thuc pose: object bbox trong world se duoc dua ve robot base de DualArmIK solve.
+
+Dong 732-752, _resolve_link_prim_path:
+Tim prim path cua link theo ten link.
+Tra path va log candidates.
+
+Dong 755-800, _verify_ee_alignment_dynamic:
+So sanh body dynamic_control, prim USD, IK FK de xem EE frame co lech khong.
+Ket qua dung de bat/tat compensation.
+
+Dong 803-884, _compute_ee_frame_delta_diagnostics:
+Tinh delta giua IK EE frame va runtime/USD frame.
+Ghi translation/rotation delta, source, per-arm diagnostic.
+
+Dong 887-907, _configure_ee_frame_compensation:
+Dua tren diagnostics va CLI, chon co dung compensation khong.
+Neu active thi luu map compensation vao args.
+
+Dong 910-985, _select_coordinate_transform_with_alignment:
+Chon coordinate transform tot nhat, verify alignment, gan compensation.
+Day la block quan trong de tranh bug "pose dung trong world nhung sai trong base".
+
+----------------------------------------------------------------------
+Block 5: End-effector, fingertip, contact reference va runtime truth
+Dong lien quan: 988-2492
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Tim body/link cua EE va fingertip.
+- Resolve midpoint hai ngon tay.
+- Phan biet proxy, diagnostic proxy va close-critical runtime truth.
+- Tinh runtime two-finger metrics.
+- Doi contact reference target thanh EE pose.
+
+Giai thich tung dong/nhom dong:
+
+Dong 988-994, _list_articulation_bodies:
+Duyet articulation bodies tu dynamic_control, tra index, handle, name/path.
+
+Dong 996-1027, _identify_end_effector_body:
+Chon body EE theo requested token/arm side.
+Scoring dua tren ten body/path de uu tien wrist/finger/palm phu hop.
+
+Dong 1030-1042, _arm_side_match_score:
+Cho diem ten/path theo left/right arm.
+Dung de tranh chon nham link doi ben.
+
+Dong 1045-1070, _prim_bbox_center_world:
+Tinh bbox center world cua prim.
+Dung khi body transform khong co hoac can fallback tu USD.
+
+Dong 1073-1170, _resolve_named_body_or_prim_position:
+Tim position cua mot named body/prim.
+Thu tu logic: dynamic_control body truoc, USD prim/bbox sau.
+Tra ca world position va log source.
+
+Dong 1173-1176, _is_finger_midpoint_vertical_reference:
+Kiem tra token co yeu cau midpoint finger/fingertip cho vertical reference khong.
+
+Dong 1178-1271, _resolve_finger_midpoint_reference_position:
+Resolve midpoint cua hai finger link theo requested token.
+Ham nay co the dung cho debug proxy midpoint.
+No khong mac dinh la close-critical fingertip truth.
+
+Dong 1274-1362, _resolve_named_transform_position:
+Resolve mot transform theo ten/link/prim.
+Dung cho palm, link reference, vertical XY reference.
+
+Dong 1365-1402, _resolve_active_palm_reference_world:
+Tim palm reference cua arm dang dung.
+Dung khi can offset tu palm/hand thay vi EE origin.
+
+Dong 1405-1448, _resolve_actual_fingertip_frame_world:
+Tim actual fingertip frame world.
+Day la nguon runtime truth manh nhat neu co du cap tip1/tip2.
+
+Dong 1451-1515, _resolve_actual_fingertip_pair_midpoint_reference_position:
+Lay actual fingertip frame cua hai ngon, tinh midpoint.
+Neu thanh cong, log source la actual_fingertip_pair_midpoint va close-critical co the true.
+
+Dong 1518-1643, _resolve_finger_link_distal_tip_proxy_world:
+Tinh distal tip proxy tu bbox/link geometry.
+Day la proxy hinh hoc cua dau ngon tay, co ich de ve marker/so sanh.
+Sau cac fix gan day, proxy nay khong duoc xem la close-critical truth neu chua runtime-validated.
+
+Dong 1646-1697, _resolve_single_fingertip_end_world:
+Resolve mot dau ngon tay rieng le.
+Dung boi pair midpoint va diagnostics.
+
+Dong 1700-1775, _resolve_calibrated_distal_proxy_pair_midpoint_reference_position:
+Tinh midpoint tu calibrated distal proxy pair.
+Nghia la "gan voi dau ngon" theo hinh hoc, nhung van la proxy.
+Theo log gan day, day chi la diagnostic-only neu khong duoc validate bang actual/stable runtime reference.
+
+Dong 1778-1884, _resolve_fingertip_midpoint_reference_position:
+Ham tong hop cac nguon fingertip midpoint.
+Thu tu uu tien:
+1. actual fingertip pair;
+2. stable finger-link midpoint;
+3. calibrated distal proxy diagnostic;
+4. fallback neu can.
+Day la ham trung tam cho contact-centric truth hierarchy.
+
+Dong 1887-1907:
+_finite_world_vector_or_none va _first_finite_vector_from_mapping loc vector hop le.
+Chung ngan NaN/None lam gate sai.
+
+Dong 1910-2054, _compute_runtime_two_finger_metrics:
+Tinh metric runtime cua hai ngon:
+- tip1/tip2/tip_mid;
+- tip axis;
+- error cua tip_mid den object grasp center;
+- xy/z error;
+- symmetry error;
+- z asymmetry;
+- alignment error;
+- primary_runtime_truth.
+Day la ham quan trong nhat cua close gate.
+Neu primary_runtime_truth false, metric van duoc log nhung khong nen authorize close nhu su that.
+
+Dong 2057-2080, _pose_for_contact_reference_world:
+Nhan target contact reference world va contact_control_offset local.
+No goi logic tuong duong _pose_for_point_b_world nhung semantics doi thanh contact_reference_world_driven.
+Cong thuc chinh:
+- rot_base = EulerXYZ(rpy).
+- reference_base = world_to_robot(contact_reference_world).
+- offset_base = rot_base @ contact_control_offset_local.
+- point_A_base = reference_base - offset_base.
+- pose = [point_A_base.x, point_A_base.y, point_A_base.z, rpy].
+Y nghia: DualArmIK van dieu khien point_A/EE origin, nhung target duoc dinh nghia theo contact reference.
+
+Dong 2083-2148, _resolve_vertical_finger_midpoint_reference_position:
+Resolve vertical reference cho vertical policy.
+No uu tien actual/stable midpoint va khong dung calibrated distal proxy lam truth.
+
+Dong 2151-2186, _upsert_two_finger_runtime_debug_markers:
+Ve/update marker tip1, tip2, tip_mid, object center, runtime object grasp center.
+Dung de nhin truc quan "robot dang close quanh dau".
+
+Dong 2189-2208, _reference_comparison_payload:
+Tao payload so sanh giua cac reference.
+Dung trong log de biet point_B/proxy/real center lech bao nhieu.
+
+Dong 2211-2246, _resolve_finger_link_midpoint_diagnostic_world:
+Resolve midpoint diagnostic cua finger link.
+Muc dich la so sanh, khong phai primary close truth.
+
+Dong 2249-2489, _resolve_real_grasp_center_world:
+Ham trung tam resolve real grasp center.
+No ap dung hierarchy:
+- actual fingertip midpoint;
+- stable finger-link midpoint;
+- calibrated proxy diagnostic-only;
+- fallback point_B/proxy.
+No ghi ro source, fallback_used, close_critical_reference.
+Neu close_critical_reference false thi close gate khong nen coi day la bang chung quyet dinh.
+
+Dong 2492-2514, resolve_real_grasp_center_world:
+Wrapper public quanh _resolve_real_grasp_center_world.
+Co the dung ngoai ham private neu can debug/inspect.
+
+----------------------------------------------------------------------
+Block 6: Joint, gripper, IK loader, logging, bbox va workspace helper
+Dong lien quan: 2517-2908
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Doc current vertical reference.
+- Doc joint state.
+- Chon DOF arm/gripper.
+- Load official startup joint map va IK classes.
+- Apply effort gripper.
+- Chay simulation ticks.
+- Ghi phase/log JSON.
+- Helper bbox/workspace.
+
+Giai thich tung dong/nhom dong:
+
+Dong 2517-2563:
+_resolve_current_vertical_xy_reference_world va _resolve_vertical_xy_reference_offset tinh reference XY runtime cho vertical descent.
+Chung cho phep align theo midpoint/fingertip thay vi point_B don thuan.
+
+Dong 2618-2634:
+_current_positions, _named_positions, _read_positions, _targets_from_map la helper doc/chuyen doi joint target.
+
+Dong 2637-2644, _all_joint_state_for_ik:
+Doc joint names va positions tu articulation de sync vao IK solver.
+Neu joint state fail, IK se solve tren state sai, nen ham nay la buoc bat buoc truoc solve.
+
+Dong 2647-2656, _select_dofs_in_name_order:
+Chon DOF theo danh sach ten co thu tu.
+Dam bao target vector khop dung joint.
+
+Dong 2659-2674, _select_gripper_dofs:
+Chon finger DOF theo arm side.
+Dung cho open/close va effort hold.
+
+Dong 2677-2698, _select_dofs_by_target_names:
+Chon DOF cho arm target names.
+Neu thieu DOF, fail de tranh command nham.
+
+Dong 2701-2715, _load_official_startup_joint_map:
+Load joint value map tu official baseline.
+Muc tieu la startup posture dung official, khong tu che local pose.
+
+Dong 2718-2727, _load_official_ik_classes:
+Load DualArmIK/CoordinateTransform tu official baseline.
+Day la diem script reuse official IK backend.
+
+Dong 2730-2751, _seed_joint_positions_for_initialization:
+Apply startup joint positions de dua robot ve trang thai ban dau.
+
+Dong 2754-2778, _apply_gripper_effort:
+Set effort cho gripper DOF.
+Su dung trong close/retention/lift de giu object, khong chi position target.
+
+Dong 2781-2797, _run_updates:
+Step simulation, tang counter, co the hold GUI.
+
+Dong 2800-2802, _gripper_values:
+Doc gia tri gripper hien tai vao dict.
+
+Dong 2804-2821, _append_phase:
+Ghi mot phase vao phase_log voi start/end step, condition_met, details.
+Day la nen cua debug timeline.
+
+Dong 2824-2835, _json_safe:
+Chuyen numpy/path/object thanh kieu JSON-safe.
+
+Dong 2838-2868, _write_logs:
+Ghi payload JSON ra LOG_ROOT, co rolling log va timestamp log.
+
+Dong 2871-2873, _finite:
+Check list float hop le.
+
+Dong 2875-2881, _bbox_state:
+Lay bbox va center cua prim.
+
+Dong 2884-2886, _center_from_bbox:
+Tinh center = (min + max) / 2.
+
+Dong 2888-2890, _distance:
+Tinh Euclidean distance.
+
+Dong 2892-2903, _workspace_check:
+Check x/y/z co nam trong limit khong, tra dict pass/error.
+
+Dong 2906-2908, _table_units:
+Doi meter sang table unit neu can log/debug.
+
+----------------------------------------------------------------------
+Block 7: Table frame va object info trong table frame
+Dong lien quan: 2911-3147
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Tinh frame cua table.
+- Doi world <-> table.
+- Lay bbox object theo table frame.
+
+Giai thich tung dong/nhom dong:
+
+Dong 2911-2922, _bbox_corners_from_bbox:
+Tao 8 corner cua bbox tu min/max.
+Dung de transform bbox sang table frame.
+
+Dong 2925-2933, _axis_aligned_with_world_xy:
+Check hai truc table co gan song song world XY khong.
+Neu table gan axis-aligned, co the don gian hoa frame.
+
+Dong 2936-2972, _inspect_table_xform_axes:
+Lay truc x/y/z cua table prim tu transform.
+Ghi orientation, axis alignment, source.
+
+Dong 2975-3057, build_or_resolve_table_frame:
+Dung table path va bbox de xay table_frame.
+Output gom origin_world, x_axis_world, y_axis_world, z_axis_world, table_top_z, source.
+Day la frame chuan de tinh object pose, clearance va table z.
+
+Dong 3060-3069, world_to_table:
+Tru vector world voi origin table, dot voi cac axis table, tra coordinate trong table frame.
+
+Dong 3072-3080, table_to_world:
+Nhan point table theo x/y/z va cong origin + x_axis*x + y_axis*y + z_axis*z.
+
+Dong 3083-3099, _bbox_in_table_frame:
+Transform 8 bbox corner sang table frame, tinh min/max/center moi.
+
+Dong 3102-3147, get_object_info_in_table_frame:
+Lay bbox world cua object, tinh bbox table, center world/table, top/bottom, size.
+Day la object_info chinh cho grasp frame va geometry filter.
+
+----------------------------------------------------------------------
+Block 8: Candidate generation va Phase 2 geometric grasp filter
+Dong lien quan: 3150-3572
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Tao candidate arm/approach.
+- Score nhanh theo reach/yaw/width.
+- Uoc luong object grasp frame.
+- Du doan contact asymmetry.
+- Kiem tra table clearance va target gap.
+- Chon Phase 2 candidate.
+
+Giai thich tung dong/nhom dong:
+
+Dong 3150-3154, _candidate_arm_list:
+Neu requested_arm la left/right thi tra mot arm.
+Neu auto/both thi tra ca hai.
+
+Dong 3156-3158, _preferred_arm_from_components:
+Chon arm dua tren lateral component cua target trong robot base.
+
+Dong 3160-3220, generate_approach_candidates_for_object:
+Tao candidate theo arm, yaw preset, object info.
+Moi candidate co contact point, approach vector, width estimate, side penalty.
+Day la lop coarse Phase 1, truoc khi vao contact-centric.
+
+Dong 3223-3261, fast_score_candidate:
+Tinh score nhanh:
+- reach distance;
+- side penalty;
+- yaw penalty;
+- width penalty neu width ngoai min/max.
+Score cang thap cang tot.
+
+Dong 3264-3293, select_best_candidate:
+Sap xep candidates theo score va chon best.
+Tra ca selected candidate va summary.
+
+Dong 3296-3301, _clamp_norm:
+Gioi han norm vector theo max_norm.
+Ham nay duoc dung lai trong final descent step clamp.
+
+Dong 3304-3308, _angle_between_axes_unsigned:
+Tinh goc khong huong giua hai axis.
+Dung cho alignment.
+
+Dong 3310-3318, _table_axis_to_world:
+Doi axis table sang world theo table_frame.
+
+Dong 3320-3380, estimate_object_grasp_frame:
+Dung object bbox/table frame de suy ra:
+- object grasp center;
+- major/minor/width axis;
+- top/support;
+- estimated width.
+Day la "hinh hoc vat" cho filter.
+
+Dong 3383-3386, _candidate_hand_closing_axis_table:
+Lay closing axis cua candidate trong table frame.
+
+Dong 3388-3412, predict_early_contact_asymmetry:
+Du doan hai ngon se cham vat lech bao nhieu neu theo candidate.
+Neu asymmetry lon, candidate co nguy co day vat hon la gap.
+
+Dong 3415-3427, estimate_table_clearance_margin:
+Tinh margin giua fingertip/contact geometry voi table.
+Dung de chan candidate co kha nang cam xuong mat ban qua sau.
+
+Dong 3430-3446, compute_target_gap:
+Tinh target gripper gap dua tren object width + margin, clamp trong min/max.
+
+Dong 3449-3512, fast_geometric_grasp_filter:
+Check bat buoc:
+- width trong range;
+- alignment error <= max;
+- symmetry error <= max;
+- predicted contact asymmetry <= max;
+- table clearance >= min.
+Tra pass/fail, violation list, weighted score.
+
+Dong 3515-3572, select_best_phase2_candidate:
+Chay filter cho tat ca candidates.
+Mac dinh PHASE2_ALLOW_LEAST_BAD_CANDIDATE = False.
+Neu khong co candidate pass mandatory, fail som thay vi lay least-bad va lao vao descent.
+Day la thay doi an toan quan trong cua contact-centric patch.
+
+----------------------------------------------------------------------
+Block 9: Target/bin utility, target selection, TCP offset, region classification, orientation preset selection
+Dong lien quan: 3575-4115
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Check inside bin.
+- Settle object.
+- Tao debug marker.
+- Tinh target component trong robot base.
+- Chon arm.
+- Chon target object.
+- Resolve TCP offset.
+- Phan loai target region va chon orientation preset.
+
+Giai thich tung dong/nhom dong:
+
+Dong 3575-3582, _inside_bin:
+Kiem tra center object co nam trong bin bbox tru wall/floor margin khong.
+
+Dong 3585-3599, _settle_and_measure:
+Step physics settle va do pose/jitter cuoi.
+
+Dong 3602-3610, _create_debug_marker:
+Tao sphere marker tai position voi radius/color.
+
+Dong 3613-3635, _upsert_debug_marker:
+Neu marker da co thi update transform, neu chua co thi tao.
+
+Dong 3638-3652, _compute_robot_base_target_components:
+Chuyen object_world ve robot base.
+Tinh forward, lateral, distance.
+Day la input cho near/mid/far va arm side.
+
+Dong 3655-3658, _choose_arm_side:
+Neu CLI chon arm thi dung; neu auto thi dua vao target_components.
+
+Dong 3661-3672, _category_from_target:
+Suy ra category A/B theo index hoac reference.
+
+Dong 3675-3683, _target_nearness_sort_key:
+Sort key de uu tien target gan/ro rang.
+
+Dong 3686-3739, _build_target_candidate_records:
+Lay cac prim part, bbox, center, category, sort key.
+
+Dong 3742-3802, _select_target_record:
+Chon target theo target-index hoac policy.
+Tra record co path, bbox, category, object_info.
+
+Dong 3805-3830, _resolve_tcp_offset:
+Lay TCP offset tu config/CLI/fallback.
+Neu khong co offset chinh thuc, dung fallback x.
+
+Dong 3833-3853:
+_euler_xyz_to_rot va _rot_to_euler_xyz lap lai conversion cho runtime pose.
+
+Dong 3856-3861, _normalize:
+Normalize vector, neu norm qua nho thi dung fallback.
+
+Dong 3864-3872, _approach_axis_from_mode:
+Lay truc approach tu rotation theo args.approach_axis_mode.
+
+Dong 3875-3878, _base_down_vector:
+Tinh vector down trong base frame tu coordinate transform.
+
+Dong 3880-3885, _classify_target_region:
+Dung forward_base va threshold CLI de phan target thanh near_body/mid/far.
+Day anh huong truc tiep den motion_family.
+
+Dong 3888-3895, _approach_family_order_for_region:
+Neu far thi uu tien world_y_approach.
+Neu mid/near thi uu tien z_approach/vertical.
+
+Dong 3898-3908, _raw_orientation_presets_by_arm_and_family:
+Tra map preset theo arm va family.
+
+Dong 3911-3916, _debug_fixed_rpy_for_arm:
+Cho phep CLI force RPY debug cho mot arm.
+
+Dong 3919-3938, _world_y_axis_diagnostics:
+Tinh dot approach axis voi world +/-Y de debug family world_y.
+
+Dong 3941-3951, _preset_axial_roll_metadata:
+Parse label axial roll variant.
+
+Dong 3954-3981, _orientation_preset_record:
+Tao record preset day du:
+- label/index/family/rpy/rotation;
+- approach axis base/world;
+- up axis;
+- dot voi world +/-Y;
+- axial roll metadata.
+
+Dong 3984-3997, _orientation_presets_by_arm_and_family:
+Tao list preset records cho arm/family.
+
+Dong 4000-4055, _region_filtered_orientation_presets:
+Loc preset theo target_region va approach_family_order.
+Neu debug fixed RPY active thi chi dung preset debug.
+
+Dong 4058-4115, _fixed_downward_rpy_by_arm:
+Tao downward RPY mac dinh theo arm.
+Dung cho geometry neu khong dung preset library rieng.
+
+----------------------------------------------------------------------
+Block 10: Pose construction, point_B semantics va grasp geometry
+Dong lien quan: 4118-4704
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Doi contact/point_B target world thanh EE pose base.
+- Dinh nghia point_A/point_B semantics.
+- Tinh contact_z.
+- Lap ke hoach pregrasp/align/contact/lift/carry/place/retreat cho far va vertical policy.
+
+Giai thich tung dong/nhom dong:
+
+Dong 4118-4149, _pose_contact_base:
+- Dong 4125 tinh rotation base tu rpy.
+- Dong 4126 doi contact_world sang robot base.
+- Dong 4127-4128 them bias forward/lateral trong base.
+- Dong 4130 tinh tcp_offset_base = rot @ tcp_offset_local.
+- Dong 4132-4135 neu target_mode == contact_axis thi EE origin trung contact_base, khong compensate TCP.
+- Dong 4136-4138 nguoc lai, EE origin = contact_base - tcp_offset_base.
+- Dong 4140-4142 tao pose [x,y,z,r,p,y].
+- Dong 4143-4149 tra pose va log contact_world/contact_base/tcp_offset/target_mode.
+Ham nay la path cu theo contact axis/TCP, khong phai contact-reference runtime truth moi.
+
+Dong 4153-4164:
+_pose_position_world, _pose_rotation_base, _pose_rotation_world.
+Ba ham nay doi pose_base thanh world position/rotation de log point_A/point_B.
+
+Dong 4166-4182, _resolve_point_b_offset_local:
+- Neu CLI cung cap point_b_offset_local thi dung.
+- Neu khong, lay length = max(norm(tcp_offset), tcp_fallback_x).
+- Dat offset = [0,0,length].
+- Log source va note: local +Z duoc dung vi preset top-down hien tai lam truc do gan vertical world.
+Day la cach script suy ra point_B compatibility.
+
+Dong 4185-4192:
+_point_world_from_pose va _point_b_world_from_pose.
+Cong thuc:
+point_A_world = robot_to_world(pose_base[:3])
+rot_world = robot_world_R @ rot_base
+point_B_world = point_A_world + rot_world @ point_b_offset_local.
+
+Dong 4195-4224, _point_b_target_for_xy_reference:
+- Bat dau tu point_b_world.
+- Neu khong co xy_reference_offset_local thi giu XY point_B.
+- Neu co, tinh delta_world = rot_world @ (xy_reference_offset_local - point_b_offset_local).
+- Dat target.x/y = desired_xy - delta_world.x/y.
+Muc tieu: point_B van control Z/contact mark, nhung XY cua reference link/fingertip moi nam tren vat.
+
+Dong 4227-4245, _pose_for_point_b_world:
+- Dong 4233 tinh rot_base.
+- Dong 4234 doi point_B target world sang base.
+- Dong 4235 tinh point_b_offset_base.
+- Dong 4236 tinh point_A_base = point_B_base - point_b_offset_base.
+- Dong 4237 tao pose [point_A_base, rpy].
+- Dong 4238-4245 log target point_B, offset, point_A, semantics point_B_proxy_driven.
+Day la cong thuc chinh cua geometry planning truoc contact-centric final descent.
+
+Dong 4248-4276, _ab_pose_semantics:
+Tinh point_A_world, point_B_world, AB vector, length, AB axis, dot voi world z, slant angle, dot voi world +/-Y.
+Day la diagnostic de biet hand dang nam ngang/doc/le nhu the nao.
+
+Dong 4279-4285, _target_world_from_pose_key:
+Lay pose trong geometry theo key roi tinh AB semantics.
+
+Dong 4288-4298, _compute_contact_z_world:
+Cong thuc:
+contact_z = max(
+    bbox_top_z + descend_clearance + grasp_depth_offset,
+    table_top_z + min_ee_table_clearance
+)
+Y nghia:
+- khong di thap hon table_top + min clearance;
+- grasp_depth_offset co the am de chen sau hon;
+- nhung trong sweep target-index=2, thay grasp_depth khong doi pregrasp_error, nen no khong phai lever cua approach.
+
+Dong 4301-4637, _plan_grasp_geometry:
+Day la block lap ke hoach geometry lon nhat.
+
+Dong 4320-4324:
+Lay bbox, object center, dat contact_world ban dau bang object center.
+Them contact_world_y_bias.
+Dat contact_world.z bang _compute_contact_z_world.
+
+Dong 4325:
+object_support_z_world = max(table_top_z, bbox_min_z).
+Day la moc support de tinh gap gan mat ban/vat.
+
+Dong 4327-4335:
+Lay rpy preset, point_b_offset, rotation, x/y axis base, world_up, base_up.
+
+Dong 4336-4345:
+Tinh AB vector world tu local point_B offset.
+Tinh horizontal span cua AB va cac bien far extra height/slant.
+
+Dong 4346-4356:
+Neu motion_family == world_y_approach, tinh them point_A extra height de dat requested downward slant.
+Neu can, dieu chinh point_b_offset local de point_B thap hon point_A theo world up.
+
+Dong 4357-4363:
+Tinh AB axis base/world, dot voi world_z, horizontal norm, downward slant deg.
+
+Dong 4364-4368:
+Tinh robot_belly_forward_world tu base +X.
+Dung de xem AB co vuong goc/huong dung voi than robot khong.
+
+Dong 4374-4438, nhanh far/world_y_approach:
+- motion_policy = far_low_side_B_driven.
+- far_contact_z_world = object_support_z + far_point_b_gap_above_support.
+- far_reach_axis_world = horizontal projection cua AB axis.
+- far_xy_align_z_world = object_top_z + far_xy_align_clearance_above_object.
+- far_xy_align_b_world = object XY, z = align z.
+- contact_b_world = same XY, z = support gap.
+- legacy_side_contact_b_world = contact_b_world + reach_axis * forward_extension.
+- low_side_prepare_b_world = legacy side contact tru standoff, z = align z.
+- far_outboard_transition_b_world = low_side_prepare + outboard offset + vertical clearance.
+- pregrasp_b_world = low_side_prepare.
+- align_b_world = far_xy_align.
+Y nghia: target xa khong lao thang tu tren xuong, ma di qua outboard/low-side/align roi moi descend theo world Z.
+
+Dong 4440-4491, nhanh vertical/mid/near:
+- motion_policy = mid_vertical_Z_descend hoac near_body_vertical_Z_descend.
+- vertical_contact_z_world = object_support_z + vertical_point_b_gap_above_support.
+- vertical_uncorrected_reference_world = [contact_world.x, contact_world.y, vertical_contact_z].
+- Tinh lateral correction theo arm: right arm shift -baseY, left arm shift +baseY.
+- vertical_xy_reference_world = uncorrected XY + correction.
+- raw_contact_b_world = vertical_xy_reference_world.
+- Goi _point_b_target_for_xy_reference de dieu chinh point_B target neu co reference link offset.
+- pregrasp_b_world = contact_b_world + world_up * pregrasp_clearance.
+- align_b_world = contact_b_world + world_up * align_clearance.
+Y nghia: target mid/near la vertical descent, co bias lateral de sua lech inward cua arm.
+
+Dong 4493-4512:
+Convert pregrasp/align/contact/far_outboard B-world sang pose_base bang _pose_for_point_b_world.
+
+Dong 4513-4522:
+Tao micro_lift va lift point_B world/pose.
+Lift = contact_b_world + world_up * lift_height.
+
+Dong 4524-4537:
+Tao carry pose o bin center, z = bin max z + safe_drop_height.
+Tao place pose o bin center, z = max(bin_floor_top + 0.12, bin max + place_clearance).
+Retreat pose = place pose + base_up * retreat_lift.
+
+Dong 4539-4637:
+Return geometry dict rat lon.
+No luu:
+- arm side, target region, motion family/policy;
+- object center, bbox top, support z;
+- contact z, rpy, axes;
+- point_A/point_B definitions;
+- far/vertical policy details;
+- pregrasp/align/contact/lift/carry/place/retreat poses;
+- world EE origins;
+- AB semantics;
+- carry/place details;
+- approach axis.
+Day la payload debug chinh de truy nguon moi target pose.
+
+Dong 4640-4674, _plan_grasp_geometry_for_preset:
+Wrapper goi _plan_grasp_geometry voi rpy tu orientation preset.
+Them orientation_source va orientation_preset vao geometry.
+
+Dong 4677-4698, _pregrasp_candidates:
+- Lay base pregrasp_pose_base.
+- Tao 2 variant: nominal va slightly_higher.
+- slightly_higher = base_up * candidate_higher_offset.
+Neu pregrasp unreachable, day la noi chi co hai bien the height nho, chua co staging pose hay multi-candidate XY.
+
+----------------------------------------------------------------------
+Block 11: IK solve, candidate diagnostics va pregrasp acceptance
+Dong lien quan: 4701-5330
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Sync IK tu dynamic_control.
+- Solve single-arm pose.
+- Classify candidate failure.
+- Chon pregrasp candidate dau tien pass strict tolerance.
+- Ghi diagnostics khi khong co candidate pass.
+
+Giai thich tung dong/nhom dong:
+
+Dong 4701-4704, _sync_ik_from_dc:
+Doc all joint state va sync vao ik_solver.
+Day la buoc dau cua moi candidate evaluation.
+
+Dong 4707-4714, _current_ee_pose_base:
+Lay EE pose hien tai trong base frame.
+
+Dong 4717-4741, _ee_pose_base_for_arm_solution:
+Gan q solution vao solver, tinh FK EE pose, tra xyzrpy.
+
+Dong 4744-4756, _pose_error:
+Tinh position error va rotation error giua reached pose va target pose.
+
+Dong 4759-4772, _limit_joint_delta:
+Gioi han delta joint moi tick de servo khong giat.
+
+Dong 4775-4788, _ik_kwargs:
+Lay cac tham so IK tu args va override.
+
+Dong 4791-4803, _solve_single_arm_pose:
+Goi official IK solve cho mot arm.
+Tra q_sol va ok.
+
+Dong 4806-4812, _candidate_ik_overrides:
+Tra override rieng cho candidate search, vi candidate co the can tolerance/iteration khac servo.
+
+Dong 4815-4822, _finite_vector:
+Check vector finite va dung size.
+
+Dong 4825-4832, _candidate_failure_summary:
+Dem cac loai failure candidate.
+
+Dong 4835-4864, _candidate_acceptance_tolerances:
+Chon tolerance theo target_region.
+Far co the dung far_candidate_position_tolerance va far_candidate_rotation_tolerance.
+
+Dong 4867-4872, _finite_float_or_none:
+Chuyen value sang float neu finite, nguoc lai None.
+
+Dong 4875-4906, _candidate_gate_metrics:
+Tinh pass/fail theo position/rotation tolerance.
+
+Dong 4909-4977, _candidate_diagnostic_view:
+Rut gon candidate de log de doc.
+
+Dong 4980-5001, _best_candidate_by_metric va _best_candidate_diagnostics:
+Tim candidate tot nhat theo position/rotation/combined error.
+Day la payload can xem khi tat ca fail.
+
+Dong 5004-5022, _classify_candidate_result:
+Phan loai:
+- catastrophic_no_solution neu q/reached/error invalid.
+- solved_but_internal_not_ok neu IK co solution nhung solver ok false.
+- candidate_error_exceeded_tolerance neu solve duoc nhung error vuot tolerance.
+- valid_candidate neu pass.
+
+Dong 5025-5330, _evaluate_pregrasp_candidates:
+Day la noi pregrasp unreachable duoc quyet dinh trong contact-centric file.
+
+Dong 5049:
+Ghi start_step de phase log.
+
+Dong 5050:
+Sync IK tu dynamic_control.
+
+Dong 5051-5052:
+Luu reference_q va reference_pose de reset solver sau moi candidate.
+
+Dong 5053:
+Lay candidate_pos_tol/candidate_rot_tol theo region.
+
+Dong 5054-5057:
+Khoi tao preset_results, flat_results, selected, IK settings.
+
+Dong 5059-5078:
+Voi tung orientation preset, goi _plan_grasp_geometry_for_preset de tao geometry.
+
+Dong 5079:
+Lay candidate_point_b_offset tu geometry.
+
+Dong 5081:
+Duyet _pregrasp_candidates, hien chi co nominal va slightly_higher.
+
+Dong 5082:
+Reset ik_solver.q ve reference_q de moi candidate cong bang.
+
+Dong 5083-5084:
+Lay target_pose va convert sang target_pose_for_ik de log.
+
+Dong 5085-5092:
+Goi _solve_single_arm_pose.
+
+Dong 5093-5094:
+Tinh reached_pose va pose error.
+
+Dong 5095-5097:
+Check q solution, reached pose, error co finite khong.
+
+Dong 5098-5106:
+Classify candidate bang _classify_candidate_result.
+
+Dong 5108-5115:
+valid true khi:
+- q valid;
+- reached pose valid;
+- error finite;
+- position error <= tolerance;
+- rotation error <= tolerance.
+Luu y valid khong yeu cau ok true neu solved va error pass, nhung log accepted_despite_internal_not_ok.
+
+Dong 5117-5121:
+Neu valid thi failure_reason None, nguoc lai failure_reason = classification.
+
+Dong 5122-5199:
+Tao result dict chi tiet:
+- preset label/index/family/rpy;
+- AB axis/far/vertical geometry;
+- reference pose;
+- target pose;
+- dualarmik status;
+- errors/tolerance;
+- q solution;
+- target point_A/B world;
+- accepted_for_pregrasp_selection.
+
+Dong 5200-5205:
+Tao selection_record gom result + geometry + selected_orientation_preset.
+
+Dong 5206-5214:
+Neu valid va chua co selected, chon candidate dau tien strict valid.
+
+Dong 5215-5275:
+Tao preset_summary va preset_results cho log tung preset.
+
+Dong 5277:
+Reset ik_solver.q ve reference_q sau khi search.
+
+Dong 5278-5292:
+Tinh success va failure_reason tong hop:
+- no_pregrasp_candidates_generated;
+- all_candidates_catastrophic_no_solution;
+- reachable_candidates_failed_strict_acceptance;
+- mixed_candidate_reachability_failure.
+
+Dong 5293-5323:
+Tao details log voi best candidate diagnostics, tolerance, preset count, candidate_results, selected fields.
+
+Dong 5324-5329:
+Append phase select_pregrasp_candidate.
+
+Dong 5330:
+Neu khong success, _fail("pregrasp_candidate_failed", ...).
+Day la failure cap run. Neu cac log noi pre_grasp_unreachable trong script khac, logic goc van tu nhom check pregrasp IK/tolerance nay.
+
+----------------------------------------------------------------------
+Block 12: Servo executor va gripper phase
+Dong lien quan: 5333-5857
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Thuc thi mot phase servo DualArmIK.
+- Ho tro target pose dong moi tick.
+- Refresh coordinate transform.
+- Stop theo metric EE/point_B/contact reference.
+- Log trace, final error, early stop.
+
+Giai thich tung dong/nhom dong:
+
+Dong 5333-5763, _execute_dualarmik_servo_phase:
+Day la executor trung tam cho pregrasp, align, descend, lift, carry, place.
+
+Dong 5333-5355:
+Signature gom ServoSpec, ik_solver, dc, articulation, arm DOF, coord_transform, gripper, sim_app, args, phase_log, EE info.
+Co target_pose_fn optional, position_metric_offset_local va position_metric_label.
+Hai tham so metric offset nay la fix quan trong gan day de final descent stop theo contact reference thay vi EE.
+
+Dong 5356-5365:
+Khoi tao start step, trace, best error, current q/pose.
+
+Dong 5366-5395:
+Neu co target_pose_fn thi moi tick lay target pose moi.
+Neu co coord_transform_refresh_fn thi refresh transform de robot/world frame khong bi stale.
+
+Dong 5396-5428:
+Solve IK cho target pose, limit joint delta, gui position targets.
+
+Dong 5429-5468:
+Step sim, doc pose hien tai, tinh position/rotation error.
+Neu position_metric_offset_local co, metric point = EE pose + rot @ offset.
+Neu khong, fallback point_B hoac EE.
+Day la noi contact-centric final descent buoc servo dung dung metric.
+
+Dong 5469-5508:
+Cap nhat best error, trace sample theo interval.
+
+Dong 5509-5536:
+Kiem tra tolerance; neu pass va hold du thi condition_met true.
+
+Dong 5537-5575:
+Xu ly ServoEarlyStop neu per_tick_monitor hoac target_pose_fn raise.
+Early stop van duoc log voi reason/details.
+
+Dong 5576-5759:
+Append phase log voi:
+- target pose;
+- final pose/error;
+- best pose/error;
+- trace;
+- metric label;
+- extra details.
+Tra result dict.
+
+Dong 5765-5833, _command_gripper_phase:
+Mo/dong gripper bang position target va effort optional.
+Ghi gripper values, effort, steps.
+
+Dong 5836-5849, _resolve_torso_prim_path:
+Resolve torso prim path tu robot root/articulation.
+
+Dong 5852-5857, _work_area_world_from_cfg:
+Lay work area world tu config/table bbox.
+
+----------------------------------------------------------------------
+Block 13: Pre-close gate va execute_pregrasp
+Dong lien quan: 5860-6263
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Thu thap evidence truoc khi close.
+- Tinh real grasp center, runtime two-finger metrics, table clearance, selected candidate filter.
+- Execute pregrasp servo voi fallback yaw debug.
+
+Giai thich tung dong/nhom dong:
+
+Dong 5860-6176, _pre_close_gate:
+Day la ham gom diagnostics truoc close.
+
+Dong 5860-5885:
+Signature nhan stage, target, geometry, transform, IK/DC/articulation, arm/gripper, table/object/filter.
+
+Dong 5886-5905:
+Doc current EE pose, current point_B, current target/object state.
+
+Dong 5906-5935:
+Resolve real grasp center bang _resolve_real_grasp_center_world.
+Neu source close-critical false, log van co nhung khong duoc coi la proof close.
+
+Dong 5936-5965:
+Build object_grasp_frame runtime va goi _compute_runtime_two_finger_metrics.
+
+Dong 5966-6005:
+Update debug markers tip/object/contact.
+
+Dong 6006-6065:
+Tinh table clearance, orientation/alignment, support gap, drift, selected candidate pass/fail.
+
+Dong 6066-6176:
+Return payload day du:
+- close_critical_uses_real_grasp_center;
+- real_grasp_center source;
+- point_B delta;
+- runtime metrics;
+- geometry/filter;
+- table clearance;
+- object state.
+Day la input cua evaluate_close_gate.
+
+Dong 6179-6263, execute_pregrasp:
+Wrapper goi _execute_dualarmik_servo_phase cho pregrasp.
+Neu pregrasp IK fail theo yaw/orientation co the fallback yaw=0 trong mot so cau hinh.
+Muc dich la tach pregrasp servo khoi final descent contact-centric.
+
+----------------------------------------------------------------------
+Block 14: Final descent local IK contact-centric
+Dong lien quan: 6266-6922
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Dung closed-loop descent dua tren contact reference runtime.
+- Clamp step XY/Z/yaw.
+- Khong cho Z command tang len trong descent.
+- Dung contact reference offset de chuyen target ve EE pose cho DualArmIK.
+- Log samples chi tiet de quyet dinh close fallback.
+
+Giai thich tung dong/nhom dong:
+
+Dong 6266-6302:
+Signature final_descent_local_ik nhan phase, scene, target, geometry, transform, IK/DC, robot root, arm/gripper, target locked, rpy locked, point_B offset, table/object/filter.
+
+Dong 6303:
+Docstring: local closed-loop descent do real grasp center moi target refresh.
+
+Dong 6304-6316:
+Chuyen locked target/rpy/point_B offset sang numpy.
+Lay object_center_world tu geometry neu co, neu khong NaN.
+Lay step limit:
+- phase2_descent_xy_step;
+- phase2_descent_z_step;
+- phase2_descent_yaw_step.
+
+Dong 6317-6332:
+Khoi tao samples, debug samples, call_count, previous_commanded_world, last_yaw, vertical tip stop rule state.
+
+Dong 6333-6337:
+Doc initial EE pose/world rotation/point_B world.
+
+Dong 6338-6348, nested support_gap_m:
+Tinh support gap = world_pos.z - object_support_z.
+Neu khong co object_support_z hoac pos invalid thi None.
+
+Dong 6350-6361:
+Resolve initial_real_center_world.
+Fallback world la initial point_B.
+Co diagnostic bypass flag neu bat.
+
+Dong 6362-6372:
+use_real_contact_offset true chi khi:
+- real_center_world co;
+- source khong fallback_proxy;
+- close_critical_reference true.
+Neu true, contact_control_offset = initial_ee_rot_world.T @ (contact_control_world - initial_ee_world).
+Neu false, contact_control_offset = point_b_offset.
+Day la quyet dinh: final descent se dieu khien tip_mid/contact reference that neu tin cay, nguoc lai fallback point_B.
+
+Dong 6373-6379:
+Tinh delta point_B -> contact_control_reference.
+Tao nominal target pose bang _pose_for_contact_reference_world.
+
+Dong 6381-6437, nested _update_proxy_middle_point_debug_marker:
+Resolve legacy finger-link midpoint va ve marker debug.
+Neu unresolved, ghi reason.
+Neu resolved, update marker /World/DebugProxyMiddlePoint va luu component positions.
+
+Dong 6439-6551, nested monitor_vertical_tip_stop_rule:
+Theo doi tip_mid table z trong vertical descent.
+Neu tip table z <= threshold thi raise ServoEarlyStop.
+Log tip1/tip2/tip_mid table z, object top/support delta, source, fallback.
+Quan trong: day la stop/diagnostic rule, khong phai auto-pass close neu close-critical truth khong du.
+
+Dong 6553-6760, nested contact_target_pose_fn:
+Day la vong dieu khien contact-centric moi tick.
+
+Dong 6554-6557:
+Tang call_count va doc current EE pose.
+
+Dong 6558-6567:
+Resolve real_center_world moi tick.
+
+Dong 6568:
+Tinh current_point_b_world tu pose hien tai.
+
+Dong 6569-6573:
+trusted_real_center_for_descent true neu real center co va close_critical_reference true.
+
+Dong 6574-6588:
+Neu trusted, lay fingertip_midpoint_world.
+Neu khong co midpoint nhung co component tip1/tip2, tinh midpoint = 0.5*(tip1+tip2).
+
+Dong 6589-6597:
+Neu tip_mid available, measured_world = tip_mid va source = tip_mid.
+Nguoc lai measured_world = current_point_b_world va source = point_B fallback.
+
+Dong 6598-6614:
+Build descent_object_grasp_frame, them object_grasp_center_world va cac axis neu thieu.
+
+Dong 6615-6622:
+Tinh close_runtime_metrics bang _compute_runtime_two_finger_metrics.
+
+Dong 6624-6628:
+Goi monitor_vertical_tip_stop_rule.
+
+Dong 6630:
+delta = locked_target - measured_world.
+
+Dong 6631:
+xy_step = clamp_norm(delta[:2], xy_step_max).
+
+Dong 6632:
+z_step = clamp(delta.z, gioi han [-z_step_max, 0]).
+Nghia la chi cho di xuong hoac dung yen, khong cho di len.
+
+Dong 6633-6635:
+commanded_world = measured_world + xy_step va z_step.
+
+Dong 6636-6637:
+Neu command z cao hon previous_commanded z thi ep bang previous.
+Day la monotonic Z downward policy.
+
+Dong 6639-6643:
+Clamp yaw delta ve [-yaw_step_max, yaw_step_max].
+Cap nhat commanded_rpy.
+
+Dong 6644-6649:
+Chuyen commanded contact reference world thanh EE pose base bang _pose_for_contact_reference_world.
+Luu previous_commanded_world va commanded_delta_to_target.
+
+Dong 6651-6759:
+Theo trace interval, log sample rat chi tiet:
+- locked target;
+- real grasp center;
+- source;
+- tip1/tip2/tip_mid;
+- runtime metrics;
+- point_B proxy;
+- measured/commanded world;
+- support gap;
+- z/xy error;
+- command step;
+- pose conversion;
+- control_reference_source;
+- monotonic_z_downward;
+- yaw step.
+
+Dong 6761-6817:
+Goi _execute_dualarmik_servo_phase voi:
+- ServoSpec phase final descent;
+- target_pose_fn = contact_target_pose_fn;
+- position_metric_offset_local = contact_control_offset;
+- position_metric_label = contact_reference_world;
+- per_tick_monitor_fn neu vertical tip rule active;
+- extra details ve contact_centric_command_path.
+Day la noi final descent gan target dong vao servo executor.
+
+Dong 6818-6868:
+Sau servo, tinh xy_drift_stable, max_xy_step, recent_xy_drift, support_gap_values.
+
+Dong 6869-6898:
+Tinh z-stall:
+- recent_z_gap_change;
+- recent_z_progress;
+- recent_z_motion_abs;
+- stalled_in_z neu recent_z_progress <= threshold.
+Day la evidence cho vertical/runtime commit fallback.
+
+Dong 6899-6919:
+Tao phase2_log voi samples, marker updates, vertical stop samples, drift, support gap, z-stall policy.
+
+Dong 6920-6922:
+Gan phase2_local_descent vao result va phase_log cuoi, tra result.
+
+----------------------------------------------------------------------
+Block 15: Close gate, vertical fallback, runtime fallback, close debug summary
+Dong lien quan: 6925-7330
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Quyet dinh co duoc close hay khong.
+- Phan biet hard blockers va soft warnings.
+- Cho fallback khi robot da cham/gan support gap va stalled in Z.
+- Tao summary ngan de log.
+
+Giai thich tung dong/nhom dong:
+
+Dong 6925-7069, evaluate_close_gate:
+Ham nay la primary close gate.
+
+Dong 6925-6950:
+Nhan pre_close payload, geometry/filter, args.
+Doc runtime metrics va close-critical flag.
+
+Dong 6951-6990:
+Check hard blockers:
+- close-critical real grasp center khong tin cay;
+- catastrophic orientation;
+- catastrophic table clearance;
+- width ngoai range;
+- runtime metric khong primary khi can.
+
+Dong 6991-7025:
+Check pass dieu kien:
+- real center/tip_mid error <= tolerance;
+- orientation <= tolerance;
+- xy drift trong nguong;
+- table clearance pass;
+- candidate filter pass hoac chi warning tuy loai.
+
+Dong 7026-7069:
+Return dict co close_allowed, reasons, warnings, runtime_truth, thresholds.
+Y nghia: candidate metric co the la warning, nhung runtime truth va hard blockers quyet dinh close.
+
+Dong 7072-7203, evaluate_vertical_support_or_stall_close_fallback:
+Fallback cho truong hop final descent da gan support va z khong tien them.
+Dieu kien chinh:
+- support gap trong [min, max];
+- stalled_in_z;
+- xy drift on;
+- orientation ok;
+- far policy chi duoc neu allow_far_policy true.
+Day khong phai relax tuy tien; no yeu cau gan contact/support ro rang.
+
+Dong 7206-7283, evaluate_runtime_commit_fallback:
+Generic runtime commit fallback.
+Dung khi tip_mid error nho, z progress stall, xy drift nho, samples du.
+Van can runtime primary truth; neu khong, khong authorize.
+
+Dong 7286-7330, build_close_debug_summary:
+Rut gon cac metric quan trong:
+- close_allowed;
+- hard blockers;
+- support gap;
+- z stall;
+- tip_mid error;
+- source reference;
+- table clearance.
+Dung de doc log nhanh.
+
+----------------------------------------------------------------------
+Block 16: Close hai stage, short lift, recover/retry
+Dong lien quan: 7332-7525
+----------------------------------------------------------------------
+
+Muc tieu block:
+- Thuc thi gripper close co hai stage.
+- Verify lift ngan sau close.
+- Recover va retry neu fail.
+
+Giai thich tung dong/nhom dong:
+
+Dong 7332-7401, execute_two_stage_close:
+Stage A close theo fraction PHASE2_CLOSE_STAGE_A_FRACTION.
+Stage B close den target gap.
+Dung effort hold trong close/retention.
+Ghi gripper values va phase log.
+
+Dong 7404-7480, verify_short_lift:
+Nang nhe sau close.
+Do object bbox/center truoc-sau.
+Pass neu object z delta >= PHASE2_SHORT_LIFT_MIN_DELTA_M.
+Day la proof "co nam vat" truoc carry dai.
+
+Dong 7483-7525, recover_and_retry:
+Mo gripper, retreat/lift nhe, reset mot so phase de retry.
+Chi chay khi retry count con trong max.
+
+----------------------------------------------------------------------
+Block 17: main orchestration
+Dong lien quan: 7528-9931
+----------------------------------------------------------------------
+
+Muc tieu block:
+main() noi tat ca cac block tren thanh mot run Task 1.
+
+Giai thich tung dong/nhom dong:
+
+Dong 7528:
+Dinh nghia main() tra int exit code.
+
+Dong 7529-7900:
+Tao argparse va khai bao CLI.
+Nhom tham so gom:
+- path/runtime;
+- seed/target;
+- scene/robot;
+- workspace/clearance;
+- IK;
+- Phase 2 thresholds;
+- debug marker/log;
+- far/vertical policy;
+- close/fallback/retry.
+
+Dong 7901-8050:
+Parse args va validate threshold.
+Vi du table clearance min phai khong nho hon catastrophic min.
+
+Dong 8051-8150:
+Resolve HRC_ROOT, LOG_ROOT, baseline_root, asset_root, config, robot USD/URDF.
+Validate environment truoc khi load Isaac.
+
+Dong 8151-8250:
+Khoi tao SimulationApp, stage, timeline, seed.
+
+Dong 8251-8420:
+Load official SceneBuilder/config.
+Override root_path den official assets.
+Build table va Task 1 parts.
+Dung diagnostic static bin collider thay cho composed box physics neu can.
+
+Dong 8421-8550:
+Load/build robot Walker S2.
+Acquire articulation.
+Doc joint/body names.
+Apply official startup joint map.
+
+Dong 8551-8650:
+Load official IK classes, tao IK solver/coordinate transform.
+Chon EE body/path, verify EE alignment, configure compensation.
+
+Dong 8651-8750:
+Build table_frame, lay object candidate records, chon target.
+Ghi marker target/object/pregrasp neu enabled.
+
+Dong 8751-8840:
+Tinh target_components trong robot base.
+Chon arm side.
+Chon target region near/mid/far.
+Resolve TCP offset va point_B offset.
+
+Dong 8841-8950:
+Tao orientation presets theo region.
+Generate coarse candidates va Phase 2 geometric filter.
+Select best Phase 2 candidate neu co.
+
+Dong 8951-9050:
+Resolve vertical XY reference offset neu vertical policy.
+Evaluate pregrasp candidates bang DualArmIK.
+Neu khong pass, run fail truoc khi chay contact/grasp.
+
+Dong 9051-9200:
+Lay selected geometry, selected orientation, target poses.
+Chon motion policy:
+- far_low_side_B_driven;
+- mid_vertical_Z_descend;
+- near_body_vertical_Z_descend.
+
+Dong 9201-9400:
+Thuc thi motion phases.
+Far policy:
+- execute_pregrasp;
+- far outboard transition;
+- low-side prepare;
+- XY align;
+- final_descent_local_ik.
+Vertical policy:
+- execute_pregrasp;
+- align;
+- descend;
+- final_descent_local_ik.
+
+Dong 9401-9550:
+Goi _pre_close_gate.
+Goi evaluate_close_gate, evaluate_vertical_support_or_stall_close_fallback, evaluate_runtime_commit_fallback.
+Tong hop final_close_allowed.
+Neu hard block thi fail truoc close.
+
+Dong 9551-9700:
+Neu close allowed:
+- execute_two_stage_close;
+- verify_short_lift;
+- neu fail va retry duoc thi recover_and_retry.
+
+Dong 9701-9850:
+Neu grasp pass:
+- lift/carry den bin;
+- place/release;
+- retreat;
+- settle object;
+- check inside bin/stability.
+
+Dong 9851-9931:
+Build payload ket qua cuoi, ghi logs, cleanup SimulationApp, return exit code.
+Neu RunFailure/runtime error thi ghi failure_reason va traceback vao log.
+
+----------------------------------------------------------------------
+Block 18: Cac diem can doc khi debug "pregrasp unreachable"
+----------------------------------------------------------------------
+
+Neu mot run bao pregrasp unreachable/pre_grasp_unreachable, can doc theo thu tu:
+
+1. _classify_target_region, dong 3880-3885.
+Neu target bi xep far, family orientation va path khac vertical.
+
+2. _approach_family_order_for_region, dong 3888-3895.
+Neu family uu tien world_y_approach ma orientation preset lech, pregrasp co the unreachable truoc grasp.
+
+3. _plan_grasp_geometry, dong 4301-4637.
+Day la noi tinh pregrasp_b_world:
+- Far: pregrasp_b_world = low_side_prepare_b_world.
+- Vertical: pregrasp_b_world = contact_b_world + world_up * pregrasp_clearance.
+
+4. _pregrasp_candidates, dong 4677-4698.
+Hien chi co nominal va slightly_higher.
+Neu ca hai fail voi cung error, viec tang/ha depth grasp khong tac dong pregrasp nhieu.
+
+5. _evaluate_pregrasp_candidates, dong 5025-5330.
+Day la noi solve IK, tinh pos_err/rot_err, so voi tolerance va fail neu khong candidate pass.
+
+6. _candidate_acceptance_tolerances, dong 4835-4864.
+Neu error nho hon nhung tolerance qua chat, root cause co the la threshold/logic.
+Neu error lon va giong nhau qua cac grasp-depth offset, root cause nghieng ve pose/orientation/path truoc grasp.
+
+----------------------------------------------------------------------
+Block 19: Cac diem can doc khi debug close/contact-centric
+----------------------------------------------------------------------
+
+1. _resolve_real_grasp_center_world, dong 2249-2489.
+Doc source va close_critical_reference.
+Neu source la calibrated distal proxy diagnostic-only, khong duoc coi la proof close.
+
+2. _compute_runtime_two_finger_metrics, dong 1910-2054.
+Doc primary_runtime_truth, tip_mid_error, tip_axis_alignment_error, symmetry, z_asymmetry.
+
+3. final_descent_local_ik, dong 6266-6922.
+Doc measured_world_source_for_descent:
+- tip_mid: dang dung runtime truth.
+- point_B_fallback: dang fallback proxy.
+
+4. _pre_close_gate, dong 5860-6176.
+Doc close_critical_uses_real_grasp_center va table clearance.
+
+5. evaluate_close_gate, dong 6925-7069.
+Doc hard blockers truoc khi xem warnings.
+
+6. evaluate_vertical_support_or_stall_close_fallback, dong 7072-7203.
+Doc support_gap, stalled_in_z, xy drift, orientation.
+
+7. evaluate_runtime_commit_fallback, dong 7206-7283.
+Doc tip_mid error va z/xy stability.
+
+======================================================================
+3. TOM TAT THUAT TOAN THEO PSEUDOCODE
+======================================================================
+
+main():
+    parse_args()
+    validate_paths_and_thresholds()
+    start_isaac()
+    build_official_task1_scene()
+    add_diagnostic_static_bin_if_needed()
+    load_or_build_walker_s2()
+    acquire_articulation()
+    apply_official_startup_joint_map()
+    load_dualarmik()
+    build_coordinate_transform()
+    resolve_table_frame()
+    target = select_target_object()
+    target_components = project_target_to_robot_base(target.center)
+    arm = choose_arm(target_components)
+    region = classify_target_region(target_components.forward)
+    presets = orientation_presets(region, arm)
+    phase1_candidates = generate_approach_candidates(target)
+    object_grasp_frame = estimate_object_grasp_frame(target)
+    phase2_candidate = select_best_phase2_candidate(phase1_candidates, object_grasp_frame)
+    pregrasp_candidate = evaluate_pregrasp_candidates(presets, target, region)
+    geometry = pregrasp_candidate.geometry
+
+    if geometry.motion_policy == far_low_side_B_driven:
+        servo(pregrasp)
+        servo(outboard_transition)
+        servo(low_side_prepare)
+        servo(xy_align)
+        final_descent_local_ik(contact_reference)
+    else:
+        servo(pregrasp)
+        servo(align)
+        servo(descend)
+        final_descent_local_ik(contact_reference)
+
+    pre_close = pre_close_gate()
+    primary = evaluate_close_gate(pre_close)
+    vertical_fallback = evaluate_vertical_support_or_stall_close_fallback(pre_close)
+    runtime_fallback = evaluate_runtime_commit_fallback(pre_close)
+    if not any_allowed(primary, vertical_fallback, runtime_fallback):
+        fail_before_close()
+
+    execute_two_stage_close()
+    if not verify_short_lift():
+        recover_and_retry_if_allowed()
+    carry_place_release_settle()
+    score_inside_bin_and_stability()
+    write_logs()
+
+======================================================================
+4. CAC CONG THUC/QUY TAC QUAN TRONG
+======================================================================
+
+4.1. Contact z
+
+contact_z_world =
+    max(
+        bbox_top_z + descend_clearance + grasp_depth_offset,
+        table_top_z + min_ee_table_clearance
+    )
+
+Y nghia:
+- bbox_top_z + descend_clearance la muc gan mat tren cua vat.
+- grasp_depth_offset am lam target sau hon.
+- min_ee_table_clearance chan target xuong qua sat table.
+
+4.2. point_B world tu EE pose
+
+point_A_world = robot_to_world(pose_base[:3])
+rot_world = robot_world_R @ EulerXYZ(pose_base.rpy)
+point_B_world = point_A_world + rot_world @ point_b_offset_local
+
+4.3. EE pose tu point_B target
+
+point_B_base = world_to_robot(point_B_world)
+point_b_offset_base = rot_base @ point_b_offset_local
+point_A_base = point_B_base - point_b_offset_base
+pose_base = [point_A_base.x, point_A_base.y, point_A_base.z, rpy]
+
+4.4. EE pose tu contact reference target
+
+reference_base = world_to_robot(contact_reference_world)
+offset_base = rot_base @ contact_control_offset_local
+point_A_base = reference_base - offset_base
+pose_base = [point_A_base.x, point_A_base.y, point_A_base.z, rpy]
+
+Khac nhau giua 4.3 va 4.4:
+- 4.3 dung point_B proxy.
+- 4.4 dung contact_control_offset, co the la offset tu EE den fingertip midpoint runtime.
+
+4.5. Final descent step clamp
+
+delta = locked_target - measured_world
+xy_step = clamp_norm(delta.xy, phase2_descent_xy_step)
+z_step = clamp(delta.z, -phase2_descent_z_step, 0.0)
+commanded_world.xy = measured_world.xy + xy_step
+commanded_world.z = measured_world.z + z_step
+commanded_world.z khong duoc lon hon previous_commanded_world.z
+
+Y nghia:
+- XY tien tu tu ve target.
+- Z chi di xuong.
+- Neu measured target nhay, command van khong bat len tren.
+
+4.6. Close truth priority
+
+Truth priority:
+1. actual fingertip pair midpoint
+2. stable finger-link midpoint
+3. calibrated distal proxy diagnostic-only
+4. point_B fallback
+
+Quy tac:
+- Close-critical authorization can close-critical reference true.
+- Diagnostic proxy co the ve marker/log nhung khong tu no cho phep close.
+
+======================================================================
+5. NHAN XET KY THUAT VA CAC CANH BAO DEBUG
+======================================================================
+
+5.1. File nay on dinh theo huong "debuggable truoc, toi uu sau"
+
+Moi phase deu ghi details day:
+- source cua reference;
+- pose base/world;
+- point_A/point_B/contact reference;
+- IK error;
+- threshold;
+- pass/fail reason.
+
+Dieu nay dung voi Phase 3 cua du an: integration/validation truoc optimization.
+
+5.2. Khong nen tune grasp depth khi failure o approach/pregrasp
+
+Trong logic file:
+- grasp_depth_offset tac dong contact_z_world.
+- Pregrasp far/vertical co the dung contact_b_world de suy ra pregrasp, nhung neu pregrasp_error gan nhu khong doi khi thay grasp_depth_offset, thi bottleneck khong nam o depth.
+- Khi failure_phase la approach/pregrasp, can doc orientation preset, pregrasp pose construction, IK tolerance, target region va possible staging.
+
+5.3. Contact dwell/carry/place/release khong lien quan neu chua qua pregrasp
+
+Neu run fail truoc grasp_window:
+- contact dwell chua phat huy tac dung.
+- carry stabilization chua vao phase.
+- place depth chua vao phase.
+- release timing chua vao phase.
+Tune cac nhom nay luc do se tao nhieu bien nhieu hon, khong giai quyet root cause.
+
+5.4. Neu runtime truth khong resolve duoc, log phai duoc doc theo source
+
+Khi doc log:
+- source actual_fingertip_pair_midpoint la manh.
+- stable finger-link midpoint co the chap nhan tuy context.
+- calibrated distal proxy la diagnostic.
+- fallback point_B la compatibility.
+
+Khong duoc chi nhin "real_grasp_center_world" co so ma ket luan close truth hop le.
+Can xem close_critical_reference va primary_runtime_truth.
+
+======================================================================
+6. BAN DO HAM CHINH DE TRA CUU NHANH
+======================================================================
+
+Orientation:
+- _preset_euler_xyz_to_rot: dong 153
+- _preset_rot_to_euler_xyz: dong 163
+- _build_world_y_approach_presets: dong 182
+- _orientation_presets_by_arm_and_family: dong 3984
+- _region_filtered_orientation_presets: dong 4000
+
+Runtime/articulation:
+- _choose_robot_prim_path: dong 477
+- _acquire_articulation_with_fallback: dong 527
+- _coordinate_transform_from_anchor: dong 648
+- _select_coordinate_transform_with_alignment: dong 910
+
+Contact reference:
+- _resolve_actual_fingertip_pair_midpoint_reference_position: dong 1451
+- _resolve_fingertip_midpoint_reference_position: dong 1778
+- _compute_runtime_two_finger_metrics: dong 1910
+- _pose_for_contact_reference_world: dong 2057
+- _resolve_real_grasp_center_world: dong 2249
+
+Object/table:
+- build_or_resolve_table_frame: dong 2975
+- world_to_table: dong 3060
+- table_to_world: dong 3072
+- get_object_info_in_table_frame: dong 3102
+
+Candidate/filter:
+- generate_approach_candidates_for_object: dong 3160
+- estimate_object_grasp_frame: dong 3320
+- fast_geometric_grasp_filter: dong 3449
+- select_best_phase2_candidate: dong 3515
+
+Pose planning:
+- _pose_for_point_b_world: dong 4227
+- _compute_contact_z_world: dong 4288
+- _plan_grasp_geometry: dong 4301
+- _pregrasp_candidates: dong 4677
+
+IK/pregrasp:
+- _solve_single_arm_pose: dong 4791
+- _classify_candidate_result: dong 5004
+- _evaluate_pregrasp_candidates: dong 5025
+
+Servo/descent/close:
+- _execute_dualarmik_servo_phase: dong 5333
+- _pre_close_gate: dong 5860
+- execute_pregrasp: dong 6179
+- final_descent_local_ik: dong 6266
+- evaluate_close_gate: dong 6925
+- evaluate_vertical_support_or_stall_close_fallback: dong 7072
+- evaluate_runtime_commit_fallback: dong 7206
+- execute_two_stage_close: dong 7332
+- verify_short_lift: dong 7404
+
+Orchestration:
+- main: dong 7528
+
+======================================================================
+7. KET LUAN NGAN
+======================================================================
+
+scripts/task1_phase2_contact_centric_patch.py la mot pipeline Task 1 hybrid geometric + contact-centric.
+No van dung official SceneBuilder va DualArmIK, nhung bo sung mot lop truth hierarchy quanh fingertip/contact reference de tranh close dua tren proxy sai.
+Thuat toan chinh khong nam o mot ham duy nhat, ma nam o chuoi:
+geometry planning -> IK candidate validation -> servo phase -> final descent contact-centric -> pre-close gate -> close/fallback -> short lift verification.
+
+Neu can debug failure:
+- Fail truoc pregrasp: doc region, preset, _plan_grasp_geometry, _pregrasp_candidates, _evaluate_pregrasp_candidates.
+- Fail trong final descent: doc measured_world_source_for_descent, samples, z-stall, support gap.
+- Fail close: doc close_critical_reference, primary_runtime_truth, hard blockers.
+- Fail sau close: doc execute_two_stage_close, verify_short_lift, retention/carry/place logs.

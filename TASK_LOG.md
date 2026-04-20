@@ -1112,3 +1112,19 @@
   and `git diff --check -- scripts/task1_phase2_contact_centric_patch.py`.
 - Current runtime status from user feedback: still not solved; robot still has not completed the intended descend/close/grasp behavior.
 - Runtime limitation: no Linux Isaac Sim run was executed in this patch; next Linux run should verify that bad-orientation least-bad candidates fail before descent and that far hover cases can use stalled-Z fallback only when the logged support/XY/orientation gates pass.
+
+## 2026-04-20 — Task 1 contact-centric algorithm explanation document
+
+- Added Vietnamese algorithm explanation document for `scripts/task1_phase2_contact_centric_patch.py`.
+- New document path: `docs/task1_phase2_contact_centric_patch_giai_trinh_thuat_toan_vi.txt`.
+- Content covers the general contact-centric idea, major runtime/control/data-flow blocks, line-numbered code explanations, core pose/contact formulas, debug guidance, and a quick function map.
+- Documentation-only update; no runtime code, training code, or scripts changed.
+- Checks run: repo inspection only; no Isaac runtime or simulation commands were run.
+
+## 2026-04-20 — GitHub repository Vietnamese explanation document
+
+- Added Vietnamese repository explanation document for `https://github.com/Moquz27/hrc2026`.
+- New document path: `docs/github_repo_giai_trinh_vi.md`.
+- Content covers repository purpose, current phase, Task 1 plan phase, workflow, official resources, tracked file roles, script families, integration status, known risks, and next engineering direction.
+- Documentation-only update; no runtime code, training code, or scripts changed.
+- Checks run: repo inspection only; no Isaac runtime or simulation commands were run.
