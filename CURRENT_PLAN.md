@@ -24,7 +24,7 @@ Overall priorities:
 
 ## Phase 0: Baseline Source Lock
 
-Status: active
+Status: complete
 
 Goal:
 
@@ -90,9 +90,41 @@ Exit criteria status:
 
 - met in this initialization run
 
-## Phase 1: Minimal Hybrid Skeleton
+## Phase 1: Competition-Oriented Task 1 Data Collection
 
-Status: pending
+Status: active
+
+User-authorized reset on 2026-04-21:
+
+- preserve the existing deterministic manipulation backend
+- add synchronized RGB-D and simulator-truth data collection first
+- prepare evaluator and Thinker structured-output interfaces only as schemas
+- do not connect Thinker to runtime control
+- do not advance into model-based grasp generation
+
+Implemented Phase 1 outputs:
+
+- `scripts/task1_collect_rgbd_labels.py`
+- `docs/task1_data_collection_schema.md`
+- `docs/schemas/task1_thinker_structured_output.schema.json`
+- `docs/schemas/task1_evaluator_io.schema.json`
+
+The collector reuses the official `RobotArticulation.get_cameras_images(step)`
+camera interface and writes structured samples under
+`$OUTPUT_ROOT/datasets/task1_rgbd_labels/<run_id>/`.
+
+Current explicit non-goals:
+
+- no camera-first manipulation runtime
+- no evaluator runner
+- no Thinker runtime integration
+- no Thinker final grasp-pose generation
+- no changes to `DualArmIK`, coordinate transforms, planner flow, or current
+  manipulation logs
+
+## Phase 1A: Minimal Hybrid Skeleton
+
+Status: paused by user-authorized data-collection reset
 
 Goal:
 
@@ -112,32 +144,30 @@ Exit criteria:
 
 - script runs without breaking baseline infrastructure
 
-## Phase 2: Geometric Planner Hardening
+## Phase 2: Dataset Validation And Evaluator Harness
 
 Status: pending
 
 Goal:
 
-- improve grasp quality and final approach stability
+- validate collected Task 1 samples and make evaluator inputs/outputs concrete
+- keep this phase data/evaluation oriented before further manipulation tuning
 
 Required outputs:
 
-- real grasp center resolution
-- geometric filters:
-  - alignment
-  - width
-  - symmetry
-  - clearance
-  - asymmetry
-- local closed-loop descent:
-  - clamp XY
-  - clamp yaw
-  - monotonic Z
-- retry with next candidate
+- sample validator for `manifest.jsonl`, RGB/depth arrays, labels, metadata,
+  and sync debug records
+- evaluator input loader based on
+  `docs/schemas/task1_evaluator_io.schema.json`
+- minimal evaluator result writer with pass/fail/skip status and metric fields
+- sync checks for missing cameras, missing depth, bad shapes, stale simulation
+  step, and label/object-count mismatches
+- no planner, IK, coordinate-transform, or deterministic phase execution changes
 
 Exit criteria:
 
-- planner decisions no longer rely on proximity only
+- Linux run produces a small valid collection and the evaluator harness can
+  read it without ad hoc path assumptions
 
 ## Phase 3: Thinker Advisor Integration
 
@@ -178,6 +208,8 @@ Goal:
 
 - clean provider abstraction while keeping `scene_state` as the real current
   provider
+- keep Thinker/camera outputs as intermediate structured observations, not
+  final grasp poses
 
 Required outputs:
 
@@ -185,6 +217,9 @@ Required outputs:
 - `scene_state_provider` implemented
 - `yolo_provider` stub only
 - explicit `perception_source` logging
+- consume or validate
+  `docs/schemas/task1_thinker_structured_output.schema.json` only after the
+  Phase 2 evaluator/data contracts are stable
 
 Exit criteria:
 

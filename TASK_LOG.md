@@ -1136,3 +1136,18 @@
 - Converted the same explanation into Markdown headings and Vietnamese text with full diacritics while preserving source line references, formulas, function names, code identifiers, paths, and technical ordering.
 - Kept the original `.txt` file unchanged for audit comparison.
 - Documentation-only update; no runtime code, training code, or scripts changed.
+
+## 2026-04-21 — Phase 1 Task 1 synchronized RGB-D/truth collection reset
+
+- Added `scripts/task1_collect_rgbd_labels.py` as a standalone Phase 1 collector.
+- Collector scope: build official Task 1 SceneBuilder table/parts/robot, reuse official `RobotArticulation.get_cameras_images(step)`, save head left/right and wrist left/right RGB-D arrays, labels, metadata, sync debug records, and one JSONL manifest entry per sample.
+- Output structure is under `$OUTPUT_ROOT/datasets/task1_rgbd_labels/<run_id>/` with stable `rgb/`, `depth/`, `labels/`, `metadata/`, and `sync_debug/` folders.
+- Simulator truth labels include object id, class, world pose, USD robot-root base-frame pose, Task 1 table-frame pose, yaw/coarse orientation, configured semantic bin metadata, and best-effort camera projection visibility metadata.
+- Added `docs/task1_data_collection_schema.md` to document the saved dataset fields and current visibility limitations.
+- Added minimal schema-only placeholders:
+  - `docs/schemas/task1_thinker_structured_output.schema.json`
+  - `docs/schemas/task1_evaluator_io.schema.json`
+- Thinker schema is intentionally intermediate/advisory only: object candidates, class, 2D center/ROI, coarse orientation, recommended arm/preset, and confidence. It does not define final grasp poses or robot commands.
+- Preserved current manipulation backend: no edits to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, `RobotArticulation.py`, or existing Task 1 manipulation scripts.
+- Updated `CURRENT_PLAN.md` and `PROJECT_CONTEXT.md` to record the user-authorized Phase 1 data-collection reset.
+- Tests run in this pass: lightweight syntax/schema validation only; no full Isaac Sim collection run yet.
