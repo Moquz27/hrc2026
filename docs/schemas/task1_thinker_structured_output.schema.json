@@ -1,203 +1,53 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "task1_thinker_structured_output.schema.json",
-  "title": "Task 1 Thinker Structured Output",
+  "title": "Task 1 Thinker Perception Output",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version",
-    "sample_id",
-    "object_candidates"
+    "objects"
   ],
   "properties": {
-    "schema_version": {
-      "const": "0.1.0"
-    },
-    "sample_id": {
-      "type": "string"
-    },
-    "source": {
-      "type": "string",
-      "description": "Model or runtime component that produced this advisory output."
-    },
-    "object_candidates": {
+    "objects": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/object_candidate"
-      }
-    },
-    "global_recommendation": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "recommended_arm": {
-          "$ref": "#/$defs/arm"
-        },
-        "recommended_preset": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "confidence": {
-          "$ref": "#/$defs/confidence"
-        },
-        "notes": {
-          "type": "string"
-        }
+        "$ref": "#/$defs/object"
       }
     }
   },
   "$defs": {
-    "arm": {
-      "type": [
-        "string",
-        "null"
-      ],
-      "enum": [
-        "left",
-        "right",
-        "none",
-        null
-      ]
-    },
-    "confidence": {
-      "type": "number",
-      "minimum": 0.0,
-      "maximum": 1.0
-    },
-    "point_2d": {
+    "object": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "u_px",
-        "v_px"
-      ],
-      "properties": {
-        "u_px": {
-          "type": "number"
-        },
-        "v_px": {
-          "type": "number"
-        }
-      }
-    },
-    "roi_2d": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "x_px",
-        "y_px",
-        "width_px",
-        "height_px"
-      ],
-      "properties": {
-        "x_px": {
-          "type": "number"
-        },
-        "y_px": {
-          "type": "number"
-        },
-        "width_px": {
-          "type": "number",
-          "minimum": 0.0
-        },
-        "height_px": {
-          "type": "number",
-          "minimum": 0.0
-        }
-      }
-    },
-    "object_candidate": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "candidate_id",
         "class",
-        "confidence"
+        "x",
+        "y",
+        "yaw"
       ],
       "properties": {
-        "candidate_id": {
-          "type": "string"
-        },
-        "object_id": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "Optional link to simulator-truth object id during supervised/debug runs."
-        },
         "class": {
-          "type": "string"
-        },
-        "camera_name": {
-          "type": [
-            "string",
-            "null"
-          ],
+          "type": "string",
           "enum": [
-            "head_left",
-            "head_right",
-            "wrist_left",
-            "wrist_right",
-            null
+            "A",
+            "B",
+            "unknown"
           ]
         },
-        "center_2d_px": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/point_2d"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "x": {
+          "type": "number",
+          "description": "Object x position in the canonical Task 1 table frame, meters."
         },
-        "roi_2d_px": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/roi_2d"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "y": {
+          "type": "number",
+          "description": "Object y position in the canonical Task 1 table frame, meters."
         },
-        "coarse_orientation_bucket": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "enum": [
-            "front",
-            "front_left",
-            "left",
-            "back_left",
-            "back",
-            "back_right",
-            "right",
-            "front_right",
-            "unknown",
-            null
-          ]
-        },
-        "recommended_arm": {
-          "$ref": "#/$defs/arm"
-        },
-        "recommended_preset": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "confidence": {
-          "$ref": "#/$defs/confidence"
-        },
-        "notes": {
-          "type": "string"
+        "yaw": {
+          "type": "number",
+          "description": "Object yaw in the canonical Task 1 table frame, radians."
         }
       }
     }
   },
-  "description": "Advisory intermediate output only. This schema intentionally does not contain a final grasp pose, robot joint command, or permission to bypass geometric checks."
+  "description": "Minimal perception output for the future camera -> Thinker -> planner path. This schema intentionally excludes final grasp poses, robot commands, planner metadata, and evaluator fields."
 }

@@ -1151,3 +1151,15 @@
 - Preserved current manipulation backend: no edits to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, `RobotArticulation.py`, or existing Task 1 manipulation scripts.
 - Updated `CURRENT_PLAN.md` and `PROJECT_CONTEXT.md` to record the user-authorized Phase 1 data-collection reset.
 - Tests run in this pass: lightweight syntax/schema validation only; no full Isaac Sim collection run yet.
+
+## 2026-04-21 — Phase 1 Task 1 minimal competition dataset refinement
+
+- Simplified `scripts/task1_collect_rgbd_labels.py` from a research-style RGB-D/truth dump into a competition-oriented dataset writer for camera -> Thinker -> planner.
+- Default dataset output now contains only `manifest.jsonl`, `rgb/`, and `labels/`; `depth/` is written only with `--save-depth`.
+- Label JSON is now Thinker-shaped: `{"objects": [{"class": "A"|"B", "x": table_x_m, "y": table_y_m, "yaw": table_yaw_rad}]}`.
+- Removed default per-sample `metadata/`, `sync_debug/`, world pose labels, base-frame pose labels, bbox labels, target-bin metadata, planner metadata, execution result, and fail reason fields.
+- Added exported-label noise by default: XY Gaussian sigma `0.005 m` and yaw Gaussian sigma `3 deg`; flags can disable or retune noise without modifying raw simulator truth.
+- Simplified manifest entries to sample id, run id, seed, RGB paths, optional depth paths, label path, object count, and label-noise settings.
+- Simplified `docs/task1_data_collection_schema.md` and `docs/schemas/task1_thinker_structured_output.schema.json` to match the table-frame object output contract.
+- Removed the Phase 1 evaluator placeholder schema because it was premature for the minimal dataset path.
+- Preserved current manipulation backend and official camera/scene paths; no edits were made to planner, IK, coordinate transforms, `RobotArticulation.py`, or existing Task 1 manipulation scripts.

@@ -8,9 +8,9 @@ Use that file to distinguish baseline code, simulation assets, dataset resources
 
 - Current active task phase: Phase 1 - Task 1 synchronized RGB-D and simulator-truth data collection
 - Current status: user-authorized reset on 2026-04-21 to restore a competition-oriented data path before more grasp tuning
-- Phase 1 focus: collect structured Task 1 camera samples and truth labels while preserving the deterministic manipulation backend
+- Phase 1 focus: collect minimal Task 1 camera samples and table-frame object labels while preserving the deterministic manipulation backend
 - Phase 2 starts after the collector is run on Linux and the saved sample structure is validated
-- Phase 4 remains schema-only until the evaluator and Thinker interface contracts are proven against collected samples
+- Phase 4 remains deferred until the minimal Thinker label contract is proven against collected samples
 
 Older Phase 2/Phase 3 manipulation experiments remain useful history, but the
 active implementation contract is now `CURRENT_PLAN.md`.
@@ -53,7 +53,7 @@ Development Strategy:
 
 Current Focus:
 - Phase: Task 1 data collection reset
-- Goal: make official Task 1 camera observations, simulator truth labels, and runtime metadata reproducible
+- Goal: make official Task 1 camera observations and Thinker-shaped table-frame labels reproducible
 - No serious algorithm or ML optimization until collected samples and evaluator contracts are stable
 - Task 1 continuous-motion baseline now has per-object diagnostics and one-knob tuning support in `scripts/task1_smooth_autoseed_multi_object_baseline.py`.
 - Latest controlled Linux runtime sweep for seed=1 target-index=2 showed grasp-depth offsets 0.0, -0.005, and -0.010 all failed before grasp at `pre_grasp_unreachable`; next single tuning family should be approach/soft waypoint reachability, not deeper grasp or carry/place tuning.

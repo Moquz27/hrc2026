@@ -97,8 +97,9 @@ Status: active
 User-authorized reset on 2026-04-21:
 
 - preserve the existing deterministic manipulation backend
-- add synchronized RGB-D and simulator-truth data collection first
-- prepare evaluator and Thinker structured-output interfaces only as schemas
+- add minimal RGB collection with optional depth and scene-derived table-frame
+  labels first
+- keep labels aligned with the future camera -> Thinker -> planner path
 - do not connect Thinker to runtime control
 - do not advance into model-based grasp generation
 
@@ -107,11 +108,29 @@ Implemented Phase 1 outputs:
 - `scripts/task1_collect_rgbd_labels.py`
 - `docs/task1_data_collection_schema.md`
 - `docs/schemas/task1_thinker_structured_output.schema.json`
-- `docs/schemas/task1_evaluator_io.schema.json`
 
 The collector reuses the official `RobotArticulation.get_cameras_images(step)`
 camera interface and writes structured samples under
 `$OUTPUT_ROOT/datasets/task1_rgbd_labels/<run_id>/`.
+
+Current default dataset shape:
+
+- `manifest.jsonl`
+- `rgb/<sample_id>/<camera>.png` when Pillow is available, with `.npy`
+  fallback; `--rgb-format npy` can force arrays
+- `labels/<sample_id>.json`
+- optional `depth/<sample_id>/<camera>.npy` only with `--save-depth`
+
+Current label schema:
+
+```json
+{"objects": [{"class": "A", "x": 0.0, "y": 0.0, "yaw": 0.0}]}
+```
+
+Labels use the Task 1 table frame as the canonical target frame. Exported
+training labels include configurable Gaussian noise by default
+(`0.005 m` XY sigma and `3 deg` yaw sigma), but the collector does not modify
+the underlying simulator truth before export.
 
 Current explicit non-goals:
 
@@ -119,6 +138,8 @@ Current explicit non-goals:
 - no evaluator runner
 - no Thinker runtime integration
 - no Thinker final grasp-pose generation
+- no default world/base-frame labels, planner metadata, execution metadata, or
+  sync-debug folders in the dataset
 - no changes to `DualArmIK`, coordinate transforms, planner flow, or current
   manipulation logs
 
@@ -144,24 +165,23 @@ Exit criteria:
 
 - script runs without breaking baseline infrastructure
 
-## Phase 2: Dataset Validation And Evaluator Harness
+## Phase 2: Dataset Validation Harness
 
 Status: pending
 
 Goal:
 
-- validate collected Task 1 samples and make evaluator inputs/outputs concrete
+- validate collected Task 1 samples and keep the data contract concrete
 - keep this phase data/evaluation oriented before further manipulation tuning
 
 Required outputs:
 
-- sample validator for `manifest.jsonl`, RGB/depth arrays, labels, metadata,
-  and sync debug records
-- evaluator input loader based on
-  `docs/schemas/task1_evaluator_io.schema.json`
-- minimal evaluator result writer with pass/fail/skip status and metric fields
-- sync checks for missing cameras, missing depth, bad shapes, stale simulation
-  step, and label/object-count mismatches
+- sample validator for `manifest.jsonl`, RGB image/array paths, optional depth
+  arrays, and minimal table-frame label files
+- minimal dataset summary with counts for samples, cameras, depth availability,
+  object labels, and noise settings
+- lightweight checks for missing camera frames, missing labels, malformed
+  `objects`, invalid class names, and non-finite `x`, `y`, or `yaw`
 - no planner, IK, coordinate-transform, or deterministic phase execution changes
 
 Exit criteria:
