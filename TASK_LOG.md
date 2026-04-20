@@ -1158,3 +1158,12 @@
 - Candidate yaw offsets remain the existing finite Phase 1 offsets, but they are now applied around the object closing axis instead of always around table X.
 - Added per-candidate yaw diagnostics: `hand_yaw_deg`, `hand_yaw_base_deg`, `hand_yaw_base_source`, and `hand_yaw_generation`.
 - Runtime limitation: no Linux Isaac Sim run was executed on Mac; next Linux run should confirm `geometric_pass_candidate_count > 0` for table-Y closing-axis targets.
+
+## 2026-04-20 — Phase 2 Task 1 vertical XY outward-bias correction
+
+- Active file patched: `scripts/task1_phase2_contact_centric_patch.py`.
+- Issue addressed: observed small symmetric XY bias where the right hand was shifted right and the left hand was shifted left.
+- Reversed the vertical arm lateral correction direction so the right arm shifts `+baseY` and the left arm shifts `-baseY`, pulling both vertical targets inward toward the robot centerline.
+- Reduced the default `--vertical-arm-lateral-bias-correction` from `0.04` m to `0.015` m to avoid overcorrecting the small observed offset.
+- Updated motion-policy and geometry logs so the new inward correction rule is visible in runtime payloads.
+- Runtime limitation: no Linux Isaac Sim run was executed on Mac; next Linux run should compare `vertical_arm_lateral_bias_correction_base_y_m`, `vertical_xy_reference_target_xy_world`, and the observed fingertip midpoint before close.

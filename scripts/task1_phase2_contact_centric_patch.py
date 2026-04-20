@@ -250,7 +250,7 @@ DEFAULT_VERTICAL_POINT_B_GAP_ABOVE_SUPPORT = 0.001
 DEFAULT_VERTICAL_CLOSE_POINT_B_TOLERANCE = 0.005
 DEFAULT_VERTICAL_XY_REFERENCE_LINK = "finger_midpoint"
 DEFAULT_VERTICAL_XY_REFERENCE_TOLERANCE = 0.008
-DEFAULT_VERTICAL_ARM_LATERAL_BIAS_CORRECTION = 0.04
+DEFAULT_VERTICAL_ARM_LATERAL_BIAS_CORRECTION = 0.015
 VERTICAL_FINGER_MIDPOINT_REFERENCE_ALIASES = {
     "finger_midpoint",
     "fingertip_midpoint",
@@ -4485,9 +4485,9 @@ def _plan_grasp_geometry(
         vertical_contact_z_world = object_support_z_world + float(args.vertical_point_b_gap_above_support)
         vertical_uncorrected_reference_world = np.array([contact_world[0], contact_world[1], vertical_contact_z_world], dtype=float)
         vertical_lateral_correction_base_y = (
-            float(args.vertical_arm_lateral_bias_correction)
+            -float(args.vertical_arm_lateral_bias_correction)
             if arm_side == "left"
-            else -float(args.vertical_arm_lateral_bias_correction)
+            else float(args.vertical_arm_lateral_bias_correction)
         )
         vertical_lateral_correction_base = np.array([0.0, vertical_lateral_correction_base_y, 0.0], dtype=float)
         vertical_lateral_correction_world = np.array(coord_transform.robot_world_R, dtype=float) @ vertical_lateral_correction_base
@@ -4513,7 +4513,7 @@ def _plan_grasp_geometry(
             "vertical_arm_lateral_bias_correction_base_y_m": float(vertical_lateral_correction_base_y),
             "vertical_arm_lateral_bias_correction_base_vector": vertical_lateral_correction_base.tolist(),
             "vertical_arm_lateral_bias_correction_world": vertical_lateral_correction_world.tolist(),
-            "vertical_arm_lateral_bias_correction_rule": "right arm shifts -baseY; left arm shifts +baseY, opposing observed inward vertical grasp bias",
+            "vertical_arm_lateral_bias_correction_rule": "right arm shifts +baseY; left arm shifts -baseY, opposing observed outward vertical grasp bias",
             "vertical_raw_point_B_contact_mark_before_xy_reference": raw_contact_b_world.tolist(),
             "vertical_contact_mark_B_world": contact_b_world.tolist(),
             "vertical_descend_target_B_world": contact_b_world.tolist(),
@@ -4611,7 +4611,7 @@ def _plan_grasp_geometry(
         "vertical_arm_lateral_bias_correction_base_y_m": float(vertical_lateral_correction_base_y) if motion_family != "world_y_approach" else None,
         "vertical_arm_lateral_bias_correction_base_vector": vertical_lateral_correction_base.tolist() if motion_family != "world_y_approach" else None,
         "vertical_arm_lateral_bias_correction_world": vertical_lateral_correction_world.tolist() if motion_family != "world_y_approach" else None,
-        "vertical_arm_lateral_bias_correction_rule": "right arm shifts -baseY; left arm shifts +baseY, opposing observed inward vertical grasp bias" if motion_family != "world_y_approach" else None,
+        "vertical_arm_lateral_bias_correction_rule": "right arm shifts +baseY; left arm shifts -baseY, opposing observed outward vertical grasp bias" if motion_family != "world_y_approach" else None,
         "vertical_raw_point_B_contact_mark_before_xy_reference": raw_contact_b_world.tolist() if motion_family != "world_y_approach" else None,
         "vertical_xy_reference_link_log": vertical_xy_reference_log if motion_family != "world_y_approach" else None,
         "vertical_xy_reference_mode": None if motion_family == "world_y_approach" or vertical_xy_reference_log is None else vertical_xy_reference_log.get("reference_mode", "single_reference_link"),
@@ -8071,7 +8071,7 @@ def main() -> int:
                 "xy_reference_link": str(args.vertical_xy_reference_link),
                 "xy_reference_tolerance_m": float(args.vertical_xy_reference_tolerance),
                 "arm_lateral_bias_correction_m": float(args.vertical_arm_lateral_bias_correction),
-                "arm_lateral_bias_correction_rule": "right arm -baseY, left arm +baseY for vertical-only XY target correction",
+                "arm_lateral_bias_correction_rule": "right arm +baseY, left arm -baseY for vertical-only XY target correction",
                 "close_after_point_B_contact_gate": True,
             },
             "stop_after_lift": bool(args.stop_after_lift),
