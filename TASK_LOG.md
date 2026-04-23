@@ -1277,3 +1277,59 @@
 - Because no real Thinker4B outputs were available, accepted corrections were 0, rejected corrections were 0, cases improved 0, unchanged 50, worsened 0; this is a workflow/configuration validation result, not model performance.
 - Checks passed: `python3 -m py_compile scripts/task1_run_thinker4b_input_eval.py scripts/task1_input_correction.py scripts/task1_run_input_correction_eval.py` and JSON validation of the generated summary.
 - No edits were made to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, or `RobotArticulation.py`.
+
+## 2026-04-23 — Local Thinker4B setup and real recorded-camera evaluation
+
+- Inspected the Linux runtime first before installation:
+  - branch/status: `test-camera-kiet`, clean before new work
+  - no local Thinker repo, no local wrapper, no local server, and no model files were present under `CKPT_ROOT` or Hugging Face cache
+  - runtime capability was sufficient for a local checkpoint path: Python 3.13, `torch 2.7.0+cu128`, CUDA available, and one RTX 5060 Ti with 16 GB VRAM
+- Installed the minimum local inference dependencies in the current Python environment:
+  - `transformers>=4.57.0`
+  - `accelerate>=1.10.0`
+  - `safetensors`
+- Downloaded the official checkpoint outside Git to:
+  `$CKPT_ROOT/models/UBTECH-Robotics--Thinker-4B`
+- Added `scripts/thinker4b_local_infer.py` as the local command-wrapper provider:
+  - accepts direct image paths, including recorded `.npy` RGB arrays
+  - accepts the existing command-provider `request_path` JSON contract from `scripts/task1_run_thinker4b_input_eval.py`
+  - loads the local `UBTECH-Robotics/Thinker-4B` checkpoint through `Qwen3VLForConditionalGeneration` and `AutoProcessor`
+  - returns one JSON object compatible with the existing Task 1 Thinker schema
+  - keeps scope limited to input-level fields only; no grasp pose, IK, planner, or motion control
+- Direct local inference sanity check passed in the narrow sense that the model really loaded and generated output from recorded head-camera inputs; the first prompt version returned malformed JSON, then the wrapper was tightened to follow the official UBTECH path-string image usage and stricter JSON prompting
+- Real one-case harness sanity run completed successfully with local inference:
+  - command:
+    `THINKER4B_MODEL='UBTECH-Robotics/Thinker-4B' THINKER4B_MODEL_PATH="$CKPT_ROOT/models/UBTECH-Robotics--Thinker-4B" THINKER4B_CMD='python3 scripts/thinker4b_local_infer.py --max-new-tokens 512' python3 scripts/task1_run_thinker4b_input_eval.py --run-id test_phase1_initfix_1 --seeds 1 --cases-per-seed 1 --cameras head_left,head_right --no-include-truth-camera --provider command --timeout-s 600 --max-image-side 384 --output-dir "$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/sanity_1case_command" --report-path docs/output01.txt`
+  - result: `thinker_status_counts={'ok': 1}`, one per-case JSON log written, `summary.json` written, and `docs/output01.txt` written without `--allow-provider-failure`
+- Full 5-seed x 10-case run completed successfully with real local Thinker4B on every case:
+  - command:
+    `THINKER4B_MODEL='UBTECH-Robotics/Thinker-4B' THINKER4B_MODEL_PATH="$CKPT_ROOT/models/UBTECH-Robotics--Thinker-4B" THINKER4B_CMD='python3 scripts/thinker4b_local_infer.py --max-new-tokens 512' python3 scripts/task1_run_thinker4b_input_eval.py --run-id test_phase1_initfix_1 --seeds 1,2,3,4,5 --cases-per-seed 10 --cameras head_left,head_right --no-include-truth-camera --provider command --timeout-s 600 --max-image-side 384 --output-dir "$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10_local_command" --report-path docs/output01.txt`
+  - runtime outputs:
+    - `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10_local_command/summary.json`
+    - `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10_local_command/cases.jsonl`
+    - `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10_local_command/cases/*.json`
+    - `docs/output01.txt`
+  - provider result: `thinker_status_counts={'ok': 50}`
+  - aggregate result:
+    - accepted corrections `342`
+    - rejected corrections `8`
+    - cases improved `0`
+    - cases unchanged `47`
+    - cases worsened `3`
+    - before accuracy and after accuracy stayed the same:
+      - class `0.66`
+      - selected object `0.74`
+      - orientation bucket `0.50`
+      - arm recommendation `0.66`
+      - preset recommendation `0.68`
+    - mean center error:
+      - before `29.8506 px`
+      - raw Thinker `79.9819 px`
+      - after correction `29.9868 px`
+- Important interpretation:
+  - local Thinker4B was truly used for all 50 cases
+  - the correction gate prevented many harmful raw ROI/center edits, but the local Thinker outputs did not improve aggregate input quality over the deterministic original estimates
+  - accepted correction count overstates meaningful changes: inspection of the per-case logs shows `330` accepted fields were identical echoes of the original estimate and only `12` accepted fields actually changed values
+- Approximate runtime from the final preserved command-provider run: total
+  `589.541 s`, mean `11.791 s` per case
+- No edits were made to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, or `RobotArticulation.py`.

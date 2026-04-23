@@ -640,6 +640,10 @@ class CacheProvider(Thinker4BProvider):
                 continue
             case_id = record.get("case_id")
             raw = record.get("thinker4b_raw_output") or record.get("thinker_output") or record.get("raw_output")
+            if not isinstance(raw, dict):
+                thinker_block = record.get("thinker4b")
+                if isinstance(thinker_block, dict) and isinstance(thinker_block.get("raw_output"), dict):
+                    raw = thinker_block.get("raw_output")
             if isinstance(case_id, str) and isinstance(raw, dict):
                 self.by_case_id[case_id] = raw
 
@@ -919,8 +923,10 @@ def _mean_metric(logs: list[dict[str, Any]], phase: str, metric: str) -> float |
 
 def _aggregate(logs: list[dict[str, Any]], *, args: argparse.Namespace, provider_error: str | None, output_dir: Path) -> dict[str, Any]:
     total = len(logs)
+    requested_total = len(_parse_seeds(args.seeds)) * int(args.cases_per_seed)
     accepted = sum(int(log["correction_summary"]["accepted_count"]) for log in logs)
     rejected = sum(int(log["correction_summary"]["rejected_count"]) for log in logs)
+    total_runtime_s = sum(float(log.get("duration_s") or 0.0) for log in logs)
     outcomes = [log["before_after_deltas"]["case_outcome"] for log in logs]
     status_counts: dict[str, int] = {}
     for log in logs:
@@ -961,7 +967,9 @@ def _aggregate(logs: list[dict[str, Any]], *, args: argparse.Namespace, provider
             "include_truth_camera": bool(args.include_truth_camera),
         },
         "output_dir": str(output_dir),
+        "requested_case_count": requested_total,
         "case_count": total,
+        "runtime_s": total_runtime_s,
         "thinker_status_counts": status_counts,
         "accepted_ai_corrections": accepted,
         "rejected_ai_corrections": rejected,

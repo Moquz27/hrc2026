@@ -228,8 +228,8 @@ Current validation:
 
 ## Phase 2B: Thinker4B Recorded-Camera Input Evaluation
 
-Status: implemented on branch `test-camera-kiet`, provider not configured in
-the current environment
+Status: implemented on branch `test-camera-kiet` with a working local
+command-based Thinker4B path
 
 Goal:
 
@@ -252,13 +252,23 @@ Supported provider modes:
 
 Current execution:
 
-- selected 5 seeds x 10 cases from
-  `$OUTPUT_ROOT/datasets/task1_rgbd_labels/test_phase1_initfix_1`
-- wrote structured runtime logs under
-  `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10`
+- local Thinker4B wrapper: `scripts/thinker4b_local_infer.py`
+- local checkpoint root:
+  `$CKPT_ROOT/models/UBTECH-Robotics--Thinker-4B`
+- one-case sanity run completed with `provider=command` and real local
+  inference under
+  `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/sanity_1case_command`
+- full 5 seeds x 10 cases completed with `provider=command` under
+  `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10_local_command`
 - wrote the complete human-readable report to `docs/output01.txt`
-- Thinker4B provider calls were not executed successfully because no real
-  Thinker4B provider was configured in this environment
+- Thinker4B provider status: `ok` for all 50 cases
+- aggregate result: no improvement over the deterministic original input
+  estimates; `cases_improved=0`, `cases_unchanged=47`, `cases_worsened=3`
+- before/after boolean accuracies stayed the same, while mean 2D center error
+  changed from about `29.85 px` before to about `29.99 px` after correction
+- raw Thinker4B mean 2D center error was much worse at about `79.98 px`, so
+  the correction gate mostly preserved the original baseline instead of
+  applying harmful center shifts
 
 Strict non-goals remain:
 
