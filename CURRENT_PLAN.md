@@ -87,7 +87,7 @@ Exit criteria status:
 
 ## Phase 1: Synchronized Camera + Truth Collector
 
-Status: active
+Status: complete
 
 Implemented in this phase:
 
@@ -137,14 +137,52 @@ Exit criteria:
 - Linux Isaac Sim run can collect a small sample set
 - collected sample structure matches `docs/task1_data_collection_schema.md`
 
+Exit criteria status:
+
+- met for the frozen Phase 1 baseline
+- frozen baseline commit: `ee6ca51` (`Restore Task 1 RGB-D truth collector`)
+- Linux Isaac Sim smoke run:
+  `$OUTPUT_ROOT/datasets/task1_rgbd_labels/test_phase1_initfix_1`
+- smoke run validation: 3 manifest entries, 4 cameras per sample, 12 RGB
+  arrays, 12 depth arrays, 3 label files, 3 metadata files, 3 sync debug files,
+  positive depth finite counts, and 4 labeled Task 1 objects per sample
+
 ## Phase 2: Automatic Evaluator
 
-Status: pending
+Status: active
 
 Goal:
 
 - compute perception, geometry, recommendation, and task metrics from Phase 1
   samples and runtime traces
+
+Implemented in this phase:
+
+- `scripts/task1_evaluate_dataset.py`
+
+Current evaluator capabilities:
+
+- validates `manifest.jsonl`, referenced camera arrays, labels, metadata, and
+  sync debug sidecars
+- verifies four-camera RGB-D completeness for head-left, head-right,
+  wrist-left, and wrist-right
+- loads RGB/depth `.npy` arrays, checks shapes, and summarizes depth finite
+  counts
+- checks label/metadata required fields and object-count consistency
+- accepts optional direct prediction JSON/JSONL, Thinker output, geometry
+  output, planner trace, execution log, or evaluator-I/O wrapper inputs
+- computes prediction metrics when matching prediction fields are available
+
+Current validation:
+
+- real Phase 1 run
+  `$OUTPUT_ROOT/datasets/task1_rgbd_labels/test_phase1_initfix_1` passes
+  structural validation with 3 samples, 12 RGB arrays, 12 depth arrays, 3 label
+  files, 3 metadata files, 3 sync debug files, complete four-camera records,
+  positive depth finite counts, and object_count `[4]`
+- prediction metric code path was smoke-tested with synthetic truth-derived
+  predictions outside the repo; real Thinker/geometry/planner prediction inputs
+  are still pending
 
 Required metrics:
 
@@ -172,6 +210,12 @@ Required work:
 Exit criteria:
 
 - evaluator can score a Linux-collected Phase 1 sample set without ad hoc paths
+
+Exit criteria status:
+
+- structurally met for Phase 1 sample validation
+- prediction metric plumbing is implemented, but real prediction inputs are
+  still required before metric values are meaningful competition evidence
 
 ## Phase 3: Camera-Only Baseline Without Thinker Dependency
 

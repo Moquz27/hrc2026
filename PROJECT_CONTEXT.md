@@ -6,10 +6,16 @@ Use that file to distinguish baseline code, simulation assets, dataset resources
 
 ## Current Phase
 
-- Current active task phase: Phase 1 - Task 1 synchronized RGB-D and simulator-truth data collection
-- Current status: user-authorized camera-first direction reset on 2026-04-21
-- Phase 1 focus: collect synchronized head/wrist RGB-D, simulator-truth labels, runtime metadata, and sync diagnostics while preserving the deterministic manipulation backend
-- Phase 2 starts after the collector is run on Linux and the saved sample structure is validated against evaluator inputs
+- Current active task phase: Phase 2 - Task 1 automatic dataset evaluator
+- Current status: Phase 1 RGB-D/truth collector frozen after the 2026-04-21
+  camera-first reset and a passing Linux Isaac smoke run
+- Phase 1 result: synchronized head/wrist RGB-D, simulator-truth labels,
+  runtime metadata, and sync diagnostics are reproducible enough for evaluator
+  development while preserving the deterministic manipulation backend
+- Phase 2 focus: structurally validate Phase 1 samples and compute
+  prediction-vs-truth metrics when Thinker/geometry/planner/execution outputs
+  are provided
+- Current evaluator entrypoint: `scripts/task1_evaluate_dataset.py`
 - Phase 4 remains deferred until Phase 2 proves the structured perception/evaluation contract against collected samples
 
 Older Phase 2/Phase 3 manipulation experiments remain useful history, but the
@@ -103,8 +109,13 @@ Development Strategy:
 - Avoid large refactors without benchmark evidence
 
 Current Focus:
-- Phase: Task 1 data collection reset
-- Goal: make official Task 1 camera observations, simulator-truth labels, and evaluator/Thinker interface contracts reproducible
+- Phase: Task 1 automatic dataset evaluator
+- Goal: validate official Task 1 camera observations, simulator-truth labels,
+  and evaluator/Thinker interface contracts against collected samples
+- Latest evaluator validation: the real Phase 1 smoke run
+  `$OUTPUT_ROOT/datasets/task1_rgbd_labels/test_phase1_initfix_1` passes
+  structural validation; prediction metrics are implemented but await real
+  prediction/geometry/planner/execution inputs
 - No serious algorithm or ML optimization until collected samples and evaluator contracts are stable
 - Task 1 continuous-motion baseline now has per-object diagnostics and one-knob tuning support in `scripts/task1_smooth_autoseed_multi_object_baseline.py`.
 - Latest controlled Linux runtime sweep for seed=1 target-index=2 showed grasp-depth offsets 0.0, -0.005, and -0.010 all failed before grasp at `pre_grasp_unreachable`; next single tuning family should be approach/soft waypoint reachability, not deeper grasp or carry/place tuning.

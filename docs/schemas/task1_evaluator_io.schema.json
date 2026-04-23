@@ -37,6 +37,13 @@
         "manifest_path": {
           "type": "string"
         },
+        "prediction_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional direct prediction JSON/JSONL accepted by scripts/task1_evaluate_dataset.py."
+        },
         "thinker_output_path": {
           "type": [
             "string",
@@ -133,6 +140,16 @@
           "type": "string"
         }
       }
+    },
+    "structural_validation": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Extended structural validation summary emitted by scripts/task1_evaluate_dataset.py."
+    },
+    "prediction_evaluation": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Extended prediction metric counts, pending metrics, and loaded input sources emitted by scripts/task1_evaluate_dataset.py."
     }
   },
   "$defs": {
@@ -143,5 +160,5 @@
       ]
     }
   },
-  "description": "Interface placeholder for the Phase 2 automatic evaluator. It declares expected inputs and metric names only; no evaluator runtime is implemented in Phase 1."
+  "description": "Interface for the Phase 2 automatic evaluator. The core inputs/outputs fields define the stable metric contract; structural_validation and prediction_evaluation carry extended diagnostic summaries."
 }

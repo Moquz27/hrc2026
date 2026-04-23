@@ -1206,3 +1206,28 @@
 - Checks passed: `python3 -m py_compile scripts/task1_collect_rgbd_labels.py` and `python3 scripts/task1_collect_rgbd_labels.py --help`.
 - Isaac runtime validation passed with `/home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_collect_rgbd_labels.py --samples 3 --sample-stride 2 --seed 1 --run-id test_phase1_initfix_1`.
 - Runtime output validation passed: `manifest.jsonl` has 3 entries, 12 RGB arrays, 12 depth arrays, 3 label files, 3 metadata files, 3 sync debug files, 4 cameras per sample, positive depth `finite_count` for all first-sample cameras, and label `object_count` matches 4 spawned Task 1 parts.
+
+## 2026-04-21 — Phase 1 baseline freeze before evaluator implementation
+
+- Git status before freeze: clean and synced with `origin/main`; no modified or untracked files were present.
+- Frozen Phase 1 baseline commit: `ee6ca51` (`Restore Task 1 RGB-D truth collector`).
+- Confirmed the frozen baseline is the fuller synchronized RGB-D/truth collector, not the older simplified table-label-only collector.
+- Real Linux smoke run selected as the first evaluator validation input:
+  `$OUTPUT_ROOT/datasets/task1_rgbd_labels/test_phase1_initfix_1`.
+- Updated `CURRENT_PLAN.md` and `PROJECT_CONTEXT.md` so Phase 1 is marked complete and Phase 2 automatic evaluator work is active.
+- Manipulation backend files remain out of scope: no edits to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, or `RobotArticulation.py`.
+
+## 2026-04-21 — Phase 2 Task 1 dataset evaluator baseline
+
+- Added `scripts/task1_evaluate_dataset.py` as the standalone Phase 2 evaluator entrypoint.
+- Structural validation covers `manifest.jsonl`, referenced RGB/depth files, four-camera completeness, `.npy` loadability and shape checks, depth finite-count summaries, labels, metadata, sync debug records, and object-count consistency.
+- Optional prediction inputs are supported through direct JSON/JSONL plus Thinker, geometry, planner trace, execution log, or evaluator-I/O wrapper paths.
+- Implemented metrics: class accuracy, selected-object accuracy, 2D center error, yaw bucket accuracy, arm recommendation accuracy, preset recommendation accuracy, 3D/table-frame position error, task success rate, wrong-bin rate, drop rate, and cycle time.
+- Real validation command:
+  `python3 scripts/task1_evaluate_dataset.py --dataset-root "$OUTPUT_ROOT/datasets/task1_rgbd_labels/test_phase1_initfix_1" --report "$OUTPUT_ROOT/metrics/task1_dataset_eval_test_phase1_initfix_1.json" --strict`
+- Also verified run-id resolution without an absolute dataset path:
+  `python3 scripts/task1_evaluate_dataset.py --run-id test_phase1_initfix_1 --report "$OUTPUT_ROOT/metrics/task1_dataset_eval_test_phase1_initfix_1_by_run_id.json" --strict`
+- Real validation result: structural PASS with 3 samples, 12 RGB arrays, 12 depth arrays, 3 label files, 3 metadata files, 3 sync debug files, complete four-camera records, depth finite counts positive for all cameras, and object_count `[4]`.
+- Prediction metric status on the real run: pending because no real prediction/Thinker/geometry/planner/execution inputs were provided.
+- Synthetic prediction smoke check outside the repo confirmed the implemented metric path can compute class accuracy, yaw bucket accuracy, and 3D table-frame position error from matching object predictions.
+- No edits were made to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, or `RobotArticulation.py`.
