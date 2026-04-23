@@ -1254,3 +1254,26 @@
 - Before/after synthetic-case metrics: class accuracy 0.6 -> 0.9, selected-object accuracy 0.7 -> 1.0, mean 2D center error 28.95 px -> 7.37 px, orientation accuracy 0.5 -> 0.8, arm recommendation accuracy 0.7 -> 1.0, preset recommendation accuracy 0.7 -> 1.0.
 - Important limitation: cases use deterministic synthetic AI outputs generated from Phase 1 truth to test gating and metric plumbing; this is not real Thinker runtime performance.
 - No edits were made to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, or `RobotArticulation.py`.
+
+## 2026-04-23 — Task 1 Thinker4B recorded-camera input evaluation workflow
+
+- Added `scripts/task1_run_thinker4b_input_eval.py`.
+- Added `docs/task1_thinker4b_input_eval.md`.
+- Generated `docs/output01.txt` as the required human-readable report containing all 50 selected cases.
+- Workflow scope: recorded-camera input evaluation only; no robot execution, no final 3D grasp pose, no IK, no planner integration, no motion control, and no manipulation backend changes.
+- Supported Thinker4B provider modes:
+  - OpenAI-compatible vision chat endpoint through `THINKER4B_API_BASE`, `THINKER4B_MODEL`, and optional `THINKER4B_API_KEY`
+  - Ollama-compatible local server
+  - command wrapper through `THINKER4B_CMD`
+  - cache replay for previously generated real Thinker4B outputs
+- Runtime command executed in this environment:
+  `python3 scripts/task1_run_thinker4b_input_eval.py --run-id test_phase1_initfix_1 --seeds 1,2,3,4,5 --cases-per-seed 10 --output-dir "$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10" --report-path docs/output01.txt --allow-provider-failure`
+- Runtime outputs:
+  - `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10/summary.json`
+  - `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10/cases.jsonl`
+  - `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10/cases/*.json`
+- Execution result: 50 cases selected and logged across seeds 1, 2, 3, 4, and 5 with 10 cases per seed.
+- Thinker4B result: 50/50 provider calls failed before inference because no `THINKER4B_API_BASE`, `THINKER4B_MODEL`, `THINKER4B_CMD`, Ollama Thinker4B server, or cached real Thinker outputs were configured in the current environment.
+- Because no real Thinker4B outputs were available, accepted corrections were 0, rejected corrections were 0, cases improved 0, unchanged 50, worsened 0; this is a workflow/configuration validation result, not model performance.
+- Checks passed: `python3 -m py_compile scripts/task1_run_thinker4b_input_eval.py scripts/task1_input_correction.py scripts/task1_run_input_correction_eval.py` and JSON validation of the generated summary.
+- No edits were made to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, or `RobotArticulation.py`.

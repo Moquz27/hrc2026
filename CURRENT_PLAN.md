@@ -226,6 +226,48 @@ Current validation:
   and AI estimates to test gating and metrics plumbing
 - this is not evidence of real Thinker runtime performance
 
+## Phase 2B: Thinker4B Recorded-Camera Input Evaluation
+
+Status: implemented on branch `test-camera-kiet`, provider not configured in
+the current environment
+
+Goal:
+
+- run Thinker4B on recorded Phase 1 camera inputs, apply input correction, and
+  compare original / Thinker4B / corrected input fields against truth
+
+Implemented in this experiment:
+
+- `scripts/task1_run_thinker4b_input_eval.py`
+- `docs/task1_thinker4b_input_eval.md`
+- `docs/output01.txt`
+
+Supported provider modes:
+
+- OpenAI-compatible vision chat endpoint via `THINKER4B_API_BASE`,
+  `THINKER4B_MODEL`, and optional `THINKER4B_API_KEY`
+- Ollama-compatible local server
+- command-wrapper provider via `THINKER4B_CMD`
+- cache provider for replaying previously generated real Thinker4B outputs
+
+Current execution:
+
+- selected 5 seeds x 10 cases from
+  `$OUTPUT_ROOT/datasets/task1_rgbd_labels/test_phase1_initfix_1`
+- wrote structured runtime logs under
+  `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10`
+- wrote the complete human-readable report to `docs/output01.txt`
+- Thinker4B provider calls were not executed successfully because no real
+  Thinker4B provider was configured in this environment
+
+Strict non-goals remain:
+
+- no robot execution
+- no final grasp pose
+- no IK or planner integration
+- no manipulation backend changes
+- no runtime motion control
+
 Required metrics:
 
 - class accuracy

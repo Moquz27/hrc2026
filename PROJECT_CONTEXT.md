@@ -19,6 +19,8 @@ Use that file to distinguish baseline code, simulation assets, dataset resources
 - Current experiment branch: `test-camera-kiet`
 - Current experiment scope: offline AI input correction only; no full Thinker
   runtime, no final grasp-pose generation, no planner/IK/motion integration
+- Current Thinker4B input-eval entrypoint:
+  `scripts/task1_run_thinker4b_input_eval.py`
 - Phase 4 remains deferred until Phase 2 proves the structured perception/evaluation contract against collected samples
 
 Older Phase 2/Phase 3 manipulation experiments remain useful history, but the
@@ -122,6 +124,10 @@ Current Focus:
 - Current input-correction experiment: `scripts/task1_run_input_correction_eval.py`
   runs 10 offline cases and writes per-case logs plus a summary under
   `$OUTPUT_ROOT/test_runs/task1_input_correction_eval/`
+- Current Thinker4B recorded-camera evaluation: 5 seeds x 10 cases are selected
+  and logged by `scripts/task1_run_thinker4b_input_eval.py`; the present
+  environment has no configured Thinker4B provider, so `docs/output01.txt`
+  records provider failures rather than real model performance
 - No serious algorithm or ML optimization until collected samples and evaluator contracts are stable
 - Task 1 continuous-motion baseline now has per-object diagnostics and one-knob tuning support in `scripts/task1_smooth_autoseed_multi_object_baseline.py`.
 - Latest controlled Linux runtime sweep for seed=1 target-index=2 showed grasp-depth offsets 0.0, -0.005, and -0.010 all failed before grasp at `pre_grasp_unreachable`; next single tuning family should be approach/soft waypoint reachability, not deeper grasp or carry/place tuning.
