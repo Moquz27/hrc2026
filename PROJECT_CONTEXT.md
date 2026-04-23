@@ -16,6 +16,9 @@ Use that file to distinguish baseline code, simulation assets, dataset resources
   prediction-vs-truth metrics when Thinker/geometry/planner/execution outputs
   are provided
 - Current evaluator entrypoint: `scripts/task1_evaluate_dataset.py`
+- Current experiment branch: `test-camera-kiet`
+- Current experiment scope: offline AI input correction only; no full Thinker
+  runtime, no final grasp-pose generation, no planner/IK/motion integration
 - Phase 4 remains deferred until Phase 2 proves the structured perception/evaluation contract against collected samples
 
 Older Phase 2/Phase 3 manipulation experiments remain useful history, but the
@@ -116,6 +119,9 @@ Current Focus:
   `$OUTPUT_ROOT/datasets/task1_rgbd_labels/test_phase1_initfix_1` passes
   structural validation; prediction metrics are implemented but await real
   prediction/geometry/planner/execution inputs
+- Current input-correction experiment: `scripts/task1_run_input_correction_eval.py`
+  runs 10 offline cases and writes per-case logs plus a summary under
+  `$OUTPUT_ROOT/test_runs/task1_input_correction_eval/`
 - No serious algorithm or ML optimization until collected samples and evaluator contracts are stable
 - Task 1 continuous-motion baseline now has per-object diagnostics and one-knob tuning support in `scripts/task1_smooth_autoseed_multi_object_baseline.py`.
 - Latest controlled Linux runtime sweep for seed=1 target-index=2 showed grasp-depth offsets 0.0, -0.005, and -0.010 all failed before grasp at `pre_grasp_unreachable`; next single tuning family should be approach/soft waypoint reachability, not deeper grasp or carry/place tuning.

@@ -1231,3 +1231,26 @@
 - Prediction metric status on the real run: pending because no real prediction/Thinker/geometry/planner/execution inputs were provided.
 - Synthetic prediction smoke check outside the repo confirmed the implemented metric path can compute class accuracy, yaw bucket accuracy, and 3D table-frame position error from matching object predictions.
 - No edits were made to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, or `RobotArticulation.py`.
+
+## 2026-04-23 — Branch setup for input-correction experiment
+
+- Started from `main` with uncommitted Phase 2 evaluator changes.
+- Checks before committing evaluator baseline: `python3 -m py_compile scripts/task1_evaluate_dataset.py scripts/task1_collect_rgbd_labels.py`, schema JSON validation for evaluator/Thinker schemas, and `git diff --check`.
+- Committed the evaluator baseline on `main` as `10593a6` with message `Add Task 1 dataset evaluator`.
+- Created and switched to branch `test-camera-kiet`.
+- Pushed `test-camera-kiet` to origin before starting new implementation work.
+
+## 2026-04-23 — Task 1 AI input-correction evaluation workflow
+
+- Added `scripts/task1_input_correction.py` as a lightweight modular correction layer for input-level fields only.
+- Added `scripts/task1_run_input_correction_eval.py` for offline 10-case correction evaluation.
+- Added `docs/task1_input_correction_eval_format.md` documenting the JSON case format and output layout.
+- Supported correction targets: selected object id, class, 2D center, ROI, orientation bucket, recommended arm, and recommended preset.
+- Correction gates: configurable confidence threshold, allowed object-id check, center/ROI large-correction rejection, enum validation, and forbidden-field ignoring for grasp poses, 3D pose/position overwrites, joint commands, motion commands, trajectories, and waypoints.
+- Outputs are written outside the repo under `$OUTPUT_ROOT/test_runs/task1_input_correction_eval/` with one JSON file per case plus `summary.json`.
+- Validation command:
+  `python3 scripts/task1_run_input_correction_eval.py --run-id test_phase1_initfix_1 --limit 10 --output-dir "$OUTPUT_ROOT/test_runs/task1_input_correction_eval/test_phase1_initfix_1_kiet"`
+- Validation result: 10 generated offline cases completed; accepted AI corrections 64, rejected AI corrections 6, cases improved 10, unchanged 0, worsened 0.
+- Before/after synthetic-case metrics: class accuracy 0.6 -> 0.9, selected-object accuracy 0.7 -> 1.0, mean 2D center error 28.95 px -> 7.37 px, orientation accuracy 0.5 -> 0.8, arm recommendation accuracy 0.7 -> 1.0, preset recommendation accuracy 0.7 -> 1.0.
+- Important limitation: cases use deterministic synthetic AI outputs generated from Phase 1 truth to test gating and metric plumbing; this is not real Thinker runtime performance.
+- No edits were made to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, or `RobotArticulation.py`.

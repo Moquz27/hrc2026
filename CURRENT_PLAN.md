@@ -184,6 +184,48 @@ Current validation:
   predictions outside the repo; real Thinker/geometry/planner prediction inputs
   are still pending
 
+## Phase 2A: Input-Correction Experiment
+
+Status: active on branch `test-camera-kiet`
+
+Goal:
+
+- evaluate whether AI can improve input-level fields before any full runtime,
+  planner, IK, or motion integration
+
+Implemented in this experiment:
+
+- `scripts/task1_input_correction.py`
+- `scripts/task1_run_input_correction_eval.py`
+- `docs/task1_input_correction_eval_format.md`
+
+Allowed correction targets:
+
+- selected object id
+- class
+- 2D center or ROI
+- coarse orientation bucket
+- recommended arm
+- recommended preset
+
+Strict non-goals:
+
+- no simulator-truth edits
+- no final 3D grasp-pose generation
+- no direct 3D pose overwrite
+- no planner backend changes
+- no `DualArmIK` changes
+- no execution-phase changes
+- no full Thinker runtime integration
+
+Current validation:
+
+- offline 10-case run on the collected Phase 1 smoke dataset completed under
+  `$OUTPUT_ROOT/test_runs/task1_input_correction_eval/test_phase1_initfix_1_kiet`
+- cases were generated from Phase 1 truth with deterministic synthetic original
+  and AI estimates to test gating and metrics plumbing
+- this is not evidence of real Thinker runtime performance
+
 Required metrics:
 
 - class accuracy
