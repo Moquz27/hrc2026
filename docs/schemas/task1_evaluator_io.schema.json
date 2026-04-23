@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "task1_evaluator_io.schema.json",
+  "title": "Task 1 Phase 2 Evaluator I/O",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "inputs",
+    "outputs"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1.0"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "sample_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifest_path",
+        "dataset_root"
+      ],
+      "properties": {
+        "dataset_root": {
+          "type": "string"
+        },
+        "manifest_path": {
+          "type": "string"
+        },
+        "thinker_output_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "geometry_output_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "planner_trace_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution_log_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "metrics"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "skip"
+          ]
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "class_accuracy": {
+              "$ref": "#/$defs/metric_number",
+              "description": "Fraction of object class predictions matching Phase 1 truth labels."
+            },
+            "selected_object_accuracy": {
+              "$ref": "#/$defs/metric_number",
+              "description": "Fraction of selected object ids matching the evaluator reference selection."
+            },
+            "center_2d_error_px": {
+              "$ref": "#/$defs/metric_number",
+              "description": "2D center error in image pixels."
+            },
+            "yaw_bucket_accuracy": {
+              "$ref": "#/$defs/metric_number",
+              "description": "Accuracy of coarse orientation buckets; reference frame must be documented by the evaluator."
+            },
+            "arm_recommendation_accuracy": {
+              "$ref": "#/$defs/metric_number"
+            },
+            "preset_recommendation_accuracy": {
+              "$ref": "#/$defs/metric_number"
+            },
+            "conversion_3d_error_m": {
+              "$ref": "#/$defs/metric_number",
+              "description": "3D conversion error in meters, expected to compare against table-frame truth unless the evaluator states another frame."
+            },
+            "task_success_rate": {
+              "$ref": "#/$defs/metric_number"
+            },
+            "wrong_bin_rate": {
+              "$ref": "#/$defs/metric_number"
+            },
+            "drop_rate": {
+              "$ref": "#/$defs/metric_number"
+            },
+            "cycle_time_s": {
+              "$ref": "#/$defs/metric_number"
+            }
+          }
+        },
+        "failure_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "metric_number": {
+      "type": [
+        "number",
+        "null"
+      ]
+    }
+  },
+  "description": "Interface placeholder for the Phase 2 automatic evaluator. It declares expected inputs and metric names only; no evaluator runtime is implemented in Phase 1."
+}

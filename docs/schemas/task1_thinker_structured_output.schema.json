@@ -1,53 +1,161 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "task1_thinker_structured_output.schema.json",
-  "title": "Task 1 Thinker Perception Output",
+  "title": "Task 1 Thinker Structured Perception Output",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "objects"
+    "frame_id",
+    "objects",
+    "global_confidence"
   ],
   "properties": {
+    "frame_id": {
+      "type": "string",
+      "description": "Camera frame, sample id, or runtime observation id."
+    },
     "objects": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/object"
+        "$ref": "#/$defs/object_candidate"
       }
+    },
+    "selected_object_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional advisory object selection. Geometry/planner code must still validate it."
+    },
+    "global_confidence": {
+      "$ref": "#/$defs/confidence"
     }
   },
   "$defs": {
-    "object": {
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "arm": {
+      "type": "string",
+      "enum": [
+        "left",
+        "right"
+      ]
+    },
+    "object_class": {
+      "type": "string",
+      "enum": [
+        "A",
+        "B",
+        "unknown"
+      ]
+    },
+    "roi": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        }
+      ],
+      "minItems": 4,
+      "maxItems": 4,
+      "description": "[x1, y1, x2, y2] pixel ROI."
+    },
+    "center_2d": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2,
+      "description": "[u, v] pixel center."
+    },
+    "object_candidate": {
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "object_id",
         "class",
-        "x",
-        "y",
-        "yaw"
+        "orientation_bucket",
+        "difficulty",
+        "occlusion",
+        "confidence",
+        "recommended_arm",
+        "recommended_preset"
       ],
-      "properties": {
-        "class": {
-          "type": "string",
-          "enum": [
-            "A",
-            "B",
-            "unknown"
+      "anyOf": [
+        {
+          "required": [
+            "roi"
           ]
         },
-        "x": {
-          "type": "number",
-          "description": "Object x position in the canonical Task 1 table frame, meters."
+        {
+          "required": [
+            "center_2d"
+          ]
+        }
+      ],
+      "properties": {
+        "object_id": {
+          "type": "string"
         },
-        "y": {
-          "type": "number",
-          "description": "Object y position in the canonical Task 1 table frame, meters."
+        "class": {
+          "$ref": "#/$defs/object_class"
         },
-        "yaw": {
-          "type": "number",
-          "description": "Object yaw in the canonical Task 1 table frame, radians."
+        "roi": {
+          "$ref": "#/$defs/roi"
+        },
+        "center_2d": {
+          "$ref": "#/$defs/center_2d"
+        },
+        "orientation_bucket": {
+          "type": "string",
+          "enum": [
+            "front",
+            "front_left",
+            "left",
+            "back_left",
+            "back",
+            "back_right",
+            "right",
+            "front_right",
+            "unknown"
+          ],
+          "description": "Coarse visual orientation bucket. It is an intermediate perception output, not a final 6D grasp pose. Evaluator comparisons should document whether the reference bucket came from table-frame yaw or another frame."
+        },
+        "difficulty": {
+          "$ref": "#/$defs/confidence"
+        },
+        "occlusion": {
+          "$ref": "#/$defs/confidence"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        },
+        "recommended_arm": {
+          "$ref": "#/$defs/arm"
+        },
+        "recommended_preset": {
+          "type": "string"
         }
       }
     }
   },
-  "description": "Minimal perception output for the future camera -> Thinker -> planner path. This schema intentionally excludes final grasp poses, robot commands, planner metadata, and evaluator fields."
+  "description": "Intermediate structured visual understanding output for camera -> depth/geometry -> planner. This schema intentionally excludes final 6D grasp poses, joint commands, motion phases, and direct continuous control."
 }

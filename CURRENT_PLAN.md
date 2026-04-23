@@ -2,265 +2,256 @@
 
 ## Plan Authority
 
-This file is the active implementation source of truth for the Task 1 hybrid
-grasp project. If this file and older logs or context disagree, this file wins.
+This file is the active implementation source of truth for the Task 1 Walker
+S2 project. If this file and older logs or context disagree, this file wins.
 
 Codex must only implement the current phase unless the user explicitly
 authorizes a phase change. After each implementation run, Codex must update
 `TASK_LOG.md` and, if relevant, `CURRENT_PLAN.md` and `PROJECT_CONTEXT.md`.
 
-## Project
+## Project Direction
 
-Task 1 hybrid geometric grasp planner with `scene_state` now and Thinker later.
+Task 1 final competition runtime must be camera-first.
+
+The final runtime observation source is head and wrist RGB-D camera data.
+Simulator ground truth is allowed for dataset labeling, evaluation, debugging,
+and controlled bootstrapping, but not as the final competition runtime input.
+
+Preserve:
+
+- deterministic phase-based execution
+- `DualArmIK` as the execution backend
+- existing coordinate transform conventions
+- useful `grasp_planner.py` logic for arm choice, TCP offsets, grasp target
+  construction, and robot-specific geometry
+
+Do not implement:
+
+- end-to-end image-to-action control
+- Thinker direct final 6D grasp pose generation
+- Thinker direct joint or per-frame motion control
+- silent frame-convention changes
+- broad manipulation-stack rewrites
+
+Target architecture:
+
+```text
+camera input
+-> structured perception / Thinker output
+-> depth + geometry + transforms
+-> grasp-relevant 3D state
+-> compact candidate grasp generation
+-> robot-specific rescoring
+-> deterministic planner
+-> DualArmIK
+-> execution phases
+```
 
 Overall priorities:
 
-- competition reliability first
-- deterministic behavior first
-- simple debugging first
-- preserve baseline compatibility
-- modular future perception swap
-- Thinker never controls joints
+- correctness with respect to competition direction
+- runtime stability
+- simplicity and debuggability
+- reproducibility
+- baseline compatibility
+- performance optimization only after a stable baseline exists
 
-## Phase 0: Baseline Source Lock
+## Phase 0: Context Reset
 
 Status: complete
 
 Goal:
 
-- choose the best existing Task 1 script as the source to fork from
+- record the old direction versus the new camera-first direction
+- separate confirmed repository facts from inferred architecture and items that
+  still need Linux runtime testing
+- preserve the selected deterministic manipulation source and backend
 
-Selected source file path:
+Confirmed source file to preserve for deterministic manipulation:
 
 - `scripts/task1_dualarmik_phase_baseline.py`
 
-Short justification:
+Confirmed subsystems to preserve:
 
-- Scene setup: uses official `Part_Sorting.yaml` through the organizer
-  `SceneBuilder`, overrides the asset root to the verified challenge assets,
-  builds Task 1 table, parts, and Walker S2, and preserves the diagnostic static
-  bin collider workaround for the known composed-box physics issue.
-- Robot loading: builds Walker S2 via `SceneBuilder.build_robot`, detects and
-  acquires the articulation with fallback paths, loads the official startup
-  joint map, and uses the official `DualArmIK` / `CoordinateTransform` classes.
-- Motion structure: has an explicit gated phase sequence for pregrasp,
-  alignment, descend, close, micro-lift, lift, carry/place, release, and
-  retreat, with region-aware approach families and deterministic candidate
-  evaluation.
-- Logging quality: writes rolling and per-run logs under `LOG_ROOT`, with
-  target selection, phase logs, object trace, candidate diagnostics,
-  coordinate/EE-frame diagnostics, and real-grasp-center diagnostics.
-- Simplicity: it is not the smallest Task 1 script, but it is the best safe
-  fork point among the current candidates because it keeps the latest official
-  IK path and safety gates. `scripts/task1_dualarmik_phase_nogate.py` is a
-  diagnostic bypass copy, not a baseline source.
-
-Subsystems to preserve:
-
-- official Task 1 `SceneBuilder` table, part, and robot setup
-- asset-root override through environment-derived paths
-- diagnostic static bin collider workaround
-- target selection records and object/category extraction
-- official startup joint map and arm/gripper DOF selection
-- official gripper open/close widths and sustained grip effort
-- `DualArmIK` / `CoordinateTransform` loading
-- coordinate transform and EE-frame diagnostics
-- deterministic pregrasp candidate evaluation
-- phase logging and object-centric success/failure checks
-- pregrasp / align / descend / close / micro-lift / lift / carry / place /
-  release / retreat phase structure
-- mandatory contact and safety gates; no-gate behavior stays diagnostic only
-
-Required outputs:
-
-- selected source file path
-- short justification based on:
-  - scene setup
-  - robot loading
-  - motion structure
-  - logging quality
-  - simplicity
-- list of subsystems to preserve
-
-Exit criteria:
-
-- source file chosen and documented
+- official Task 1 `SceneBuilder` setup
+- official `RobotArticulation` camera wrapper
+- `DualArmIK`
+- `CoordinateTransform`
+- deterministic grasp/planner flow and logs
+- current Task 1 manipulation scripts unless a future phase explicitly patches
+  them
 
 Exit criteria status:
 
-- met in this initialization run
+- met in this reset run
 
-## Phase 1: Competition-Oriented Task 1 Data Collection
+## Phase 1: Synchronized Camera + Truth Collector
 
 Status: active
 
-User-authorized reset on 2026-04-21:
-
-- preserve the existing deterministic manipulation backend
-- add minimal RGB collection with optional depth and scene-derived table-frame
-  labels first
-- keep labels aligned with the future camera -> Thinker -> planner path
-- do not connect Thinker to runtime control
-- do not advance into model-based grasp generation
-
-Implemented Phase 1 outputs:
+Implemented in this phase:
 
 - `scripts/task1_collect_rgbd_labels.py`
 - `docs/task1_data_collection_schema.md`
 - `docs/schemas/task1_thinker_structured_output.schema.json`
+- `docs/schemas/task1_evaluator_io.schema.json`
 
-The collector reuses the official `RobotArticulation.get_cameras_images(step)`
-camera interface and writes structured samples under
-`$OUTPUT_ROOT/datasets/task1_rgbd_labels/<run_id>/`.
+Collector requirements:
 
-Current default dataset shape:
+- build the official Task 1 scene through the organizer-provided setup
+- use `RobotArticulation.get_cameras_images(step)` for camera capture
+- record head-left, head-right, wrist-left, and wrist-right RGB-D
+- write simulator-truth labels for each spawned Task 1 object
+- include object id, class, world pose, USD robot-root base-frame pose,
+  table-frame pose, yaw/coarse orientation, target-bin metadata, and best-effort
+  projection visibility
+- write runtime metadata for chosen object, chosen arm, chosen preset, chosen
+  candidate, planner target, execution result, fail reason, simulation step,
+  and timestamp
+- write synchronization debug records that help diagnose missing cameras, depth,
+  shape mismatches, and capture timing
+- keep all outputs under `$OUTPUT_ROOT/datasets/task1_rgbd_labels/<run_id>/`
 
-- `manifest.jsonl`
-- `rgb/<sample_id>/<camera>.png` when Pillow is available, with `.npy`
-  fallback; `--rgb-format npy` can force arrays
-- `labels/<sample_id>.json`
-- optional `depth/<sample_id>/<camera>.npy` only with `--save-depth`
+Current output shape:
 
-Current label schema:
-
-```json
-{"objects": [{"class": "A", "x": 0.0, "y": 0.0, "yaw": 0.0}]}
+```text
+<run_id>/
+  run_metadata.json
+  manifest.jsonl
+  rgb/<sample_id>/<camera>.npy
+  depth/<sample_id>/<camera>.npy
+  labels/<sample_id>.json
+  metadata/<sample_id>.json
+  sync_debug/<sample_id>.json
 ```
 
-Labels use the Task 1 table frame as the canonical target frame. Exported
-training labels include configurable Gaussian noise by default
-(`0.005 m` XY sigma and `3 deg` yaw sigma), but the collector does not modify
-the underlying simulator truth before export.
+Important boundary:
 
-Current explicit non-goals:
-
-- no camera-first manipulation runtime
-- no evaluator runner
-- no Thinker runtime integration
-- no Thinker final grasp-pose generation
-- no default world/base-frame labels, planner metadata, execution metadata, or
-  sync-debug folders in the dataset
-- no changes to `DualArmIK`, coordinate transforms, planner flow, or current
-  manipulation logs
-
-## Phase 1A: Minimal Hybrid Skeleton
-
-Status: paused by user-authorized data-collection reset
-
-Goal:
-
-- create a new Task 1 script copied from the selected source
-- get a minimal hybrid pipeline running without Thinker
-
-Required outputs:
-
-- new script file in `scripts/`
-- `scene_state`-only perception
-- normalized `object_info`
-- simple candidate generation
-- deterministic candidate selection
-- pregrasp / descend / close / lift reuse from baseline
+- Phase 1 collects truth for labels and evaluation only.
+- Phase 1 does not make simulator truth the competition runtime input.
+- Phase 1 does not modify manipulation/control code.
 
 Exit criteria:
 
-- script runs without breaking baseline infrastructure
+- lightweight Python/schema checks pass on the development machine
+- Linux Isaac Sim run can collect a small sample set
+- collected sample structure matches `docs/task1_data_collection_schema.md`
 
-## Phase 2: Dataset Validation Harness
+## Phase 2: Automatic Evaluator
 
 Status: pending
 
 Goal:
 
-- validate collected Task 1 samples and keep the data contract concrete
-- keep this phase data/evaluation oriented before further manipulation tuning
+- compute perception, geometry, recommendation, and task metrics from Phase 1
+  samples and runtime traces
 
-Required outputs:
+Required metrics:
 
-- sample validator for `manifest.jsonl`, RGB image/array paths, optional depth
-  arrays, and minimal table-frame label files
-- minimal dataset summary with counts for samples, cameras, depth availability,
-  object labels, and noise settings
-- lightweight checks for missing camera frames, missing labels, malformed
-  `objects`, invalid class names, and non-finite `x`, `y`, or `yaw`
-- no planner, IK, coordinate-transform, or deterministic phase execution changes
+- class accuracy
+- selected-object accuracy
+- 2D center error
+- yaw bucket accuracy
+- arm recommendation accuracy
+- preset recommendation accuracy
+- 3D conversion error after depth + geometry
+- task success rate
+- wrong-bin rate
+- drop rate
+- cycle time
+
+Required work:
+
+- implement evaluator reader for `manifest.jsonl`, labels, metadata, sync debug,
+  Thinker output, geometry output, planner traces, and execution logs
+- validate the placeholder interface in
+  `docs/schemas/task1_evaluator_io.schema.json`
+- report missing or malformed fields clearly
+- do not change planner, IK, or manipulation behavior in this phase
 
 Exit criteria:
 
-- Linux run produces a small valid collection and the evaluator harness can
-  read it without ad hoc path assumptions
+- evaluator can score a Linux-collected Phase 1 sample set without ad hoc paths
 
-## Phase 3: Thinker Advisor Integration
+## Phase 3: Camera-Only Baseline Without Thinker Dependency
 
 Status: pending
 
 Goal:
 
-- add Thinker as optional multimodal strategy advisor
+- create the first functional camera-first runtime baseline without requiring
+  Thinker
 
-Required outputs:
+Required work:
 
-- `scripts/utils/thinker_advisor.py`
-- lazy model load
-- multimodal payload support
-- text-only fallback
-- deterministic fallback on any failure
-- strict JSON validation
-- Thinker only allowed to:
-  - rerank top-K
-  - suggest arm preference
-  - suggest approach family
-  - suggest retry strategy
-- Thinker not allowed to:
-  - generate final robot pose
-  - bypass geometric checks
-  - control joints
-  - run inside final descent loop
+- use head RGB-D for object localization
+- convert 2D/ROI plus depth into grasp-relevant 3D state using existing
+  transforms
+- estimate coarse yaw, width, and usable object state where possible
+- generate a compact candidate grasp set
+- rescore candidates using robot-specific checks and `DualArmIK`
+- keep deterministic checkpoint-based execution phases
 
-Exit criteria:
+Non-goals:
 
-- Thinker can influence candidate selection safely
+- no fixed "stop every 2 seconds" policy
+- no aggressive wrist retargeting during final descent
+- no Thinker dependency
 
-## Phase 4: Perception Abstraction For Future YOLO
+## Phase 4: Thinker Structured Perception Integration
 
 Status: pending
 
 Goal:
 
-- clean provider abstraction while keeping `scene_state` as the real current
-  provider
-- keep Thinker/camera outputs as intermediate structured observations, not
-  final grasp poses
+- connect Thinker as a structured visual understanding and decision-support
+  component
 
-Required outputs:
+Thinker output schema:
 
-- `resolve_object_infos(...)`
-- `scene_state_provider` implemented
-- `yolo_provider` stub only
-- explicit `perception_source` logging
-- consume or validate
-  `docs/schemas/task1_thinker_structured_output.schema.json` only after the
-  Phase 2 evaluator/data contracts are stable
+- `docs/schemas/task1_thinker_structured_output.schema.json`
 
-Exit criteria:
+Thinker may output:
 
-- future YOLO can replace provider without rewriting planner
+- object candidates
+- class
+- ROI or 2D center
+- coarse orientation bucket
+- difficulty / occlusion
+- confidence
+- recommended arm
+- recommended preset
+- selected object id
 
-## Phase 5: Reliability Tuning For Competition
+Thinker must not output or control:
+
+- final 6D grasp pose as the first integration target
+- robot joint commands
+- per-frame motion commands
+- permissions to bypass geometry, IK, or safety checks
+
+## Phase 5: Wrist Local Refinement
 
 Status: pending
 
 Goal:
 
-- optimize speed, stability, and failure handling for Task 1 scoring
+- add wrist-camera local correction only if Phase 2 and Phase 3 metrics show it
+  improves success rate
 
-Required outputs:
+Rules:
 
-- threshold tuning
-- failure taxonomy
-- improved retry policy
-- logging for benchmark runs
-- multi-seed evaluation notes
+- use wrist camera only near the target
+- apply small XY/yaw corrections only
+- if correction is small, update the target in place
+- if correction is large, return to fine pregrasp or replan
+- do not destabilize monotonic final Z descent
 
-Exit criteria:
+## Current Non-Goals
 
-- stable baseline for repeated simulation trials
+- no planner redesign
+- no IK redesign
+- no grasp logic tuning in the data-collection phase
+- no full evaluator runtime in Phase 1
+- no full Thinker runtime in Phase 1
+- no segmentation training pipeline unless a later phase explicitly requires it

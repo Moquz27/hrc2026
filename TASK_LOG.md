@@ -1163,3 +1163,46 @@
 - Simplified `docs/task1_data_collection_schema.md` and `docs/schemas/task1_thinker_structured_output.schema.json` to match the table-frame object output contract.
 - Removed the Phase 1 evaluator placeholder schema because it was premature for the minimal dataset path.
 - Preserved current manipulation backend and official camera/scene paths; no edits were made to planner, IK, coordinate transforms, `RobotArticulation.py`, or existing Task 1 manipulation scripts.
+
+## 2026-04-21 — Camera-first Task 1 direction reset and Phase 1 collector restore
+
+- Updated `PROJECT_CONTEXT.md` and `CURRENT_PLAN.md` to make the camera-first competition runtime the active source of truth.
+- Recorded the old scene-truth-driven direction as useful only for debugging, labeling, evaluation, and bootstrapping, not final competition runtime input.
+- Replaced the minimal table-label-only collector with a synchronized Phase 1 RGB-D/truth collector in `scripts/task1_collect_rgbd_labels.py`.
+- Collector scope now builds the official Task 1 scene, uses `RobotArticulation.get_cameras_images(step)`, and writes head left/right plus wrist left/right RGB-D arrays.
+- Labels now include object id, class, raw class, world pose, USD robot-root base-frame pose, Task 1 table-frame pose, yaw/coarse orientation, configured target-bin metadata, world bbox, and best-effort center-projection visibility metadata.
+- Runtime metadata now includes chosen object, chosen arm, chosen preset, chosen candidate, planner target, execution result, fail reason, simulation step, estimated sim time, and timestamp.
+- Dataset output restored to a structured Phase 1 layout under `$OUTPUT_ROOT/datasets/task1_rgbd_labels/<run_id>/` with `run_metadata.json`, `manifest.jsonl`, `rgb/`, `depth/`, `labels/`, `metadata/`, and `sync_debug/`.
+- Added/updated schema docs:
+  - `docs/task1_data_collection_schema.md`
+  - `docs/schemas/task1_thinker_structured_output.schema.json`
+  - `docs/schemas/task1_evaluator_io.schema.json`
+- Thinker schema is explicitly intermediate structured perception/decision support: object candidates, class, ROI/center, orientation bucket, difficulty, occlusion, confidence, recommended arm, recommended preset, and selected object id. It does not define final grasp poses or robot commands.
+- Phase 2 evaluator schema is a placeholder interface only; no evaluator runtime was implemented in this phase.
+- Preserved current manipulation backend: no edits to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, `RobotArticulation.py`, or existing Task 1 manipulation scripts.
+- Checks passed: `python3 -m py_compile scripts/task1_collect_rgbd_labels.py`, `python3 scripts/task1_collect_rgbd_labels.py --help`, `python3 -m json.tool` for the Thinker and evaluator schema files, and `git diff --check`.
+- Runtime limitation: no Isaac Sim collection run was performed on this machine.
+
+## 2026-04-21 — Phase 1 collector frame and visibility semantics tightening
+
+- Patched `scripts/task1_collect_rgbd_labels.py` so the Task 1 table frame is built from the actual USD stage robot-root pose when available.
+- Kept the YAML `robot_position` / `robot_rotation` pose as an explicit fallback only, with run metadata recording both pose sources.
+- Added config-vs-USD robot pose comparison metadata, including position/yaw deltas and warning thresholds; the collector logs `robot_pose_source_warning` when the difference exceeds the threshold.
+- Made visibility semantics explicit: `visible_projection` is center-projection-only and not visibility truth; the collector records no segmentation, no true occlusion reasoning, and no depth ROI finite-ratio check.
+- Added projected 3D bbox debug fields under per-camera `bbox_projection`; these are debug hints only and do not make visibility occlusion-aware.
+- Tightened `docs/task1_data_collection_schema.md` around world pose, USD robot-root pose, table-frame pose, meter units, table units, yaw reference axis, and coarse-orientation bucket origin.
+- Added brief schema descriptions for Thinker `orientation_bucket` and Phase 2 evaluator metric units/frame assumptions.
+- Preserved current manipulation backend; no edits were made to planner, IK, coordinate transforms, `RobotArticulation.py`, or existing Task 1 manipulation scripts.
+- Checks passed: `python3 -m py_compile scripts/task1_collect_rgbd_labels.py`, `python3 scripts/task1_collect_rgbd_labels.py --help`, `python3 -m json.tool` for the Thinker and evaluator schema files, and `git diff --check`.
+- Runtime limitation: no Isaac Sim collection run was performed on this machine.
+
+## 2026-04-21 — Phase 1 collector Isaac physics initialization bugfix
+
+- Runtime blocker reproduced with Isaac Sim `python.sh`: the collector launched Isaac and built the run folder, but stopped before writing samples because `RobotArticulation.initialize()` saw no Isaac physics simulation view and failed with `AttributeError: 'NoneType' object has no attribute 'create_articulation_view'`.
+- Patched only `scripts/task1_collect_rgbd_labels.py` runtime initialization ordering.
+- Added an Isaac `SimulationContext` readiness step after SceneBuilder table/parts/robot creation, `rep.orchestrator.step()`, and initial updates, but before `RobotArticulation.initialize()`.
+- The collector now logs `scene_built`, `physics_ready_check`, `physics_ready`, `robot_initialize_start`, and `robot_initialize_success` so future failures around camera wrapper setup are visible in the collector log.
+- Preserved dataset output structure, labels, metadata, schema, official `RobotArticulation.get_cameras_images(step)` path, and manipulation/control backend behavior.
+- Checks passed: `python3 -m py_compile scripts/task1_collect_rgbd_labels.py` and `python3 scripts/task1_collect_rgbd_labels.py --help`.
+- Isaac runtime validation passed with `/home/edward/Projects/NVIDIA/isaac-sim/python.sh scripts/task1_collect_rgbd_labels.py --samples 3 --sample-stride 2 --seed 1 --run-id test_phase1_initfix_1`.
+- Runtime output validation passed: `manifest.jsonl` has 3 entries, 12 RGB arrays, 12 depth arrays, 3 label files, 3 metadata files, 3 sync debug files, 4 cameras per sample, positive depth `finite_count` for all first-sample cameras, and label `object_count` matches 4 spawned Task 1 parts.
