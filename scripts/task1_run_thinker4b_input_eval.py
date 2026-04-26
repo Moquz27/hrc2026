@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -65,6 +66,7 @@ CAMERA_NAMES = ("head_left", "head_right", "wrist_left", "wrist_right")
 DEFAULT_SEEDS = (1, 2, 3, 4, 5)
 DEFAULT_CASES_PER_SEED = 10
 OUTPUT_FORMAT_VERSION = "0.1.0"
+PROMPT_MODES = ("image-only", "refine-original")
 ORIENTATION_BUCKETS = (
     "front",
     "front_left",
@@ -88,6 +90,12 @@ class ThinkerProviderUnavailable(Thinker4BEvalError):
 
 class ThinkerProviderError(Thinker4BEvalError):
     """Raised when a configured Thinker4B provider fails for one case."""
+
+
+@dataclass
+class ThinkerInferResult:
+    payload: dict[str, Any]
+    raw_text: str | None = None
 
 
 def _parse_csv(value: str | None) -> list[str]:
@@ -177,6 +185,40 @@ def _truth_from_object(
     }
 
 
+def _truth_from_object_for_exact_camera(
+    *,
+    obj: dict[str, Any],
+    camera_name: str,
+    x_extent_m: float | None,
+) -> dict[str, Any] | None:
+    table_pose = obj.get("table_frame_pose") if isinstance(obj.get("table_frame_pose"), dict) else {}
+    table_x = _finite_float(table_pose.get("x"))
+    truth_center, truth_camera = _extract_truth_center_from_visibility(obj, camera_name)
+    if truth_camera != camera_name:
+        truth_center = None
+        truth_camera = None
+    truth_roi = _extract_truth_roi_from_visibility(obj, camera_name)
+    if truth_center is None and truth_roi is None:
+        return None
+    orientation_bucket = table_pose.get("coarse_orientation")
+    if not isinstance(orientation_bucket, str):
+        world_pose = obj.get("world_pose") if isinstance(obj.get("world_pose"), dict) else {}
+        orientation_bucket = world_pose.get("coarse_orientation")
+    if not isinstance(orientation_bucket, str):
+        orientation_bucket = "unknown"
+    return {
+        "selected_object_id": obj.get("object_id"),
+        "object_id": obj.get("object_id"),
+        "class": obj.get("class"),
+        "center_2d": truth_center,
+        "roi": truth_roi,
+        "orientation_bucket": orientation_bucket,
+        "recommended_arm": _reference_arm(table_x, x_extent_m),
+        "recommended_preset": _reference_preset(orientation_bucket),
+        "camera_name": truth_camera,
+    }
+
+
 def _camera_paths_from_manifest(dataset_root: Path, entry: dict[str, Any]) -> dict[str, Path]:
     cameras = entry.get("cameras") if isinstance(entry.get("cameras"), dict) else {}
     paths: dict[str, Path] = {}
@@ -244,6 +286,8 @@ def _build_case_pool(
                     "object_id": obj["object_id"],
                     "truth": truth,
                     "allowed_object_ids": allowed_ids,
+                    "scene_objects": objects,
+                    "x_extent_m": x_extent_m,
                     "camera_paths": {key: str(value) for key, value in camera_paths.items()},
                     "label_object": obj,
                     "dataset_root": str(dataset_root),
@@ -354,11 +398,14 @@ def _select_cases(
                     "object_index": source["object_index"],
                     "object_id": source["object_id"],
                     "allowed_object_ids": source["allowed_object_ids"],
+                    "scene_objects": source["scene_objects"],
+                    "x_extent_m": source["x_extent_m"],
                     "camera_names": camera_names,
                     "camera_files": {
                         camera_name: source["camera_paths"][camera_name]
                         for camera_name in camera_names
                     },
+                    "all_camera_files": dict(source["camera_paths"]),
                     "truth": truth,
                     "original_input": original_input,
                 }
@@ -382,6 +429,12 @@ def _to_uint8_rgb(array: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(np.clip(rgb, 0.0, 255.0).astype(np.uint8))
 
 
+def _png_bytes_from_image(image: Image.Image) -> bytes:
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def _image_to_png_bytes(path: Path, *, max_side: int) -> bytes:
     if not path.exists():
         raise ThinkerProviderError(f"camera RGB file does not exist: {path}")
@@ -389,37 +442,123 @@ def _image_to_png_bytes(path: Path, *, max_side: int) -> bytes:
     image = Image.fromarray(_to_uint8_rgb(array))
     if max_side > 0 and max(image.size) > max_side:
         image.thumbnail((max_side, max_side))
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
+    return _png_bytes_from_image(image)
 
 
-def _case_images(case: dict[str, Any], *, max_side: int) -> list[dict[str, Any]]:
-    images: list[dict[str, Any]] = []
-    camera_files = case["camera_files"]
-    for camera_name in case["camera_names"]:
-        path = Path(camera_files[camera_name])
-        png_bytes = _image_to_png_bytes(path, max_side=max_side)
-        images.append(
-            {
-                "camera_name": camera_name,
-                "path": str(path),
-                "png_base64": base64.b64encode(png_bytes).decode("ascii"),
-                "mime_type": "image/png",
-            }
-        )
-    return images
+def _active_bbox(mask: np.ndarray) -> list[int] | None:
+    ys, xs = np.where(mask)
+    if ys.size == 0 or xs.size == 0:
+        return None
+    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
 
 
-def _prompt_for_case(case: dict[str, Any]) -> str:
+def _image_stats(rgb: np.ndarray, *, dtype_name: str, original_shape: tuple[int, ...]) -> dict[str, Any]:
+    rgb_u8 = np.asarray(rgb, dtype=np.uint8)
+    gray = rgb_u8.astype(np.float32).mean(axis=2)
+    non_black_mask = gray > 1.0
+    bright_mask = gray > 16.0
+    return {
+        "shape": list(original_shape),
+        "dtype": dtype_name,
+        "min": float(rgb_u8.min()),
+        "max": float(rgb_u8.max()),
+        "mean_brightness": float(gray.mean()),
+        "non_black_ratio": float(non_black_mask.mean()),
+        "bright_ratio": float(bright_mask.mean()),
+        "non_black_bbox": _active_bbox(non_black_mask),
+        "bright_bbox": _active_bbox(bright_mask),
+    }
+
+
+def _resize_rgb(rgb: np.ndarray, *, max_side: int) -> np.ndarray:
+    image = Image.fromarray(rgb)
+    if max_side > 0 and max(image.size) > max_side:
+        image = image.copy()
+        image.thumbnail((max_side, max_side))
+    return np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+
+def _camera_image_artifact(path: Path, *, max_side: int) -> dict[str, Any]:
+    if not path.exists():
+        raise ThinkerProviderError(f"camera RGB file does not exist: {path}")
+    raw_array = np.load(path, allow_pickle=False)
+    raw_rgb = _to_uint8_rgb(raw_array)
+    model_input_rgb = _resize_rgb(raw_rgb, max_side=max_side)
+    raw_png_bytes = _png_bytes_from_image(Image.fromarray(raw_rgb))
+    model_input_png_bytes = _png_bytes_from_image(Image.fromarray(model_input_rgb))
+    return {
+        "path": str(path),
+        "raw_png_bytes": raw_png_bytes,
+        "model_input_png_bytes": model_input_png_bytes,
+        "png_base64": base64.b64encode(model_input_png_bytes).decode("ascii"),
+        "mime_type": "image/png",
+        "raw_stats": _image_stats(raw_rgb, dtype_name=str(raw_array.dtype), original_shape=tuple(raw_array.shape)),
+        "model_input_stats": _image_stats(
+            model_input_rgb,
+            dtype_name="uint8",
+            original_shape=tuple(model_input_rgb.shape),
+        ),
+    }
+
+
+def _case_camera_artifacts(case: dict[str, Any], *, max_side: int) -> dict[str, dict[str, Any]]:
+    artifacts: dict[str, dict[str, Any]] = {}
+    for camera_name in CAMERA_NAMES:
+        camera_path = case["all_camera_files"].get(camera_name)
+        if not isinstance(camera_path, str):
+            continue
+        artifact = _camera_image_artifact(Path(camera_path), max_side=max_side)
+        artifact["camera_name"] = camera_name
+        artifact["sent_to_model"] = camera_name in case["camera_names"]
+        artifacts[camera_name] = artifact
+    return artifacts
+
+
+def _prompt_for_case(case: dict[str, Any], *, prompt_mode: str) -> str:
+    primary_camera = case["camera_names"][0] if case["camera_names"] else "head_left"
     payload = {
         "case_id": case["case_id"],
         "run_id": case["run_id"],
         "sample_id": case["sample_id"],
         "camera_names": case["camera_names"],
-        "allowed_object_ids": case["allowed_object_ids"],
-        "original_input_estimate": case["original_input"],
+        "primary_image_camera_for_2d_outputs": primary_camera,
     }
+    if prompt_mode == "image-only":
+        return (
+            "You are Thinker4B analyzing recorded camera images from HRC Task 1.\n"
+            "Use only visual evidence visible in the provided image(s).\n"
+            "Do not use any prior estimate, prior object id hint, or hidden state.\n"
+            "Do not guess dataset object ids such as task1_part_XXX from the image.\n"
+            "All 2D outputs must be expressed in the first camera image listed in "
+            f"camera_names, which is {primary_camera} for this case.\n"
+            "Order objects by confidence or task relevance, with the primary candidate first.\n"
+            "If something is uncertain, return unknown or null and low confidence.\n"
+            "Return ONLY one JSON object with this shape:\n"
+            "{\n"
+            '  "frame_id": "sample or case id",\n'
+            '  "selected_object_id": null,\n'
+            '  "global_confidence": 0.0,\n'
+            '  "objects": [\n'
+            "    {\n"
+            '      "class": "A|B|unknown",\n'
+            '      "center_2d": [u, v] or null,\n'
+            '      "roi": [x1, y1, x2, y2] or null,\n'
+            '      "orientation_bucket": "front|front_left|left|back_left|back|back_right|right|front_right|unknown",\n'
+            '      "confidence": 0.0,\n'
+            '      "recommended_arm": "left|right|null",\n'
+            '      "recommended_preset": "short string or null",\n'
+            '      "notes": "optional short note"\n'
+            "    }\n"
+            "  ],\n"
+            '  "model_notes": "optional short note"\n'
+            "}\n"
+            "Do not output final 3D pose, grasp pose, IK targets, motion commands, "
+            "waypoints, or trajectories.\n"
+            "Context JSON:\n"
+            f"{json.dumps(payload, indent=2, sort_keys=True)}"
+        )
+    payload["allowed_object_ids"] = case["allowed_object_ids"]
+    payload["original_input_estimate"] = case["original_input"]
     return (
         "You are Thinker4B analyzing recorded camera images from HRC Task 1.\n"
         "Return ONLY one JSON object compatible with this structure:\n"
@@ -493,7 +632,14 @@ def _content_text_from_openai_response(payload: dict[str, Any]) -> str:
 
 
 class Thinker4BProvider:
-    def infer(self, case: dict[str, Any], images: list[dict[str, Any]]) -> dict[str, Any]:
+    def infer(
+        self,
+        case: dict[str, Any],
+        images: list[dict[str, Any]],
+        *,
+        prompt: str,
+        debug_raw_output_path: Path | None = None,
+    ) -> ThinkerInferResult:
         raise NotImplementedError
 
 
@@ -508,8 +654,15 @@ class OpenAICompatibleProvider(Thinker4BProvider):
         self.model = model
         self.timeout_s = timeout_s
 
-    def infer(self, case: dict[str, Any], images: list[dict[str, Any]]) -> dict[str, Any]:
-        content: list[dict[str, Any]] = [{"type": "text", "text": _prompt_for_case(case)}]
+    def infer(
+        self,
+        case: dict[str, Any],
+        images: list[dict[str, Any]],
+        *,
+        prompt: str,
+        debug_raw_output_path: Path | None = None,
+    ) -> ThinkerInferResult:
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for image in images:
             content.append(
                 {
@@ -544,7 +697,7 @@ class OpenAICompatibleProvider(Thinker4BProvider):
         if response.status_code >= 400:
             raise ThinkerProviderError(f"OpenAI-compatible provider returned HTTP {response.status_code}: {response.text[:500]}")
         text = _content_text_from_openai_response(response.json())
-        return _extract_json_from_text(text)
+        return ThinkerInferResult(payload=_extract_json_from_text(text), raw_text=text)
 
 
 class OllamaProvider(Thinker4BProvider):
@@ -553,7 +706,14 @@ class OllamaProvider(Thinker4BProvider):
         self.model = model or os.environ.get("THINKER4B_MODEL") or "thinker4b"
         self.timeout_s = timeout_s
 
-    def infer(self, case: dict[str, Any], images: list[dict[str, Any]]) -> dict[str, Any]:
+    def infer(
+        self,
+        case: dict[str, Any],
+        images: list[dict[str, Any]],
+        *,
+        prompt: str,
+        debug_raw_output_path: Path | None = None,
+    ) -> ThinkerInferResult:
         response = requests.post(
             f"{self.host}/api/chat",
             json={
@@ -563,7 +723,7 @@ class OllamaProvider(Thinker4BProvider):
                 "messages": [
                     {
                         "role": "user",
-                        "content": _prompt_for_case(case),
+                        "content": prompt,
                         "images": [image["png_base64"] for image in images],
                     }
                 ],
@@ -577,7 +737,7 @@ class OllamaProvider(Thinker4BProvider):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str):
             raise ThinkerProviderError("Ollama response has no message.content")
-        return _extract_json_from_text(content)
+        return ThinkerInferResult(payload=_extract_json_from_text(content), raw_text=content)
 
 
 class CommandProvider(Thinker4BProvider):
@@ -587,13 +747,22 @@ class CommandProvider(Thinker4BProvider):
         self.command = command
         self.timeout_s = timeout_s
 
-    def infer(self, case: dict[str, Any], images: list[dict[str, Any]]) -> dict[str, Any]:
+    def infer(
+        self,
+        case: dict[str, Any],
+        images: list[dict[str, Any]],
+        *,
+        prompt: str,
+        debug_raw_output_path: Path | None = None,
+    ) -> ThinkerInferResult:
         request_payload = {
-            "prompt": _prompt_for_case(case),
+            "prompt": prompt,
             "case": case,
             "images": images,
             "output_contract": "return JSON matching docs/schemas/task1_thinker_structured_output.schema.json",
         }
+        if debug_raw_output_path is not None:
+            request_payload["debug_raw_output_path"] = str(debug_raw_output_path)
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
             json.dump(request_payload, handle)
             request_path = handle.name
@@ -616,7 +785,7 @@ class CommandProvider(Thinker4BProvider):
             raise ThinkerProviderError(
                 f"command provider failed with code {completed.returncode}: {completed.stderr[:500]}"
             )
-        return _extract_json_from_text(completed.stdout)
+        return ThinkerInferResult(payload=_extract_json_from_text(completed.stdout), raw_text=completed.stdout)
 
 
 class CacheProvider(Thinker4BProvider):
@@ -647,11 +816,19 @@ class CacheProvider(Thinker4BProvider):
             if isinstance(case_id, str) and isinstance(raw, dict):
                 self.by_case_id[case_id] = raw
 
-    def infer(self, case: dict[str, Any], images: list[dict[str, Any]]) -> dict[str, Any]:
+    def infer(
+        self,
+        case: dict[str, Any],
+        images: list[dict[str, Any]],
+        *,
+        prompt: str,
+        debug_raw_output_path: Path | None = None,
+    ) -> ThinkerInferResult:
         case_id = case["case_id"]
         if case_id not in self.by_case_id:
             raise ThinkerProviderError(f"no cached Thinker4B output for case_id={case_id}")
-        return self.by_case_id[case_id]
+        payload = self.by_case_id[case_id]
+        return ThinkerInferResult(payload=payload, raw_text=json.dumps(payload, ensure_ascii=False))
 
 
 def _make_provider(args: argparse.Namespace) -> Thinker4BProvider:
@@ -679,6 +856,103 @@ def _make_provider(args: argparse.Namespace) -> Thinker4BProvider:
     raise Thinker4BEvalError(f"unsupported provider: {provider}")
 
 
+def _clamp_unit(value: Any) -> float:
+    numeric = _finite_float(value)
+    if numeric is None:
+        return 0.0
+    return max(0.0, min(1.0, float(numeric)))
+
+
+def _clean_center_2d(value: Any) -> list[float] | None:
+    return _finite_vector(value, 2)
+
+
+def _clean_roi(value: Any) -> list[float] | None:
+    roi = _finite_vector(value, 4)
+    if roi is None:
+        return None
+    if not (roi[0] < roi[2] and roi[1] < roi[3]):
+        return None
+    return roi
+
+
+def _clean_object_class(value: Any) -> str:
+    return value if isinstance(value, str) and value in {"A", "B", "unknown"} else "unknown"
+
+
+def _clean_orientation_bucket(value: Any) -> str:
+    return value if isinstance(value, str) and value in ORIENTATION_BUCKETS else "unknown"
+
+
+def _clean_recommended_arm(value: Any) -> str | None:
+    return value if isinstance(value, str) and value in {"left", "right"} else None
+
+
+def _clean_recommended_preset(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _clean_object_candidate(item: dict[str, Any]) -> dict[str, Any]:
+    object_id = item.get("object_id")
+    notes = item.get("notes")
+    cleaned = {
+        "object_id": object_id if isinstance(object_id, str) and object_id else None,
+        "class": _clean_object_class(item.get("class")),
+        "center_2d": _clean_center_2d(item.get("center_2d")),
+        "roi": _clean_roi(item.get("roi")),
+        "orientation_bucket": _clean_orientation_bucket(item.get("orientation_bucket")),
+        "difficulty": _clamp_unit(item.get("difficulty")),
+        "occlusion": _clamp_unit(item.get("occlusion")),
+        "confidence": _clamp_unit(item.get("confidence")),
+        "recommended_arm": _clean_recommended_arm(item.get("recommended_arm")),
+        "recommended_preset": _clean_recommended_preset(item.get("recommended_preset")),
+        "notes": notes if isinstance(notes, str) and notes.strip() else None,
+    }
+    return cleaned
+
+
+def _clean_raw_output(raw: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
+    objects = raw.get("objects")
+    cleaned_objects: list[dict[str, Any]] = []
+    if isinstance(objects, list):
+        for item in objects:
+            if isinstance(item, dict):
+                cleaned_objects.append(_clean_object_candidate(item))
+    else:
+        fallback_item = {
+            "object_id": raw.get("object_id") or raw.get("selected_object_id"),
+            "class": raw.get("class"),
+            "center_2d": raw.get("center_2d"),
+            "roi": raw.get("roi"),
+            "orientation_bucket": raw.get("orientation_bucket"),
+            "difficulty": raw.get("difficulty"),
+            "occlusion": raw.get("occlusion"),
+            "confidence": raw.get("confidence", raw.get("global_confidence")),
+            "recommended_arm": raw.get("recommended_arm"),
+            "recommended_preset": raw.get("recommended_preset"),
+            "notes": raw.get("notes"),
+        }
+        if any(
+            fallback_item.get(field) is not None
+            for field in ("object_id", "class", "center_2d", "roi", "orientation_bucket", "recommended_arm", "recommended_preset", "notes")
+        ):
+            cleaned_objects.append(_clean_object_candidate(fallback_item))
+    selected_object_id = raw.get("selected_object_id")
+    if not isinstance(selected_object_id, str) or not selected_object_id:
+        selected_object_id = None
+    model_notes = raw.get("model_notes")
+    return {
+        "frame_id": str(raw.get("frame_id") or case["case_id"]),
+        "selected_object_id": selected_object_id,
+        "global_confidence": _clamp_unit(raw.get("global_confidence", raw.get("confidence"))),
+        "objects": cleaned_objects,
+        "model_notes": model_notes if isinstance(model_notes, str) and model_notes.strip() else None,
+    }
+
+
 def _selected_object_from_schema(raw: dict[str, Any]) -> dict[str, Any]:
     objects = raw.get("objects") if isinstance(raw.get("objects"), list) else []
     selected_id = raw.get("selected_object_id")
@@ -696,9 +970,113 @@ def _selected_object_from_schema(raw: dict[str, Any]) -> dict[str, Any]:
     return selected_obj or {}
 
 
-def _flat_ai_output(raw: dict[str, Any]) -> dict[str, Any]:
+def _record_center_2d(record: dict[str, Any]) -> list[float] | None:
+    center = _clean_center_2d(record.get("center_2d"))
+    if center is not None:
+        return center
+    roi = _clean_roi(record.get("roi"))
+    if roi is not None:
+        return _roi_center(roi)
+    return None
+
+
+def _truth_candidates_for_case(case: dict[str, Any], *, camera_name: str) -> list[dict[str, Any]]:
+    truth_candidates: list[dict[str, Any]] = []
+    for obj in case.get("scene_objects", []):
+        if not isinstance(obj, dict):
+            continue
+        candidate = _truth_from_object_for_exact_camera(
+            obj=obj,
+            camera_name=camera_name,
+            x_extent_m=_finite_float(case.get("x_extent_m")),
+        )
+        if candidate is not None:
+            truth_candidates.append(candidate)
+    return truth_candidates
+
+
+def _match_objects_by_geometry(
+    raw: dict[str, Any],
+    case: dict[str, Any],
+    *,
+    max_match_distance_px: float,
+) -> dict[str, Any]:
+    reference_camera = case["camera_names"][0] if case["camera_names"] else None
+    if reference_camera is None:
+        return {
+            "enabled": False,
+            "reference_camera": None,
+            "selected_prediction_index": None,
+            "selected_match_distance_px": None,
+            "selected_object_id": None,
+            "object_matches": [],
+        }
+    truth_candidates = _truth_candidates_for_case(case, camera_name=reference_camera)
+    predicted_objects = raw.get("objects") if isinstance(raw.get("objects"), list) else []
+    pairs: list[tuple[float, int, int]] = []
+    for pred_index, pred_obj in enumerate(predicted_objects):
+        if not isinstance(pred_obj, dict):
+            continue
+        pred_center = _record_center_2d(pred_obj)
+        if pred_center is None:
+            continue
+        for truth_index, truth_obj in enumerate(truth_candidates):
+            truth_center = _record_center_2d(truth_obj)
+            if truth_center is None:
+                continue
+            pairs.append((_distance_2d(pred_center, truth_center), pred_index, truth_index))
+    pairs.sort(key=lambda item: item[0])
+    used_predictions: set[int] = set()
+    used_truths: set[int] = set()
+    matches_by_prediction: dict[int, dict[str, Any]] = {}
+    for distance_px, pred_index, truth_index in pairs:
+        if distance_px > max_match_distance_px:
+            continue
+        if pred_index in used_predictions or truth_index in used_truths:
+            continue
+        truth_obj = truth_candidates[truth_index]
+        used_predictions.add(pred_index)
+        used_truths.add(truth_index)
+        matches_by_prediction[pred_index] = {
+            "prediction_index": pred_index,
+            "matched_truth_object_id": truth_obj.get("object_id"),
+            "distance_px": distance_px,
+            "truth_center_2d": truth_obj.get("center_2d"),
+            "truth_roi": truth_obj.get("roi"),
+        }
+    selected_prediction_index: int | None = None
+    selected_id = raw.get("selected_object_id")
+    if isinstance(selected_id, str):
+        for index, pred_obj in enumerate(predicted_objects):
+            if isinstance(pred_obj, dict) and pred_obj.get("object_id") == selected_id:
+                selected_prediction_index = index
+                break
+    if selected_prediction_index is None and predicted_objects:
+        selected_prediction_index = 0
+    selected_match = matches_by_prediction.get(selected_prediction_index) if selected_prediction_index is not None else None
+    return {
+        "enabled": True,
+        "reference_camera": reference_camera,
+        "selected_prediction_index": selected_prediction_index,
+        "selected_match_distance_px": selected_match.get("distance_px") if isinstance(selected_match, dict) else None,
+        "selected_object_id": selected_match.get("matched_truth_object_id") if isinstance(selected_match, dict) else None,
+        "object_matches": [
+            matches_by_prediction[index]
+            for index in sorted(matches_by_prediction)
+        ],
+    }
+
+
+def _flat_ai_output(
+    raw: dict[str, Any],
+    *,
+    prompt_mode: str,
+    geometry_match: dict[str, Any] | None,
+) -> dict[str, Any]:
     selected_obj = _selected_object_from_schema(raw)
     selected_id = raw.get("selected_object_id") or selected_obj.get("object_id")
+    if prompt_mode == "image-only" and isinstance(geometry_match, dict):
+        selected_id = geometry_match.get("selected_object_id")
     object_confidence = _finite_float(selected_obj.get("confidence"))
     global_confidence = _finite_float(raw.get("global_confidence"))
     confidence = object_confidence if object_confidence is not None else global_confidence
@@ -728,33 +1106,60 @@ def _flat_ai_output(raw: dict[str, Any]) -> dict[str, Any]:
     return flat
 
 
-def _clean_raw_output(raw: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
-    objects = raw.get("objects")
-    if not isinstance(objects, list):
-        flat_obj = {
-            "object_id": raw.get("object_id") or raw.get("selected_object_id") or _object_id(case["original_input"]),
-            "class": raw.get("class", "unknown"),
-            "center_2d": raw.get("center_2d"),
-            "roi": raw.get("roi"),
-            "orientation_bucket": raw.get("orientation_bucket", "unknown"),
-            "difficulty": raw.get("difficulty", 0.5),
-            "occlusion": raw.get("occlusion", 0.5),
-            "confidence": raw.get("confidence", raw.get("global_confidence", 0.0)),
-            "recommended_arm": raw.get("recommended_arm", "right"),
-            "recommended_preset": raw.get("recommended_preset", "unknown"),
+def _case_camera_metadata(case: dict[str, Any], camera_artifacts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    cameras: dict[str, Any] = {}
+    for camera_name in CAMERA_NAMES:
+        artifact = camera_artifacts.get(camera_name)
+        if artifact is None:
+            continue
+        cameras[camera_name] = {
+            "npy_path": artifact["path"],
+            "sent_to_model": bool(artifact["sent_to_model"]),
+            "raw": artifact["raw_stats"],
+            "model_input": artifact["model_input_stats"],
         }
-        raw = {
-            "frame_id": raw.get("frame_id") or case["case_id"],
-            "selected_object_id": raw.get("selected_object_id") or flat_obj["object_id"],
-            "global_confidence": raw.get("global_confidence", flat_obj["confidence"]),
-            "objects": [flat_obj],
-            "model_notes": raw.get("model_notes"),
-        }
-    else:
-        raw.setdefault("frame_id", case["case_id"])
-        raw.setdefault("selected_object_id", None)
-        raw.setdefault("global_confidence", 0.0)
-    return raw
+    return {
+        "case_id": case["case_id"],
+        "sample_id": case["sample_id"],
+        "seed": case["seed"],
+        "camera_names_used_by_model": list(case["camera_names"]),
+        "cameras": cameras,
+    }
+
+
+def _write_case_visual_artifacts(
+    case_dir: Path,
+    *,
+    prompt_text: str,
+    raw_model_output_text: str | None,
+    camera_artifacts: dict[str, dict[str, Any]],
+    camera_metadata: dict[str, Any],
+    raw_output: dict[str, Any] | None,
+    ai_output: dict[str, Any],
+    truth: dict[str, Any],
+    original_input: dict[str, Any],
+    corrected_input: dict[str, Any],
+    metrics: dict[str, Any],
+) -> None:
+    case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / "prompt.txt").write_text(prompt_text, encoding="utf-8")
+    raw_model_output_path = case_dir / "raw_model_output.txt"
+    if not raw_model_output_path.exists():
+        raw_model_output_path.write_text(raw_model_output_text or "", encoding="utf-8")
+    for camera_name in CAMERA_NAMES:
+        artifact = camera_artifacts.get(camera_name)
+        if artifact is None:
+            continue
+        (case_dir / f"{camera_name}_raw.png").write_bytes(artifact["raw_png_bytes"])
+        (case_dir / f"{camera_name}_model_input.png").write_bytes(artifact["model_input_png_bytes"])
+    _write_json(case_dir / "metadata.json", camera_metadata)
+    _write_json(case_dir / "normalized_output.json", ai_output)
+    _write_json(case_dir / "truth.json", truth)
+    _write_json(case_dir / "original_input.json", original_input)
+    _write_json(case_dir / "corrected_input.json", corrected_input)
+    _write_json(case_dir / "metrics.json", metrics)
+    if raw_output is not None:
+        _write_json(case_dir / "raw_output.json", raw_output)
 
 
 def _case_outcome(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
@@ -786,23 +1191,68 @@ def _evaluate_cases(
             start = time.monotonic()
             raw_output: dict[str, Any] | None = None
             ai_output: dict[str, Any] = {}
+            geometry_match: dict[str, Any] | None = None
             thinker_status = "not_run"
             thinker_error = provider_error
             images_meta: list[dict[str, Any]] = []
+            prompt_text = _prompt_for_case(case, prompt_mode=args.mode)
+            raw_model_output_text: str | None = None
+            case_dir = output_dir / case["case_id"] if args.save_debug_artifacts else None
+            camera_artifacts: dict[str, dict[str, Any]] = {}
+            camera_metadata = {
+                "case_id": case["case_id"],
+                "sample_id": case["sample_id"],
+                "seed": case["seed"],
+                "camera_names_used_by_model": list(case["camera_names"]),
+                "cameras": {},
+            }
             try:
-                images = _case_images(case, max_side=int(args.max_image_side))
+                camera_artifacts = _case_camera_artifacts(case, max_side=int(args.max_image_side))
+                camera_metadata = _case_camera_metadata(case, camera_artifacts)
                 images_meta = [
                     {
-                        "camera_name": image["camera_name"],
-                        "path": image["path"],
-                        "mime_type": image["mime_type"],
+                        "camera_name": camera_name,
+                        "path": artifact["path"],
+                        "mime_type": artifact["mime_type"],
+                        "sent_to_model": bool(artifact["sent_to_model"]),
+                        "raw_stats": artifact["raw_stats"],
+                        "model_input_stats": artifact["model_input_stats"],
                     }
-                    for image in images
+                    for camera_name, artifact in camera_artifacts.items()
+                ]
+                provider_images = [
+                    {
+                        key: value
+                        for key, value in camera_artifacts[camera_name].items()
+                        if key in {"camera_name", "path", "png_base64", "mime_type"}
+                    }
+                    for camera_name in case["camera_names"]
+                    if camera_name in camera_artifacts
                 ]
                 if provider is None:
                     raise ThinkerProviderUnavailable(provider_error or "Thinker4B provider unavailable")
-                raw_output = _clean_raw_output(provider.infer(case, images), case)
-                ai_output = _flat_ai_output(raw_output)
+                infer_result = provider.infer(
+                    case,
+                    provider_images,
+                    prompt=prompt_text,
+                    debug_raw_output_path=(case_dir / "raw_model_output.txt") if case_dir is not None else None,
+                )
+                raw_model_output_text = infer_result.raw_text
+                if case_dir is not None and infer_result.raw_text and not (case_dir / "raw_model_output.txt").exists():
+                    case_dir.mkdir(parents=True, exist_ok=True)
+                    (case_dir / "raw_model_output.txt").write_text(infer_result.raw_text, encoding="utf-8")
+                raw_output = _clean_raw_output(infer_result.payload, case)
+                if args.mode == "image-only":
+                    geometry_match = _match_objects_by_geometry(
+                        raw_output,
+                        case,
+                        max_match_distance_px=float(args.image_only_match_max_distance_px),
+                    )
+                ai_output = _flat_ai_output(
+                    raw_output,
+                    prompt_mode=args.mode,
+                    geometry_match=geometry_match,
+                )
                 thinker_status = "ok"
                 thinker_error = None
             except Exception as exc:
@@ -810,6 +1260,7 @@ def _evaluate_cases(
                     raise
                 thinker_status = "failed"
                 thinker_error = str(exc)
+                raw_model_output_text = raw_model_output_text or str(exc)
 
             correction = apply_input_corrections(
                 case["original_input"],
@@ -846,13 +1297,17 @@ def _evaluate_cases(
                 "source_pool_index": case["source_pool_index"],
                 "reuse_reason": case["reuse_reason"],
                 "camera_inputs_used": images_meta,
+                "camera_metadata": camera_metadata,
                 "original_input": case["original_input"],
                 "thinker4b": {
                     "provider": args.provider,
                     "model": args.model or os.environ.get("THINKER4B_MODEL"),
+                    "prompt_mode": args.mode,
                     "status": thinker_status,
                     "error": thinker_error,
+                    "raw_model_output_text": raw_model_output_text,
                     "raw_output": raw_output,
+                    "geometry_match": geometry_match,
                     "normalized_input_output": ai_output,
                 },
                 "corrected_input": correction["corrected_input"],
@@ -878,6 +1333,20 @@ def _evaluate_cases(
                 "before_after_deltas": deltas,
                 "duration_s": time.monotonic() - start,
             }
+            if case_dir is not None:
+                _write_case_visual_artifacts(
+                    case_dir,
+                    prompt_text=prompt_text,
+                    raw_model_output_text=raw_model_output_text,
+                    camera_artifacts=camera_artifacts,
+                    camera_metadata=camera_metadata,
+                    raw_output=raw_output,
+                    ai_output=ai_output,
+                    truth=case["truth"],
+                    original_input=case["original_input"],
+                    corrected_input=correction["corrected_input"],
+                    metrics=log["metrics"],
+                )
             _write_json(cases_dir / f"{case['case_id']}.json", log)
             jsonl.write(json.dumps(log, sort_keys=True) + "\n")
             case_logs.append(log)
@@ -921,6 +1390,35 @@ def _mean_metric(logs: list[dict[str, Any]], phase: str, metric: str) -> float |
     return sum(values) / len(values)
 
 
+def _case_has_usable_center_or_roi(log: dict[str, Any]) -> bool:
+    normalized = log.get("thinker4b", {}).get("normalized_input_output", {})
+    if not isinstance(normalized, dict):
+        return False
+    camera_names = log.get("camera_metadata", {}).get("camera_names_used_by_model")
+    if not isinstance(camera_names, list) or not camera_names:
+        return False
+    primary_camera = camera_names[0]
+    camera_payload = log.get("camera_metadata", {}).get("cameras", {}).get(primary_camera)
+    model_input_stats = camera_payload.get("model_input") if isinstance(camera_payload, dict) else None
+    shape = model_input_stats.get("shape") if isinstance(model_input_stats, dict) else None
+    if not isinstance(shape, list) or len(shape) < 2:
+        return False
+    height = _finite_float(shape[0])
+    width = _finite_float(shape[1])
+    if height is None or width is None or height <= 0 or width <= 0:
+        return False
+    center = _finite_vector(normalized.get("center_2d"), 2)
+    if center is not None:
+        if 0.0 <= center[0] < width and 0.0 <= center[1] < height:
+            return True
+    roi = _finite_vector(normalized.get("roi"), 4)
+    if roi is not None:
+        if roi[0] < roi[2] and roi[1] < roi[3]:
+            if roi[2] > 0.0 and roi[3] > 0.0 and roi[0] < width and roi[1] < height:
+                return True
+    return False
+
+
 def _aggregate(logs: list[dict[str, Any]], *, args: argparse.Namespace, provider_error: str | None, output_dir: Path) -> dict[str, Any]:
     total = len(logs)
     requested_total = len(_parse_seeds(args.seeds)) * int(args.cases_per_seed)
@@ -928,10 +1426,46 @@ def _aggregate(logs: list[dict[str, Any]], *, args: argparse.Namespace, provider
     rejected = sum(int(log["correction_summary"]["rejected_count"]) for log in logs)
     total_runtime_s = sum(float(log.get("duration_s") or 0.0) for log in logs)
     outcomes = [log["before_after_deltas"]["case_outcome"] for log in logs]
+    empty_object_outputs = 0
+    usable_center_or_roi = 0
     status_counts: dict[str, int] = {}
+    camera_debug_values: dict[str, dict[str, list[Any]]] = {}
     for log in logs:
         status = log["thinker4b"]["status"]
         status_counts[status] = status_counts.get(status, 0) + 1
+        raw_output = log.get("thinker4b", {}).get("raw_output")
+        objects = raw_output.get("objects") if isinstance(raw_output, dict) else None
+        if isinstance(objects, list) and len(objects) == 0:
+            empty_object_outputs += 1
+        if _case_has_usable_center_or_roi(log):
+            usable_center_or_roi += 1
+        camera_metadata = log.get("camera_metadata", {}).get("cameras")
+        if isinstance(camera_metadata, dict):
+            for camera_name, payload in camera_metadata.items():
+                if not isinstance(payload, dict):
+                    continue
+                raw_stats = payload.get("raw")
+                if not isinstance(raw_stats, dict):
+                    continue
+                bucket = camera_debug_values.setdefault(
+                    camera_name,
+                    {
+                        "shape": [],
+                        "dtype": [],
+                        "mean_brightness": [],
+                        "non_black_ratio": [],
+                        "bright_ratio": [],
+                        "non_black_bbox": [],
+                        "bright_bbox": [],
+                    },
+                )
+                for key in ("shape", "dtype", "non_black_bbox", "bright_bbox"):
+                    if raw_stats.get(key) is not None:
+                        bucket[key].append(raw_stats.get(key))
+                for key in ("mean_brightness", "non_black_ratio", "bright_ratio"):
+                    value = _finite_float(raw_stats.get(key))
+                    if value is not None:
+                        bucket[key].append(value)
     bool_metrics = {
         "class": "class_correct",
         "selected_object": "selected_object_correct",
@@ -946,6 +1480,29 @@ def _aggregate(logs: list[dict[str, Any]], *, args: argparse.Namespace, provider
         before_accuracy[label] = _accuracy(logs, "before", metric)
         thinker_accuracy[label] = _accuracy(logs, "thinker_raw", metric)
         after_accuracy[label] = _accuracy(logs, "after", metric)
+    camera_debug_overview: dict[str, Any] = {}
+    for camera_name, values in camera_debug_values.items():
+        camera_debug_overview[camera_name] = {
+            "shapes_seen": sorted({tuple(item) for item in values["shape"]}),
+            "dtypes_seen": sorted({str(item) for item in values["dtype"]}),
+            "mean_brightness_range": (
+                [min(values["mean_brightness"]), max(values["mean_brightness"])]
+                if values["mean_brightness"]
+                else None
+            ),
+            "non_black_ratio_range": (
+                [min(values["non_black_ratio"]), max(values["non_black_ratio"])]
+                if values["non_black_ratio"]
+                else None
+            ),
+            "bright_ratio_range": (
+                [min(values["bright_ratio"]), max(values["bright_ratio"])]
+                if values["bright_ratio"]
+                else None
+            ),
+            "example_non_black_bbox": values["non_black_bbox"][0] if values["non_black_bbox"] else None,
+            "example_bright_bbox": values["bright_bbox"][0] if values["bright_bbox"] else None,
+        }
     return {
         "format_version": OUTPUT_FORMAT_VERSION,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -957,6 +1514,15 @@ def _aggregate(logs: list[dict[str, Any]], *, args: argparse.Namespace, provider
             "command_configured": bool(args.thinker_command or os.environ.get("THINKER4B_CMD")),
             "provider_setup_error": provider_error,
             "allow_provider_failure": bool(args.allow_provider_failure),
+        },
+        "prompt": {
+            "mode": args.mode,
+            "original_input_in_prompt": args.mode != "image-only",
+            "allowed_object_ids_in_prompt": args.mode != "image-only",
+            "save_debug_artifacts": bool(args.save_debug_artifacts),
+            "image_only_match_max_distance_px": (
+                float(args.image_only_match_max_distance_px) if args.mode == "image-only" else None
+            ),
         },
         "inputs": {
             "run_id": args.run_id,
@@ -971,6 +1537,8 @@ def _aggregate(logs: list[dict[str, Any]], *, args: argparse.Namespace, provider
         "case_count": total,
         "runtime_s": total_runtime_s,
         "thinker_status_counts": status_counts,
+        "objects_empty_count": empty_object_outputs,
+        "cases_with_usable_center_or_roi": usable_center_or_roi,
         "accepted_ai_corrections": accepted,
         "rejected_ai_corrections": rejected,
         "cases_improved": outcomes.count("improved"),
@@ -982,11 +1550,15 @@ def _aggregate(logs: list[dict[str, Any]], *, args: argparse.Namespace, provider
         "before_center_2d_error_mean_px": _mean_metric(logs, "before", "center_2d_error_px"),
         "thinker_center_2d_error_mean_px": _mean_metric(logs, "thinker_raw", "center_2d_error_px"),
         "after_center_2d_error_mean_px": _mean_metric(logs, "after", "center_2d_error_px"),
+        "camera_debug_overview": camera_debug_overview,
         "limitations": [
             "This is recorded-camera input evaluation only.",
             "No robot execution, IK, planner integration, final grasp pose, or motion control is performed.",
             "Original inputs are deterministic generated estimates unless an external original-input source is added later.",
-            "Object ids are dataset labels and may not be visually grounded for a model unless the provider/prompt can infer them.",
+            (
+                "In image-only mode, dataset object ids are excluded from the prompt and "
+                "selected-object scoring uses external 2D geometry matching."
+            ),
         ],
     }
 
@@ -1039,6 +1611,10 @@ def _write_human_report(path: Path, *, case_logs: list[dict[str, Any]], summary:
     lines.append("-" * 8)
     lines.append(_format_json_for_report(portable_summary["provider"]))
     lines.append("")
+    lines.append("Prompt")
+    lines.append("-" * 6)
+    lines.append(_format_json_for_report(portable_summary["prompt"]))
+    lines.append("")
     lines.append("Cases")
     lines.append("-" * 5)
     for log in case_logs:
@@ -1063,6 +1639,9 @@ def _write_human_report(path: Path, *, case_logs: list[dict[str, Any]], summary:
         lines.append("")
         lines.append("Thinker4B raw data:")
         lines.append(_format_json_for_report(portable_log["thinker4b"]["raw_output"]))
+        lines.append("")
+        lines.append("Thinker4B geometry match:")
+        lines.append(_format_json_for_report(portable_log["thinker4b"]["geometry_match"]))
         lines.append("")
         lines.append("Thinker4B normalized input-level output:")
         lines.append(_format_json_for_report(portable_log["thinker4b"]["normalized_input_output"]))
@@ -1118,6 +1697,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--run-id", default="test_phase1_initfix_1", help="Run id under $OUTPUT_ROOT/datasets/task1_rgbd_labels.")
     parser.add_argument("--seeds", default=",".join(str(seed) for seed in DEFAULT_SEEDS))
     parser.add_argument("--cases-per-seed", type=int, default=DEFAULT_CASES_PER_SEED)
+    parser.add_argument("--mode", choices=PROMPT_MODES, default="image-only", help="Prompt/evaluation mode. Default: image-only.")
     parser.add_argument("--cameras", default="head_left,head_right", help="Comma-separated preferred camera inputs.")
     parser.add_argument("--include-truth-camera", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--provider", choices=("openai-compatible", "ollama", "command", "cache"), default="openai-compatible")
@@ -1130,8 +1710,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--allow-provider-failure", action="store_true", help="Write logs/report even if Thinker4B provider is unavailable or fails.")
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--max-image-side", type=int, default=512)
+    parser.add_argument("--image-only-match-max-distance-px", type=float, default=80.0)
+    parser.add_argument("--save-debug-artifacts", action="store_true", help="Save prompt, PNG inputs, and raw provider text under <output_dir>/debug/<case_id>.")
     parser.add_argument("--output-dir", help="Runtime output dir. Defaults under $OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/.")
-    parser.add_argument("--report-path", default="docs/output01.txt")
+    parser.add_argument("--report-path", default="docs/output02.txt")
     parser.add_argument("--disable-ai-correction", action="store_true")
     parser.add_argument("--min-confidence", type=float, default=0.70)
     parser.add_argument("--max-center-shift-px", type=float, default=45.0)
@@ -1154,6 +1736,19 @@ def main(argv: list[str] | None = None) -> int:
                 raise Thinker4BEvalError(f"unsupported camera {camera_name!r}; expected one of {CAMERA_NAMES}")
         dataset_root = _dataset_root(args)
         pool = _build_case_pool(dataset_root=dataset_root, preferred_camera=requested_cameras[0] if requested_cameras else "head_left")
+        if args.mode == "image-only" and requested_cameras:
+            primary_camera = requested_cameras[0]
+            visible_pool = [
+                item
+                for item in pool
+                if item.get("truth", {}).get("camera_name") == primary_camera
+            ]
+            if visible_pool:
+                pool = visible_pool
+            else:
+                raise Thinker4BEvalError(
+                    f"no cases have the target visible in primary image-only camera {primary_camera!r}"
+                )
         cases = _select_cases(
             pool=pool,
             seeds=seeds,

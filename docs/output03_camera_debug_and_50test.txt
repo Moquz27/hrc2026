@@ -1,0 +1,188 @@
+Task 1 Camera Debug And 50-Case Thinker4B Image-Only Evaluation
+================================================================
+
+Decision summary
+----------------
+
+- The camera arrays are not actually black or blank.
+- The exported images are native `128x128 uint8` frames with large black top
+  borders and low effective object resolution.
+- The previous “too dark” failure was incomplete: when all four cameras are
+  passed with no resize, Thinker4B usually sees objects.
+- The remaining failure is mainly output quality:
+  - raw output is sometimes truncated/malformed
+  - parsed centers/rois are consistently far outside the `128x128` frame
+  - corrected center/roi therefore fall back to the original baseline
+  - harmful discrete class/orientation/arm/preset corrections are still being
+    accepted too often
+
+Output folder
+-------------
+
+- Full debug/eval root:
+  `$OUTPUT_ROOT/debug/task1_camera_image_size_and_png_export/test_phase1_initfix_1_20260426T162154Z`
+- Sample inspection folder:
+  `$OUTPUT_ROOT/debug/task1_camera_image_size_and_png_export/test_phase1_initfix_1_20260426T162154Z/sample_inspection_sample_000000`
+
+Original camera image stats
+---------------------------
+
+From `sample_000000` raw `.npy` export:
+
+- `head_left`
+  - shape: `128x128x3`
+  - dtype: `uint8`
+  - min/max: `0 / 244`
+  - mean brightness: `105.7759`
+  - non-black ratio: `0.5981`
+  - active bbox: `[0, 48, 127, 127]`
+- `head_right`
+  - shape: `128x128x3`
+  - dtype: `uint8`
+  - min/max: `0 / 244`
+  - mean brightness: `105.5150`
+  - non-black ratio: `0.5962`
+  - active bbox: `[0, 48, 127, 127]`
+- `wrist_left`
+  - shape: `128x128x3`
+  - dtype: `uint8`
+  - min/max: `0 / 236`
+  - mean brightness: `66.6685`
+  - non-black ratio: `0.4077`
+  - active bbox: `[7, 36, 127, 127]`
+- `wrist_right`
+  - shape: `128x128x3`
+  - dtype: `uint8`
+  - min/max: `0 / 234`
+  - mean brightness: `69.3566`
+  - non-black ratio: `0.4171`
+  - active bbox: `[0, 35, 127, 127]`
+
+Camera-debug conclusion
+-----------------------
+
+- Images have large black borders.
+  - `head_*`: top `48` rows black
+  - `wrist_*`: top `35..36` rows black
+- The visible table/object region is not empty, but it is compressed into a
+  small effective area because the whole frame is only `128x128`.
+- `head_*` views show the table and both hands more clearly than `wrist_*`.
+- `wrist_*` views are dominated by black background, gripper geometry, and a
+  small tabletop slice.
+- There is no silent resize issue in the successful debug run:
+  - evaluator used `--max-image-side 0`
+  - local wrapper used `--max-image-side 0`
+  - raw PNG and model-input PNG are identical in size
+
+One-case validation before 50-case run
+--------------------------------------
+
+- Using `wrist_left,head_left,head_right,wrist_right` with `wrist_left` as the
+  2D output frame changed the behavior materially.
+- Raw model output described two visible objects instead of `objects=[]`.
+- The raw text was sometimes truncated JSON, so a small brace-repair parser fix
+  was added in the local wrapper.
+- Even after parsing, the model predicted coordinates like `[283, 640]` and
+  `[723, 640]` for a `128x128` image, which confirms a severe coordinate-scale
+  mismatch.
+
+Exact 50-test command
+---------------------
+
+```bash
+THINKER4B_MODEL='UBTECH-Robotics/Thinker-4B' \
+THINKER4B_MODEL_PATH="$CKPT_ROOT/models/UBTECH-Robotics--Thinker-4B" \
+THINKER4B_CMD='python3 scripts/thinker4b_local_infer.py --max-new-tokens 512 --max-image-side 0' \
+python3 scripts/task1_run_thinker4b_input_eval.py \
+  --run-id test_phase1_initfix_1 \
+  --seeds 1,2,3,4,5 \
+  --cases-per-seed 10 \
+  --mode image-only \
+  --cameras wrist_left,head_left,head_right,wrist_right \
+  --no-include-truth-camera \
+  --provider command \
+  --timeout-s 600 \
+  --max-image-side 0 \
+  --save-debug-artifacts \
+  --output-dir "$OUTPUT_ROOT/debug/task1_camera_image_size_and_png_export/test_phase1_initfix_1_20260426T162154Z" \
+  --report-path "$OUTPUT_ROOT/debug/task1_camera_image_size_and_png_export/test_phase1_initfix_1_20260426T162154Z/report_50case.txt"
+```
+
+50-case result summary
+----------------------
+
+- The 50-case run really completed.
+- Provider status: `ok` for all `50/50` cases
+- Runtime: `616.12 s`
+- Cases with `objects=[]`: `3`
+- Cases where Thinker saw objects (`objects` non-empty): `47`
+- Cases with usable in-frame center/roi: `0`
+- Raw Thinker object count histogram:
+  - `0 objects`: `3`
+  - `2 objects`: `47`
+- Raw Thinker center error mean: `543.0351 px`
+
+Metrics
+-------
+
+- Before:
+  - class accuracy: `0.66`
+  - selected-object accuracy: `0.74`
+  - orientation accuracy: `0.50`
+  - arm accuracy: `0.66`
+  - preset accuracy: `0.68`
+  - center error mean: `29.8506 px`
+- Raw Thinker:
+  - class accuracy: `0.0`
+  - selected-object accuracy: not applicable
+  - orientation accuracy: `0.1915`
+  - arm accuracy: `0.5319`
+  - preset accuracy: `0.0`
+  - center error mean: `543.0351 px`
+- After correction:
+  - class accuracy: `0.06`
+  - selected-object accuracy: `0.74`
+  - orientation accuracy: `0.22`
+  - arm accuracy: `0.52`
+  - preset accuracy: `0.04`
+  - center error mean: `29.8506 px`
+
+Interpretation
+--------------
+
+- The images are not actually too dark.
+- The images are actually too small and border-heavy for reliable direct pixel
+  output at the current native resolution.
+- The four-camera raw path is enough for Thinker to describe scene content, so
+  the model is not blind.
+- The dominant failure is output coordinate scaling and formatting, not simple
+  visibility.
+- The correction gate currently protects center/roi well enough to preserve the
+  original baseline center error, but it does not protect discrete fields well
+  in image-only mode.
+
+Recommendation
+--------------
+
+- Use raw image: yes, keep the no-resize export path because resize was not the
+  root cause.
+- Crop active region: yes, strongly recommended as the next fix. Make the crop
+  explicit, saved, and logged; do not silently replace the raw frame.
+- Choose different camera: use head views as context, but keep a wrist camera
+  as the metric/output frame on this dataset because current label visibility is
+  only available there.
+- Recollect dataset with better camera/lighting: yes, recommended if feasible.
+  The bigger issue is native `128x128` resolution plus framing/borders, not just
+  illumination.
+
+Next recommended fix
+--------------------
+
+- Add an explicit, logged active-region crop/zoom experiment for the image-only
+  evaluator:
+  - keep raw PNGs unchanged
+  - save cropped preview PNGs separately
+  - run a new 50-case comparison with the cropped view as model input
+  - reject center/roi outputs that fall outside the target image frame
+  - disable or tighten discrete class/orientation/arm/preset corrections until
+    the model produces usable in-frame geometry

@@ -1333,3 +1333,161 @@
 - Approximate runtime from the final preserved command-provider run: total
   `589.541 s`, mean `11.791 s` per case
 - No edits were made to `grasp_planner.py`, `DualArmIK.py`, `coordinate_utils.py`, or `RobotArticulation.py`.
+
+## 2026-04-26 — Thinker4B image-only prompt reset and staged rerun
+
+- Patched `scripts/task1_run_thinker4b_input_eval.py` to stop biasing the
+  model toward the deterministic original estimate:
+  - added `--mode image-only` and made it the default prompt mode
+  - removed `original_input_estimate` and dataset object-id hints from the
+    image-only prompt
+  - rewrote the image-only prompt to require visual evidence only, strict JSON,
+    null/unknown for uncertainty, and no 3D pose / IK / motion output
+  - kept `original_input` only for logging/evaluation, not for prompting
+  - added external 2D geometry matching for selected-object scoring in
+    image-only mode instead of expecting the model to know `task1_part_XXX`
+  - added `--save-debug-artifacts` to write per-case `prompt.txt`, PNG input,
+    and raw model text under `<output_dir>/debug/<case_id>/`
+- Patched `scripts/thinker4b_local_infer.py` for stricter coercion:
+  - invalid `center_2d` and `roi` now become `null`
+  - invalid `class` becomes `unknown`
+  - invalid `orientation_bucket` becomes `unknown`
+  - invalid `recommended_arm` / `recommended_preset` are no longer invented
+  - confidence-like fields are clamped to `[0,1]`
+  - request-path mode can now save the raw model text to the debug path passed
+    by the evaluator
+- Lightweight verification passed:
+  - `python3 -m py_compile scripts/task1_run_thinker4b_input_eval.py scripts/thinker4b_local_infer.py`
+- Requested Test A (`head_left` only) could not be run on
+  `test_phase1_initfix_1` as specified because the label visibility records
+  expose no visible target projections in `head_left` or `head_right`; all 12
+  visible object projections in that smoke dataset are in `wrist_left` or
+  `wrist_right`
+- Executed the smallest safe substitute on `wrist_left`:
+  - command:
+    `THINKER4B_MODEL='UBTECH-Robotics/Thinker-4B' THINKER4B_MODEL_PATH="$CKPT_ROOT/models/UBTECH-Robotics--Thinker-4B" THINKER4B_CMD='python3 scripts/thinker4b_local_infer.py --max-new-tokens 512' python3 scripts/task1_run_thinker4b_input_eval.py --run-id test_phase1_initfix_1 --seeds 1 --cases-per-seed 1 --mode image-only --cameras wrist_left --no-include-truth-camera --provider command --timeout-s 600 --max-image-side 384 --save-debug-artifacts --output-dir "$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/image_only_sanity_1case_wrist_left" --report-path "$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/image_only_sanity_1case_wrist_left/report.txt"`
+  - result: provider status `ok`, but raw output was `objects=[]` with
+    `model_notes="The image is too dark to identify any objects"`
+  - important behavior change: raw Thinker output no longer echoed the original
+    estimate; corrected output stayed equal to the original baseline because no
+    usable AI fields were produced
+- Executed requested Test B as a 5-case image-only wrist-left run:
+  - command:
+    `THINKER4B_MODEL='UBTECH-Robotics/Thinker-4B' THINKER4B_MODEL_PATH="$CKPT_ROOT/models/UBTECH-Robotics--Thinker-4B" THINKER4B_CMD='python3 scripts/thinker4b_local_infer.py --max-new-tokens 512' python3 scripts/task1_run_thinker4b_input_eval.py --run-id test_phase1_initfix_1 --seeds 1 --cases-per-seed 5 --mode image-only --cameras wrist_left --no-include-truth-camera --provider command --timeout-s 600 --max-image-side 384 --save-debug-artifacts --output-dir "$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/image_only_5case_wrist_left" --report-path "$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/image_only_5case_wrist_left/report.txt"`
+  - result: provider status `ok` for all 5 cases, but all 5/5 raw outputs were
+    identical empty detections with the same dark-image note
+  - aggregate result: accepted corrections `0`, rejected corrections `0`,
+    cases improved `0`, unchanged `5`, worsened `0`
+  - mean center error stayed unchanged before/after at `28.4498 px`; raw
+    Thinker center error was non-applicable because no centers were returned
+  - before and after boolean accuracies were identical because corrected output
+    remained the deterministic original baseline:
+    - class `0.6`
+    - selected object `0.6`
+    - orientation bucket `0.4`
+    - arm recommendation `0.6`
+    - preset recommendation `0.8`
+- Test C (50 cases) was intentionally not run because Tests A/B did not produce
+  valid image-driven detections; running 50 cases would only repeat the same
+  empty-output failure mode
+- Wrote the new human-readable review report to `docs/output02.txt`
+- No edits were made to manipulation backend, planner, IK, grasp logic,
+  collector, or robot execution files
+
+## 2026-04-26 — Camera image debug export and full 50-case image-only rerun
+
+- Extended `scripts/task1_run_thinker4b_input_eval.py` to save richer per-case
+  artifacts directly under the evaluation output directory:
+  - one folder per case at `<output_dir>/<case_id>/`
+  - raw PNG and model-input PNG for all four cameras
+  - `metadata.json` with per-camera shape, dtype, min/max, mean brightness,
+    non-black ratio, and active-region bbox
+  - `prompt.txt`, `raw_model_output.txt`, `raw_output.json`,
+    `normalized_output.json`, `truth.json`, `original_input.json`,
+    `corrected_input.json`, and `metrics.json`
+  - aggregate `summary.json`, `cases.jsonl`, and `cases/*.json` remain in the
+    same output root
+- Added camera-debug aggregation to `summary.json`:
+  - `objects_empty_count`
+  - `cases_with_usable_center_or_roi`
+  - per-camera native shape/brightness/non-black/bbox overview
+- Tightened the local Thinker wrapper parser in
+  `scripts/thinker4b_local_infer.py` so near-valid truncated JSON outputs are
+  repaired by simple brace balancing before schema coercion
+- Created the requested sample-inspection export folder:
+  `$OUTPUT_ROOT/debug/task1_camera_image_size_and_png_export/test_phase1_initfix_1_20260426T162154Z/sample_inspection_sample_000000`
+- Sample inspection result for `sample_000000`:
+  - all four cameras are native `128x128x3 uint8`
+  - `head_left` and `head_right` are not dark; mean brightness is about
+    `105.5..105.8`, but the top `48` rows are black and the active region is
+    the lower `80` rows
+  - `wrist_left` and `wrist_right` are darker overall than head cameras but not
+    black; mean brightness is about `66.7..69.4`, with active content starting
+    near `y=35..36`
+- Visual inspection result:
+  - `head_*` views show the table and both robot hands inside a large black top
+    border
+  - `wrist_*` views are dominated by black background plus robot gripper/table
+    geometry; the visible workpiece region is small at native `128x128`
+- One-case full-artifact validation:
+  - used cameras:
+    `wrist_left,head_left,head_right,wrist_right`
+  - output frame for 2D fields: `wrist_left`
+  - no resize was applied (`--max-image-side 0` in both evaluator and local
+    wrapper command)
+  - raw model output no longer collapsed to `objects=[]`; it described two
+    visible objects, but initially emitted truncated JSON and out-of-frame pixel
+    coordinates
+  - after parser repair, the one-case run produced parsed raw objects with mean
+    raw center error about `497.13 px`; corrected output still preserved the
+    original baseline center error because the gate rejected the huge center/roi
+    shifts
+- Full requested 50-case run completed successfully:
+  - command:
+    `THINKER4B_MODEL='UBTECH-Robotics/Thinker-4B' THINKER4B_MODEL_PATH="$CKPT_ROOT/models/UBTECH-Robotics--Thinker-4B" THINKER4B_CMD='python3 scripts/thinker4b_local_infer.py --max-new-tokens 512 --max-image-side 0' python3 scripts/task1_run_thinker4b_input_eval.py --run-id test_phase1_initfix_1 --seeds 1,2,3,4,5 --cases-per-seed 10 --mode image-only --cameras wrist_left,head_left,head_right,wrist_right --no-include-truth-camera --provider command --timeout-s 600 --max-image-side 0 --save-debug-artifacts --output-dir "$OUTPUT_ROOT/debug/task1_camera_image_size_and_png_export/test_phase1_initfix_1_20260426T162154Z" --report-path "$OUTPUT_ROOT/debug/task1_camera_image_size_and_png_export/test_phase1_initfix_1_20260426T162154Z/report_50case.txt"`
+  - provider result: `thinker_status_counts={'ok': 50}`
+  - runtime: about `616.12 s`
+  - aggregate result:
+    - accepted corrections `188`
+    - rejected corrections `94`
+    - cases improved `0`
+    - cases unchanged `3`
+    - cases worsened `47`
+    - `objects_empty_count=3`
+    - raw non-empty object lists in `47/50` cases, almost always `2` objects
+    - `cases_with_usable_center_or_roi=0`
+    - mean center error:
+      - before `29.8506 px`
+      - raw Thinker `543.0351 px`
+      - after correction `29.8506 px`
+    - before accuracy:
+      - class `0.66`
+      - selected object `0.74`
+      - orientation `0.50`
+      - arm `0.66`
+      - preset `0.68`
+    - raw Thinker accuracy:
+      - class `0.0`
+      - orientation `0.1915`
+      - arm `0.5319`
+      - preset `0.0`
+      - selected object not applicable because no visually grounded id output
+    - after-correction accuracy:
+      - class `0.06`
+      - selected object `0.74`
+      - orientation `0.22`
+      - arm `0.52`
+      - preset `0.04`
+- Interpretation:
+  - the earlier “too dark” conclusion was incomplete
+  - the images are low-resolution with large black borders, but the four-camera
+    raw path is visually informative enough for Thinker to describe scene
+    content in most cases
+  - the dominant remaining issues are malformed/truncated output plus a severe
+    coordinate-scale mismatch; the model predicts centers/rois hundreds of
+    pixels outside the `128x128` frame
+  - the current correction gate protects center/roi by rejecting huge shifts,
+    but it still accepts many harmful discrete class/orientation/arm/preset
+    changes in image-only mode
+- Wrote the requested human-readable summary to
+  `docs/output03_camera_debug_and_50test.txt`

@@ -1,0 +1,139 @@
+Task 1 Thinker4B Image-Only Prompt Rerun
+========================================
+
+Scope
+-----
+
+- Patch scope only covered `scripts/task1_run_thinker4b_input_eval.py` and
+  `scripts/thinker4b_local_infer.py`.
+- No manipulation backend, planner, IK, grasp logic, collector, or robot
+  execution code was modified.
+- `original_input_estimate` was excluded from the model prompt in image-only
+  mode.
+- `allowed_object_ids` were excluded from the model prompt in image-only mode.
+- Selected-object scoring in image-only mode now uses external 2D geometry
+  matching instead of expecting the model to know dataset ids such as
+  `task1_part_XXX`.
+
+Code changes applied
+--------------------
+
+- Added default `--mode image-only` to
+  `scripts/task1_run_thinker4b_input_eval.py`.
+- Rewrote the image-only prompt to require visual evidence only, strict JSON,
+  and null/unknown for uncertain fields.
+- Added `--save-debug-artifacts` to save per-case:
+  - `prompt.txt`
+  - PNG image(s) actually sent to the model
+  - raw model text
+- Tightened `scripts/thinker4b_local_infer.py` coercion:
+  - invalid `center_2d` -> `null`
+  - invalid `roi` -> `null`
+  - invalid `class` -> `unknown`
+  - invalid `orientation_bucket` -> `unknown`
+  - invalid `recommended_arm` / `recommended_preset` are not invented
+  - confidence values are clamped to `[0,1]`
+
+Dataset limitation discovered during rerun
+------------------------------------------
+
+- The requested Test A camera (`head_left`) is not evaluable on
+  `test_phase1_initfix_1`.
+- Visibility inspection of the collected smoke dataset showed:
+  - `head_left`: 0 visible labeled object projections
+  - `head_right`: 0 visible labeled object projections
+  - `wrist_left`: 12 visible labeled object projections
+  - `wrist_right`: 12 visible labeled object projections
+- Because `head_left` has no labeled visible targets in this dataset, the
+  staged rerun used `wrist_left` as the smallest safe substitute.
+
+Test A
+------
+
+- Run: 1 case, image-only, `wrist_left`, provider `command`
+- Output dir:
+  `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/image_only_sanity_1case_wrist_left`
+- Provider status: `ok`
+- Raw Thinker output:
+
+```json
+{
+  "selected_object_id": null,
+  "global_confidence": 0.0,
+  "objects": [],
+  "model_notes": "The image is too dark to identify any objects"
+}
+```
+
+- Result interpretation:
+  - raw output did not echo the deterministic original input
+  - raw output also did not produce a usable detection
+  - corrected output therefore stayed equal to the original baseline
+
+Test B
+------
+
+- Run: 5 cases, image-only, `wrist_left`, provider `command`
+- Output dir:
+  `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/image_only_5case_wrist_left`
+- Provider status: `ok` for all 5 cases
+- All 5/5 raw outputs were identical:
+  - `objects=[]`
+  - `selected_object_id=null`
+  - `model_notes="The image is too dark to identify any objects"`
+
+Assessment
+----------
+
+- Whether original input was excluded from the model prompt:
+  - yes
+- Whether Thinker outputs changed meaningfully across different images:
+  - no
+  - all 5 image-only wrist-left cases returned the same empty-output/dark-image
+    response
+- Whether any outputs still appear to echo prior estimates:
+  - raw Thinker output: no direct echo was observed in Tests A/B
+  - corrected output: yes, but only because the correction gate correctly fell
+    back to the original baseline when raw Thinker returned no usable fields
+
+Metrics
+-------
+
+- Test B raw Thinker vs truth:
+  - selected-object accuracy: not applicable
+  - class accuracy: not applicable
+  - orientation accuracy: not applicable
+  - arm recommendation accuracy: not applicable
+  - preset recommendation accuracy: not applicable
+  - center 2D mean error: not applicable
+- Test B corrected output vs truth:
+  - selected-object accuracy: `0.6`
+  - class accuracy: `0.6`
+  - orientation accuracy: `0.4`
+  - arm recommendation accuracy: `0.6`
+  - preset recommendation accuracy: `0.8`
+  - center 2D mean error: `28.4498 px`
+- Test B before/after correction summary:
+  - accepted corrections: `0`
+  - rejected corrections: `0`
+  - improved cases: `0`
+  - unchanged cases: `5`
+  - worsened cases: `0`
+
+Test C decision
+---------------
+
+- The requested 50-case rerun was not executed.
+- Reason: Tests A/B did not produce valid image-driven detections, so running
+  50 cases would only repeat the same empty-output failure mode and would not
+  be a meaningful perception evaluation.
+
+Conclusion
+----------
+
+- The prompt-bias issue was fixed: the model no longer had access to
+  `original_input_estimate` and no longer echoed that estimate in raw output.
+- The current blocker is now different and clearer: on this dataset/model path,
+  the image-only run produced no usable detections and collapsed to the same
+  dark-image response across multiple cases.
+- No improvement should be claimed from this rerun.

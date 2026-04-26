@@ -131,12 +131,35 @@ Current Focus:
   and logged by `scripts/task1_run_thinker4b_input_eval.py`; the current Linux
   environment now uses the official Hugging Face checkpoint through the local
   command wrapper `scripts/thinker4b_local_infer.py`
+- Current Thinker4B image-only prompt path now excludes
+  `original_input_estimate` and dataset object-id hints from the model prompt,
+  uses external 2D geometry matching for selected-object scoring, and can save
+  per-case debug artifacts
 - Latest local Thinker4B run:
   `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/test_phase1_initfix_1_thinker4b_5x10_local_command`
   completed all 50 cases with local provider status `ok`
 - Current measured result: local Thinker4B did not improve aggregate input
   quality over the deterministic original estimates; the correction gate mostly
   preserved the original baseline and limited worse raw center predictions
+- Latest image-only rerun result: `test_phase1_initfix_1` exposes no visible
+  target projections in `head_left` or `head_right`, so the staged rerun used
+  `wrist_left`; the provider succeeded on 1-case and 5-case image-only runs,
+  but all 5/5 raw outputs were identical empty detections with
+  `model_notes="The image is too dark to identify any objects"`, so no
+  meaningful raw-vs-truth metric improvement was observed and the 50-case
+  rerun was intentionally skipped
+- Latest camera-debug rerun result: using all four camera views with
+  `wrist_left` as the image-only output frame and no resize changed the failure
+  mode materially
+  - raw exported arrays are native `128x128 uint8`, not actually black, but
+    they contain large top black borders and low effective object resolution
+  - the full 50-case run completed with provider status `ok` for all cases
+  - raw Thinker output contained non-empty `objects` in `47/50` cases, so the
+    model does see scene content when all four views are provided
+  - usable in-frame center/roi outputs were still `0/50`; raw center
+    predictions remained far out of frame with mean error about `543 px`
+  - corrected outputs preserved the original baseline center error but still
+    accepted many harmful discrete class/orientation/arm/preset changes
 - No serious algorithm or ML optimization until collected samples and evaluator contracts are stable
 - Task 1 continuous-motion baseline now has per-object diagnostics and one-knob tuning support in `scripts/task1_smooth_autoseed_multi_object_baseline.py`.
 - Latest controlled Linux runtime sweep for seed=1 target-index=2 showed grasp-depth offsets 0.0, -0.005, and -0.010 all failed before grasp at `pre_grasp_unreachable`; next single tuning family should be approach/soft waypoint reachability, not deeper grasp or carry/place tuning.

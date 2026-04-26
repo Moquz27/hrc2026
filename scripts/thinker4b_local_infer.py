@@ -27,6 +27,19 @@ from PIL import Image
 
 DEFAULT_MODEL_ID = "UBTECH-Robotics/Thinker-4B"
 DEFAULT_MAX_NEW_TOKENS = 768
+ORIENTATION_BUCKETS = {
+    "front",
+    "front_left",
+    "left",
+    "back_left",
+    "back",
+    "back_right",
+    "right",
+    "front_right",
+    "unknown",
+}
+OBJECT_CLASSES = {"A", "B", "unknown"}
+ARMS = {"left", "right"}
 
 
 def _stderr(message: str) -> None:
@@ -46,17 +59,110 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     if stripped.startswith("```"):
         stripped = re.sub(r"^```(?:json)?", "", stripped, flags=re.IGNORECASE).strip()
         stripped = re.sub(r"```$", "", stripped).strip()
-    try:
-        payload = json.loads(stripped)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
-        if match is None:
-            return None
+    candidates: list[str] = []
+    if stripped:
+        candidates.append(stripped)
+    match = re.search(r"\{.*", stripped, flags=re.DOTALL)
+    if match is not None:
+        candidate = match.group(0).strip()
+        candidates.append(candidate)
+        open_count = candidate.count("{")
+        close_count = candidate.count("}")
+        if open_count > close_count:
+            repaired = candidate + ("}" * (open_count - close_count))
+            candidates.append(repaired)
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         try:
-            payload = json.loads(match.group(0))
+            payload = json.loads(candidate)
         except json.JSONDecodeError:
-            return None
-    return payload if isinstance(payload, dict) else None
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        result = float(value)
+        if np.isfinite(result):
+            return result
+    return None
+
+
+def _clamp_confidence(value: Any) -> float:
+    numeric = _finite_float(value)
+    if numeric is None:
+        return 0.0
+    return max(0.0, min(1.0, float(numeric)))
+
+
+def _coerce_center_2d(value: Any) -> list[float] | None:
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    coords = [_finite_float(value[0]), _finite_float(value[1])]
+    if any(item is None for item in coords):
+        return None
+    return [float(item) for item in coords if item is not None]
+
+
+def _coerce_roi(value: Any) -> list[float] | None:
+    if not isinstance(value, list) or len(value) < 4:
+        return None
+    coords = [_finite_float(value[index]) for index in range(4)]
+    if any(item is None for item in coords):
+        return None
+    roi = [float(item) for item in coords if item is not None]
+    if not (roi[0] < roi[2] and roi[1] < roi[3]):
+        return None
+    return roi
+
+
+def _coerce_class(value: Any) -> str:
+    return value if isinstance(value, str) and value in OBJECT_CLASSES else "unknown"
+
+
+def _coerce_orientation(value: Any) -> str:
+    return value if isinstance(value, str) and value in ORIENTATION_BUCKETS else "unknown"
+
+
+def _coerce_arm(value: Any) -> str | None:
+    return value if isinstance(value, str) and value in ARMS else None
+
+
+def _coerce_preset(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _coerce_object_candidate(item: dict[str, Any]) -> dict[str, Any]:
+    object_id = item.get("object_id")
+    notes = item.get("notes")
+    cleaned: dict[str, Any] = {
+        "class": _coerce_class(item.get("class")),
+        "center_2d": _coerce_center_2d(item.get("center_2d")),
+        "roi": _coerce_roi(item.get("roi")),
+        "orientation_bucket": _coerce_orientation(item.get("orientation_bucket")),
+        "confidence": _clamp_confidence(item.get("confidence")),
+        "recommended_arm": _coerce_arm(item.get("recommended_arm")),
+        "recommended_preset": _coerce_preset(item.get("recommended_preset")),
+    }
+    if isinstance(object_id, str) and object_id:
+        cleaned["object_id"] = object_id
+    if "difficulty" in item:
+        cleaned["difficulty"] = _clamp_confidence(item.get("difficulty"))
+    if "occlusion" in item:
+        cleaned["occlusion"] = _clamp_confidence(item.get("occlusion"))
+    if isinstance(notes, str) and notes.strip():
+        cleaned["notes"] = notes
+    return cleaned
 
 
 def _coerce_schema(payload: dict[str, Any] | None, *, frame_id: str, raw_text: str | None) -> dict[str, Any]:
@@ -78,33 +184,13 @@ def _coerce_schema(payload: dict[str, Any] | None, *, frame_id: str, raw_text: s
     for item in objects:
         if not isinstance(item, dict):
             continue
-        cleaned: dict[str, Any] = {}
-        for key in (
-            "object_id",
-            "class",
-            "roi",
-            "center_2d",
-            "orientation_bucket",
-            "difficulty",
-            "occlusion",
-            "confidence",
-            "recommended_arm",
-            "recommended_preset",
-            "notes",
-        ):
-            if key in item:
-                cleaned[key] = item[key]
-        cleaned_objects.append(cleaned)
+        cleaned_objects.append(_coerce_object_candidate(item))
 
     selected_object_id = payload.get("selected_object_id")
-    if selected_object_id is not None and not isinstance(selected_object_id, str):
+    if selected_object_id is not None and (not isinstance(selected_object_id, str) or not selected_object_id):
         selected_object_id = None
 
-    confidence = payload.get("global_confidence", payload.get("confidence", 0.0))
-    try:
-        global_confidence = max(0.0, min(1.0, float(confidence)))
-    except (TypeError, ValueError):
-        global_confidence = 0.0
+    global_confidence = _clamp_confidence(payload.get("global_confidence", payload.get("confidence", 0.0)))
 
     result = {
         "frame_id": str(payload.get("frame_id") or frame_id),
@@ -187,11 +273,11 @@ def _request_from_stdin() -> dict[str, Any] | None:
 def _build_direct_request(args: argparse.Namespace) -> dict[str, Any]:
     prompt = args.prompt or (
         "You are Thinker4B analyzing recorded camera images from HRC Task 1. "
+        "Use only image evidence. Do not use prior estimates or guess dataset object ids. "
         "Return EXACTLY one JSON object with keys frame_id, selected_object_id, "
         "global_confidence, objects, and optional model_notes. "
-        "Each object may contain object_id, class, center_2d, roi, "
-        "orientation_bucket, difficulty, occlusion, confidence, "
-        "recommended_arm, recommended_preset, and notes. "
+        "Each object may contain class, center_2d, roi, orientation_bucket, "
+        "confidence, optional recommended_arm, optional recommended_preset, and notes. "
         "Do not use markdown fences. Do not output final grasp poses, world poses, "
         "joint commands, trajectories, or extra prose. "
         "If uncertain, use null or unknown and low confidence."
@@ -314,8 +400,10 @@ def main(argv: list[str] | None = None) -> int:
             images=images,
             max_new_tokens=args.max_new_tokens,
         )
-        if args.debug_raw_output:
-            debug_path = Path(args.debug_raw_output).expanduser()
+        debug_raw_output = request.get("debug_raw_output_path")
+        debug_path_value = debug_raw_output if isinstance(debug_raw_output, str) else args.debug_raw_output
+        if debug_path_value:
+            debug_path = Path(debug_path_value).expanduser()
             debug_path.parent.mkdir(parents=True, exist_ok=True)
             debug_path.write_text(raw_text, encoding="utf-8")
 

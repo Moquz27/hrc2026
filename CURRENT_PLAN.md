@@ -241,6 +241,7 @@ Implemented in this experiment:
 - `scripts/task1_run_thinker4b_input_eval.py`
 - `docs/task1_thinker4b_input_eval.md`
 - `docs/output01.txt`
+- `docs/output02.txt`
 
 Supported provider modes:
 
@@ -255,6 +256,10 @@ Current execution:
 - local Thinker4B wrapper: `scripts/thinker4b_local_infer.py`
 - local checkpoint root:
   `$CKPT_ROOT/models/UBTECH-Robotics--Thinker-4B`
+- prompt/eval path now supports default `--mode image-only`, excludes
+  `original_input_estimate` and dataset object-id hints from the model prompt,
+  uses external 2D geometry matching for selected-object scoring, and can save
+  per-case debug artifacts (prompt, PNG input, raw model text)
 - one-case sanity run completed with `provider=command` and real local
   inference under
   `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/sanity_1case_command`
@@ -269,6 +274,38 @@ Current execution:
 - raw Thinker4B mean 2D center error was much worse at about `79.98 px`, so
   the correction gate mostly preserved the original baseline instead of
   applying harmful center shifts
+- latest image-only rerun on the same dataset could not use `head_left` or
+  `head_right` because the collected `test_phase1_initfix_1` labels expose no
+  visible target projections in those cameras; all visible 2D projections in
+  that smoke dataset are in `wrist_left` or `wrist_right`
+- latest image-only sanity outputs were written under
+  `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/image_only_sanity_1case_wrist_left`
+  and
+  `$OUTPUT_ROOT/test_runs/task1_thinker4b_input_eval/image_only_5case_wrist_left`
+- latest image-only measured result: provider status was `ok`, but the model
+  returned the same empty `objects=[]` response with
+  `model_notes="The image is too dark to identify any objects"` on all 5/5
+  wrist-left cases, so raw Thinker metrics were non-applicable, accepted
+  corrections stayed at `0`, corrected outputs stayed equal to the original
+  baseline, and the requested 50-case rerun was intentionally not executed
+  because tests A/B were not valid perception outputs
+- latest camera-debug rerun with visual artifacts is under
+  `$OUTPUT_ROOT/debug/task1_camera_image_size_and_png_export/test_phase1_initfix_1_20260426T162154Z`
+- latest camera-debug finding: the exported arrays are not truly dark; all four
+  cameras are native `128x128 uint8` images with large black top borders
+  (`head_*` active region starts near `y=48`, `wrist_*` near `y=35..36`)
+- latest full image-only 50-case run used all four camera views as model
+  context with `wrist_left` as the 2D output frame and no resize
+- latest full 50-case measured result:
+  - provider status `ok` on all `50/50` cases
+  - raw Thinker returned non-empty `objects` in `47/50` cases
+  - usable in-frame center/roi outputs remained `0/50`
+  - raw Thinker mean center error was about `543.04 px`
+  - corrected center error stayed at the original baseline mean of about
+    `29.85 px`
+  - corrected selected-object accuracy stayed `0.74`, but class/orientation/
+    arm/preset accuracies worsened sharply after accepting many harmful
+    discrete-field corrections
 
 Strict non-goals remain:
 
